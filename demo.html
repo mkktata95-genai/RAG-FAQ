@@ -18,7 +18,6 @@
       flex-direction: column;
     }
 
-    /* Header */
     .header {
       background: white;
       border-bottom: 1px solid #e5e7eb;
@@ -37,14 +36,8 @@
     }
     .avatar.user { background: #6b7280; }
     .header-name { font-weight: 600; font-size: 14px; color: #111827; }
-    .header-status {
-      font-size: 11px; color: #22c55e;
-      display: flex; align-items: center; gap: 4px;
-    }
-    .status-dot {
-      width: 6px; height: 6px; border-radius: 50%;
-      background: #22c55e; display: inline-block;
-    }
+    .header-status { font-size: 11px; color: #22c55e; display: flex; align-items: center; gap: 4px; }
+    .status-dot { width: 6px; height: 6px; border-radius: 50%; background: #22c55e; display: inline-block; }
     .settings-btn {
       font-size: 11px; padding: 4px 10px;
       border: 1px solid #e5e7eb; border-radius: 6px;
@@ -52,7 +45,6 @@
     }
     .settings-btn:hover { border-color: #d1d5db; color: #374151; }
 
-    /* Settings bar */
     .settings-bar {
       background: #fffbeb; border-bottom: 1px solid #fde68a;
       padding: 8px 16px; display: flex; align-items: center; gap: 8px;
@@ -63,30 +55,18 @@
       padding: 4px 8px; font-size: 11px; font-family: monospace;
       background: white; color: #374151;
     }
-    .settings-bar button {
-      font-size: 12px; font-weight: 600; color: #92400e;
-      background: none; border: none; cursor: pointer;
-    }
+    .settings-bar button { font-size: 12px; font-weight: 600; color: #92400e; background: none; border: none; cursor: pointer; }
 
-    /* Messages area */
-    .messages {
-      flex: 1; overflow-y: auto;
-      padding: 16px; display: flex; flex-direction: column;
-    }
+    .messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; }
     .messages-inner { max-width: 680px; margin: 0 auto; width: 100%; }
 
-    /* Message row */
-    .message-row {
-      display: flex; align-items: flex-end; gap: 10px;
-      margin-bottom: 16px;
-    }
+    .message-row { display: flex; align-items: flex-end; gap: 10px; margin-bottom: 16px; }
     .message-row.user { flex-direction: row-reverse; }
 
-    /* Bubble */
     .bubble {
       max-width: 520px; padding: 10px 14px;
       border-radius: 18px; font-size: 14px;
-      line-height: 1.6; white-space: pre-wrap;
+      line-height: 1.6;
       box-shadow: 0 1px 2px rgba(0,0,0,0.06);
     }
     .bubble.assistant {
@@ -96,9 +76,27 @@
     .bubble.user {
       background: #4f46e5; color: white;
       border-bottom-right-radius: 4px;
+      white-space: pre-wrap;
     }
 
-    /* Cursor blink */
+    /* Markdown rendered content */
+    .md-content p { margin-bottom: 8px; }
+    .md-content p:last-child { margin-bottom: 0; }
+    .md-content strong { font-weight: 600; color: #111827; }
+    .md-content ul { padding-left: 18px; margin-bottom: 8px; }
+    .md-content ul li { margin-bottom: 4px; }
+    .md-content ol { padding-left: 18px; margin-bottom: 8px; }
+    .md-content ol li { margin-bottom: 4px; }
+    .md-content h1, .md-content h2, .md-content h3 {
+      font-weight: 600; margin-bottom: 6px; margin-top: 10px; color: #111827;
+    }
+    .md-content h1 { font-size: 16px; }
+    .md-content h2 { font-size: 15px; }
+    .md-content h3 { font-size: 14px; }
+    .md-content h1:first-child,
+    .md-content h2:first-child,
+    .md-content h3:first-child { margin-top: 0; }
+
     .cursor {
       display: inline-block; width: 2px; height: 16px;
       background: #4f46e5; margin-left: 2px;
@@ -106,7 +104,6 @@
     }
     @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
 
-    /* Citations */
     .citations { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
     .citation-badge {
       display: inline-flex; align-items: center; gap: 4px;
@@ -116,47 +113,25 @@
     }
     .citation-badge:hover { background: #e0e7ff; }
     .citation-num { font-weight: 700; }
-    .citation-title {
-      max-width: 140px; overflow: hidden;
-      text-overflow: ellipsis; white-space: nowrap;
-    }
+    .citation-title { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-    /* Metadata */
-    .meta {
-      margin-top: 4px; font-size: 11px; color: #9ca3af;
-      display: flex; gap: 8px; align-items: center;
-    }
+    .meta { margin-top: 4px; font-size: 11px; color: #9ca3af; display: flex; gap: 8px; align-items: center; }
     .meta-cached { color: #f59e0b; }
 
-    /* Typing indicator */
-    .typing-row {
-      display: flex; align-items: flex-end; gap: 10px; margin-bottom: 16px;
-    }
+    .typing-row { display: flex; align-items: flex-end; gap: 10px; margin-bottom: 16px; }
     .typing-bubble {
       background: white; border: 1px solid #e5e7eb;
       border-radius: 18px; border-bottom-left-radius: 4px;
       padding: 12px 16px; display: flex; gap: 4px; align-items: center;
       box-shadow: 0 1px 2px rgba(0,0,0,0.06);
     }
-    .dot {
-      width: 8px; height: 8px; border-radius: 50%;
-      background: #a5b4fc; animation: bounce 1.2s infinite;
-    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #a5b4fc; animation: bounce 1.2s infinite; }
     .dot:nth-child(2) { animation-delay: 0.2s; }
     .dot:nth-child(3) { animation-delay: 0.4s; }
-    @keyframes bounce {
-      0%,60%,100%{ transform: translateY(0); }
-      30%{ transform: translateY(-6px); }
-    }
+    @keyframes bounce { 0%,60%,100%{ transform: translateY(0); } 30%{ transform: translateY(-6px); } }
 
-    /* Suggested questions */
-    .suggestions {
-      padding: 0 16px 8px;
-    }
-    .suggestions-inner {
-      max-width: 680px; margin: 0 auto;
-      display: flex; flex-wrap: wrap; gap: 8px;
-    }
+    .suggestions { padding: 0 16px 8px; }
+    .suggestions-inner { max-width: 680px; margin: 0 auto; display: flex; flex-wrap: wrap; gap: 8px; }
     .suggestion-btn {
       font-size: 12px; padding: 6px 14px;
       background: white; border: 1px solid #e5e7eb;
@@ -164,29 +139,17 @@
       cursor: pointer; transition: all 0.15s;
       box-shadow: 0 1px 2px rgba(0,0,0,0.04);
     }
-    .suggestion-btn:hover {
-      border-color: #a5b4fc; color: #4f46e5;
-    }
+    .suggestion-btn:hover { border-color: #a5b4fc; color: #4f46e5; }
 
-    /* Error */
-    .error-bar {
-      text-align: center; margin-bottom: 12px;
-    }
+    .error-bar { text-align: center; margin-bottom: 12px; }
     .error-msg {
       font-size: 11px; color: #ef4444;
       background: #fef2f2; padding: 4px 12px;
       border-radius: 20px; border: 1px solid #fecaca;
     }
 
-    /* Input area */
-    .input-area {
-      background: white; border-top: 1px solid #e5e7eb;
-      padding: 12px 16px;
-    }
-    .input-inner {
-      max-width: 680px; margin: 0 auto;
-      display: flex; gap: 8px; align-items: flex-end;
-    }
+    .input-area { background: white; border-top: 1px solid #e5e7eb; padding: 12px 16px; }
+    .input-inner { max-width: 680px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
     textarea {
       flex: 1; border: 1px solid #e5e7eb; border-radius: 12px;
       padding: 10px 14px; font-size: 14px; font-family: inherit;
@@ -204,17 +167,13 @@
     }
     .send-btn:hover:not(:disabled) { background: #4338ca; }
     .send-btn:disabled { background: #e5e7eb; cursor: not-allowed; }
-    .send-btn svg { color: white; }
     .spinner {
       width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.4);
       border-top-color: white; border-radius: 50%;
       animation: spin 0.7s linear infinite;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .disclaimer {
-      max-width: 680px; margin: 6px auto 0;
-      text-align: center; font-size: 11px; color: #9ca3af;
-    }
+    .disclaimer { max-width: 680px; margin: 6px auto 0; text-align: center; font-size: 11px; color: #9ca3af; }
   </style>
 </head>
 <body>
@@ -230,6 +189,117 @@
       "How do I find a lost pension?",
     ];
 
+    // ── Simple Markdown Renderer ──────────────────────────────
+    function renderMarkdown(text) {
+      if (!text) return [];
+      const lines = text.split("\n");
+      const elements = [];
+      let i = 0;
+      let key = 0;
+
+      while (i < lines.length) {
+        const line = lines[i];
+
+        // Blank line
+        if (line.trim() === "") { i++; continue; }
+
+        // Heading
+        if (line.startsWith("### ")) {
+          elements.push(<h3 key={key++}>{parseInline(line.slice(4))}</h3>);
+          i++; continue;
+        }
+        if (line.startsWith("## ")) {
+          elements.push(<h2 key={key++}>{parseInline(line.slice(3))}</h2>);
+          i++; continue;
+        }
+        if (line.startsWith("# ")) {
+          elements.push(<h1 key={key++}>{parseInline(line.slice(2))}</h1>);
+          i++; continue;
+        }
+
+        // Unordered list
+        if (line.match(/^(\s*[-*+])\s/)) {
+          const items = [];
+          while (i < lines.length && lines[i].match(/^(\s*[-*+])\s/)) {
+            const content = lines[i].replace(/^\s*[-*+]\s/, "");
+            items.push(<li key={i}>{parseInline(content)}</li>);
+            i++;
+          }
+          elements.push(<ul key={key++}>{items}</ul>);
+          continue;
+        }
+
+        // Ordered list
+        if (line.match(/^\d+\.\s/)) {
+          const items = [];
+          while (i < lines.length && lines[i].match(/^\d+\.\s/)) {
+            const content = lines[i].replace(/^\d+\.\s/, "");
+            items.push(<li key={i}>{parseInline(content)}</li>);
+            i++;
+          }
+          elements.push(<ol key={key++}>{items}</ol>);
+          continue;
+        }
+
+        // Normal paragraph
+        elements.push(<p key={key++}>{parseInline(line)}</p>);
+        i++;
+      }
+
+      return elements;
+    }
+
+    // Parse inline: **bold**, *italic*, [text](url), [1]
+    function parseInline(text) {
+      const parts = [];
+      const regex = /(\*\*(.+?)\*\*|\*(.+?)\*|\[([^\]]+)\]\(([^)]+)\)|\[(\d+)\])/g;
+      let last = 0;
+      let match;
+      let key = 0;
+
+      while ((match = regex.exec(text)) !== null) {
+        if (match.index > last) {
+          parts.push(text.slice(last, match.index));
+        }
+        if (match[2]) {
+          // **bold**
+          parts.push(<strong key={key++}>{match[2]}</strong>);
+        } else if (match[3]) {
+          // *italic*
+          parts.push(<em key={key++}>{match[3]}</em>);
+        } else if (match[4] && match[5]) {
+          // [text](url)
+          parts.push(
+            <a key={key++} href={match[5]} target="_blank" rel="noopener noreferrer"
+               style={{color:"#4f46e5", textDecoration:"underline"}}>
+              {match[4]}
+            </a>
+          );
+        } else if (match[6]) {
+          // [1] citation marker — keep as-is styled
+          parts.push(
+            <sup key={key++} style={{color:"#6366f1", fontWeight:600, fontSize:"11px"}}>
+              [{match[6]}]
+            </sup>
+          );
+        }
+        last = match.index + match[0].length;
+      }
+
+      if (last < text.length) parts.push(text.slice(last));
+      return parts;
+    }
+
+    function MarkdownContent({ text, streaming }) {
+      const elements = renderMarkdown(text);
+      return (
+        <div className="md-content">
+          {elements}
+          {streaming && text && <span className="cursor" />}
+        </div>
+      );
+    }
+
     function CitationBadge({ c }) {
       return (
         <a href={c.url} target="_blank" rel="noopener noreferrer" className="citation-badge">
@@ -243,13 +313,13 @@
       const isUser = msg.role === "user";
       return (
         <div className={`message-row ${isUser ? "user" : ""}`}>
-          <div className={`avatar ${isUser ? "user" : ""}`}>
-            {isUser ? "Y" : "A"}
-          </div>
+          <div className={`avatar ${isUser ? "user" : ""}`}>{isUser ? "Y" : "A"}</div>
           <div>
             <div className={`bubble ${isUser ? "user" : "assistant"}`}>
-              {msg.content}
-              {msg.streaming && msg.content && <span className="cursor" />}
+              {isUser
+                ? msg.content
+                : <MarkdownContent text={msg.content} streaming={msg.streaming} />
+              }
             </div>
             {msg.citations && msg.citations.length > 0 && (
               <div className="citations">
@@ -262,9 +332,7 @@
                 {msg.meta.model_used && <span>{msg.meta.model_used}</span>}
                 {msg.meta.latency_ms && (
                   <span>
-                    {Math.round(
-                      Object.values(msg.meta.latency_ms).reduce((a, b) => a + b, 0)
-                    )}ms
+                    {Math.round(Object.values(msg.meta.latency_ms).reduce((a,b)=>a+b,0))}ms
                   </span>
                 )}
               </div>
@@ -279,9 +347,7 @@
         <div className="typing-row">
           <div className="avatar">A</div>
           <div className="typing-bubble">
-            <div className="dot" />
-            <div className="dot" />
-            <div className="dot" />
+            <div className="dot" /><div className="dot" /><div className="dot" />
           </div>
         </div>
       );
@@ -293,11 +359,11 @@
         content: "Hello! I'm Aria, RLG's AI Assistant. I'm here to help you with questions about Royal London insurance, pensions, ISAs and other financial products. How can I help you today?",
         citations: [],
       }]);
-      const [input, setInput]           = useState("");
-      const [loading, setLoading]       = useState(false);
-      const [error, setError]           = useState(null);
-      const [showTyping, setShowTyping] = useState(false);
-      const [backendUrl, setBackendUrl] = useState("http://127.0.0.1:8000");
+      const [input, setInput]               = useState("");
+      const [loading, setLoading]           = useState(false);
+      const [error, setError]               = useState(null);
+      const [showTyping, setShowTyping]     = useState(false);
+      const [backendUrl, setBackendUrl]     = useState("http://127.0.0.1:8000");
       const [showSettings, setShowSettings] = useState(false);
       const bottomRef = useRef(null);
       const inputRef  = useRef(null);
@@ -318,7 +384,6 @@
         setLoading(true);
         setShowTyping(true);
         setError(null);
-
         const aId = Date.now() + 1;
 
         try {
@@ -327,7 +392,6 @@
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ query: query.trim(), conversation_history: history }),
           });
-
           if (!res.ok) throw new Error(`Server error: ${res.status}`);
 
           const reader  = res.body.getReader();
@@ -338,13 +402,11 @@
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-
             const lines = decoder.decode(value).split("\n");
             for (const line of lines) {
               if (!line.startsWith("data: ")) continue;
               try {
                 const data = JSON.parse(line.slice(6));
-
                 if (data.token) {
                   if (!started) {
                     setShowTyping(false);
@@ -359,26 +421,19 @@
                     m.id === aId ? { ...m, content: fullText } : m
                   ));
                 }
-
                 if (data.done) {
                   setMessages(prev => prev.map(m =>
                     m.id === aId ? {
                       ...m, content: fullText, streaming: false,
                       citations: data.citations || [],
-                      meta: {
-                        cached: data.cached,
-                        model_used: data.model_used,
-                        latency_ms: data.latency_ms,
-                      }
+                      meta: { cached: data.cached, model_used: data.model_used, latency_ms: data.latency_ms }
                     } : m
                   ));
                 }
-
                 if (data.error) {
                   setShowTyping(false);
                   setMessages(prev => [...prev, {
-                    id: aId, role: "assistant",
-                    content: data.error, streaming: false, citations: [],
+                    id: aId, role: "assistant", content: data.error, streaming: false, citations: [],
                   }]);
                 }
               } catch(e) {}
@@ -395,92 +450,63 @@
       };
 
       const onKey = (e) => {
-        if (e.key === "Enter" && !e.shiftKey) {
-          e.preventDefault();
-          send(input);
-        }
+        if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); }
       };
 
       return (
         <>
-          {/* Header */}
           <div className="header">
             <div className="header-left">
               <div className="avatar">A</div>
               <div>
                 <div className="header-name">Aria</div>
-                <div className="header-status">
-                  <span className="status-dot" /> RLG AI Assistant
-                </div>
+                <div className="header-status"><span className="status-dot" /> RLG AI Assistant</div>
               </div>
             </div>
-            <button className="settings-btn" onClick={() => setShowSettings(!showSettings)}>
-              ⚙ Settings
-            </button>
+            <button className="settings-btn" onClick={() => setShowSettings(!showSettings)}>⚙ Settings</button>
           </div>
 
-          {/* Settings */}
           {showSettings && (
             <div className="settings-bar">
               <label>Backend URL:</label>
-              <input
-                type="text" value={backendUrl}
-                onChange={e => setBackendUrl(e.target.value)}
-                placeholder="http://127.0.0.1:8000"
-              />
+              <input type="text" value={backendUrl} onChange={e => setBackendUrl(e.target.value)} placeholder="http://127.0.0.1:8000" />
               <button onClick={() => setShowSettings(false)}>Done</button>
             </div>
           )}
 
-          {/* Messages */}
           <div className="messages">
             <div className="messages-inner">
               {messages.map(m => <Message key={m.id} msg={m} />)}
               {showTyping && <TypingIndicator />}
-              {error && (
-                <div className="error-bar">
-                  <span className="error-msg">⚠ {error}</span>
-                </div>
-              )}
+              {error && <div className="error-bar"><span className="error-msg">⚠ {error}</span></div>}
               <div ref={bottomRef} />
             </div>
           </div>
 
-          {/* Suggested questions */}
           {messages.length === 1 && !loading && (
             <div className="suggestions">
               <div className="suggestions-inner">
                 {SUGGESTED.map((q, i) => (
-                  <button key={i} className="suggestion-btn" onClick={() => send(q)}>
-                    {q}
-                  </button>
+                  <button key={i} className="suggestion-btn" onClick={() => send(q)}>{q}</button>
                 ))}
               </div>
             </div>
           )}
 
-          {/* Input */}
           <div className="input-area">
             <div className="input-inner">
               <textarea
-                ref={inputRef}
-                value={input}
+                ref={inputRef} value={input}
                 onChange={e => setInput(e.target.value)}
                 onKeyDown={onKey}
                 placeholder="Ask about Royal London insurance, pensions or ISAs..."
-                disabled={loading}
-                rows={1}
+                disabled={loading} rows={1}
               />
-              <button
-                className="send-btn"
-                onClick={() => send(input)}
-                disabled={loading || !input.trim()}
-              >
+              <button className="send-btn" onClick={() => send(input)} disabled={loading || !input.trim()}>
                 {loading
                   ? <div className="spinner" />
                   : <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                      <line x1="22" y1="2" x2="11" y2="13" />
-                      <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                      <line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" />
                     </svg>
                 }
               </button>
