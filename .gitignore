@@ -11,6 +11,7 @@ venv/
 
 # Data files - too large for git
 scraper/data/*.json
+!scraper/data/royal_london_faq_clean_20260609_142353.json
 
 # Logs
 *.log
