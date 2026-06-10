@@ -3,13 +3,14 @@ Shared embedding client — single instance reused across all nodes.
 Eliminates duplicate embedding generation.
 
 Migration: Cohere → text-embedding-3-large via Azure AI Foundry
-Auth:       DefaultAzureCredential (no API key required)
+Auth:       DefaultAzureCredential + bearer token (no API key required)
+Fix:        Bypasses AIProjectClient.get_openai_client() bug in v2.2.0
+            by using AzureOpenAI directly with token provider
 """
 
 import os
 from openai import AzureOpenAI
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-from azure.ai.projects import AIProjectClient
 from dotenv import load_dotenv
 import structlog
 
@@ -27,36 +28,42 @@ EMBEDDING_DIMENSIONS  = int(
 )
 
 # Singleton clients — created once, reused
-_project_client: AIProjectClient | None = None
-_openai_client:  AzureOpenAI | None     = None
+_credential:     DefaultAzureCredential | None = None
+_openai_client:  AzureOpenAI | None            = None
 
 
-def get_project_client() -> AIProjectClient:
-    """Get or create singleton AIProjectClient."""
-    global _project_client
-    if _project_client is None:
-        if not PROJECT_ENDPOINT:
-            raise ValueError(
-                "PROJECT_ENDPOINT is not set in .env"
-            )
-        _project_client = AIProjectClient(
-            endpoint=PROJECT_ENDPOINT,
-            credential=DefaultAzureCredential(),
-        )
-        log.info("project_client_created", endpoint=PROJECT_ENDPOINT)
-    return _project_client
+def get_credential() -> DefaultAzureCredential:
+    """Get or create singleton DefaultAzureCredential."""
+    global _credential
+    if _credential is None:
+        _credential = DefaultAzureCredential()
+        log.info("credential_created")
+    return _credential
 
 
 def get_openai_client() -> AzureOpenAI:
     """
-    Get or create singleton OpenAI client via AIProjectClient.
-    Uses DefaultAzureCredential — no API key needed.
+    Get or create singleton AzureOpenAI client.
+
+    Uses DefaultAzureCredential with bearer token provider.
+    Bypasses AIProjectClient.get_openai_client() which has a known
+    bug in v2.2.0 where it returns OpenAI instead of AzureOpenAI,
+    causing TypeError on api_version parameter.
     """
     global _openai_client
     if _openai_client is None:
-        project = get_project_client()
-        _openai_client = project.inference.get_azure_openai_client(
-            api_version="2024-12-01-preview"
+        if not PROJECT_ENDPOINT:
+            raise ValueError(
+                "PROJECT_ENDPOINT is not set in .env"
+            )
+        token_provider = get_bearer_token_provider(
+            get_credential(),
+            "https://cognitiveservices.azure.com/.default",
+        )
+        _openai_client = AzureOpenAI(
+            azure_endpoint=PROJECT_ENDPOINT,
+            azure_ad_token_provider=token_provider,
+            api_version="2024-12-01-preview",
         )
         log.info(
             "openai_client_created",
@@ -77,8 +84,8 @@ def get_embedding(
     Args:
         text:       Text to embed
         input_type: 'query' for search queries,
-                    'document' for indexing (ignored by OpenAI,
-                    kept for API compatibility with old Cohere calls)
+                    'document' for indexing (kept for API
+                    compatibility with old Cohere callers)
     """
     client = get_openai_client()
     response = client.embeddings.create(

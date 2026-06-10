@@ -4,16 +4,17 @@ Chunks scraped content, generates embeddings,
 pushes to Azure AI Search.
 
 Migration: Cohere → text-embedding-3-large via Azure AI Foundry
-Auth:       DefaultAzureCredential (no API key required)
+Auth:       DefaultAzureCredential + bearer token (no API key required)
+Fix:        Bypasses AIProjectClient.get_openai_client() bug in v2.2.0
+            by using AzureOpenAI directly with token provider
 
 Supports:
   --full:     Delete + recreate index (fresh start)
-  --new-only: Only index pages not already indexed
-              (default)
+  --new-only: Only index pages not already indexed (default)
 
 Usage:
-    uv run python scraper/chunk_and_index.py --full
-    uv run python scraper/chunk_and_index.py --new-only
+    python scraper/chunk_and_index.py --full
+    python scraper/chunk_and_index.py --new-only
 """
 
 import json
@@ -23,8 +24,8 @@ import argparse
 import os
 
 import structlog
-from azure.identity import DefaultAzureCredential
-from azure.ai.projects import AIProjectClient
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+from openai import AzureOpenAI
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
 from azure.search.documents.indexes.models import (
@@ -48,25 +49,24 @@ log = structlog.get_logger()
 SCRAPED_FILE = (
     "scraper/data/royal_london_faq_clean_20260609_142353.json"
 )
-CHUNK_SIZE             = 1600
-CHUNK_OVERLAP          = 200
-INDEX_NAME             = os.getenv("AZURE_SEARCH_INDEX_NAME", "rlg-faq-index")
-EMBEDDING_DIMS         = int(os.getenv("AZURE_OPENAI_EMBEDDING_DIMENSIONS", "1024"))
-PROJECT_ENDPOINT       = os.getenv("PROJECT_ENDPOINT", "").rstrip("/")
-SEARCH_ENDPOINT        = os.getenv("AZURE_SEARCH_ENDPOINT", "").rstrip("/")
-EMBEDDING_DEPLOYMENT   = os.getenv(
+CHUNK_SIZE           = 1600
+CHUNK_OVERLAP        = 200
+INDEX_NAME           = os.getenv("AZURE_SEARCH_INDEX_NAME", "rlg-faq-index")
+EMBEDDING_DIMS       = int(os.getenv("AZURE_OPENAI_EMBEDDING_DIMENSIONS", "1024"))
+PROJECT_ENDPOINT     = os.getenv("PROJECT_ENDPOINT", "").rstrip("/")
+SEARCH_ENDPOINT      = os.getenv("AZURE_SEARCH_ENDPOINT", "").rstrip("/")
+EMBEDDING_DEPLOYMENT = os.getenv(
     "AZURE_OPENAI_EMBEDDING_DEPLOYMENT",
     "text-embedding-3-large",
 )
 
 # Batch sizes
-EMBEDDING_BATCH_SIZE   = 100   # OpenAI supports up to 2048; 100 is safe
-UPLOAD_BATCH_SIZE      = 100   # Azure AI Search upload batch size
+EMBEDDING_BATCH_SIZE = 100   # Safe batch size for OpenAI embeddings
+UPLOAD_BATCH_SIZE    = 100   # Azure AI Search upload batch size
 
 # ── Singleton clients ─────────────────────────────────────────
-_credential      = None
-_project_client  = None
-_openai_client   = None
+_credential     = None
+_openai_client  = None
 
 
 def get_credential() -> DefaultAzureCredential:
@@ -78,23 +78,29 @@ def get_credential() -> DefaultAzureCredential:
     return _credential
 
 
-def get_openai_client():
+def get_openai_client() -> AzureOpenAI:
     """
-    Get or create singleton OpenAI client via AIProjectClient.
-    Used for generating embeddings.
+    Get or create singleton AzureOpenAI client.
+
+    Uses DefaultAzureCredential with bearer token provider.
+    Bypasses AIProjectClient.get_openai_client() which has a known
+    bug in v2.2.0 where it returns OpenAI instead of AzureOpenAI,
+    causing TypeError on api_version parameter.
     """
-    global _project_client, _openai_client
+    global _openai_client
     if _openai_client is None:
         if not PROJECT_ENDPOINT:
             raise ValueError(
                 "PROJECT_ENDPOINT is not set in .env"
             )
-        _project_client = AIProjectClient(
-            endpoint=PROJECT_ENDPOINT,
-            credential=get_credential(),
+        token_provider = get_bearer_token_provider(
+            get_credential(),
+            "https://cognitiveservices.azure.com/.default",
         )
-        _openai_client = _project_client.inference.get_azure_openai_client(
-            api_version="2024-12-01-preview"
+        _openai_client = AzureOpenAI(
+            azure_endpoint=PROJECT_ENDPOINT,
+            azure_ad_token_provider=token_provider,
+            api_version="2024-12-01-preview",
         )
         log.info(
             "openai_client_created",
@@ -147,7 +153,6 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
             continue
 
         # Prepend title → every chunk benefits from page context
-        # → Better embedding similarity for title-based queries
         content_with_title = (
             f"{title}\n\n{content}" if title else content
         )
@@ -296,16 +301,16 @@ def create_or_update_index(fresh: bool = False):
 # ── Embeddings ────────────────────────────────────────────────
 def get_embeddings(
     texts: list[str],
-    input_type: str = "document",
 ) -> list[list[float]]:
     """
     Generate embeddings in batches using text-embedding-3-large.
-    OpenAI supports up to 2048 inputs per request;
-    we use 100 per batch for safe memory usage.
+    Processes in batches of 100 for safe memory usage.
     """
-    client         = get_openai_client()
+    client        = get_openai_client()
     all_embeddings = []
-    total_batches  = (len(texts) + EMBEDDING_BATCH_SIZE - 1) // EMBEDDING_BATCH_SIZE
+    total_batches  = (
+        len(texts) + EMBEDDING_BATCH_SIZE - 1
+    ) // EMBEDDING_BATCH_SIZE
 
     for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
         batch    = texts[i : i + EMBEDDING_BATCH_SIZE]
@@ -359,10 +364,10 @@ def upload_chunks(
 # ── Verify ────────────────────────────────────────────────────
 def verify_index():
     """Run a test hybrid query to verify the index works."""
-    openai_client = get_openai_client()
-    test_query    = "How do I make a claim?"
+    client     = get_openai_client()
+    test_query = "How do I make a claim?"
 
-    response = openai_client.embeddings.create(
+    response = client.embeddings.create(
         input=[test_query],
         model=EMBEDDING_DEPLOYMENT,
         dimensions=EMBEDDING_DIMS,
@@ -416,19 +421,18 @@ def main():
         default=SCRAPED_FILE,
         help="Path to scraped JSON file",
     )
-    args = parser.parse_args()
-
+    args         = parser.parse_args()
     fresh        = args.full
     scraped_file = args.file
 
     print("\n🚀 RLG Chunk and Index Pipeline")
     print("=" * 55)
-    print(f"   Mode:      {'FULL (fresh index)' if fresh else 'NEW ONLY (append)'}")
-    print(f"   File:      {scraped_file}")
-    print(f"   Index:     {INDEX_NAME}")
-    print(f"   Model:     {EMBEDDING_DEPLOYMENT}")
-    print(f"   Dims:      {EMBEDDING_DIMS}")
-    print(f"   Endpoint:  {SEARCH_ENDPOINT}")
+    print(f"   Mode:     {'FULL (fresh index)' if fresh else 'NEW ONLY (append)'}")
+    print(f"   File:     {scraped_file}")
+    print(f"   Index:    {INDEX_NAME}")
+    print(f"   Model:    {EMBEDDING_DEPLOYMENT}")
+    print(f"   Dims:     {EMBEDDING_DIMS}")
+    print(f"   Endpoint: {SEARCH_ENDPOINT}")
     print("=" * 55)
 
     # ── Validate config ───────────────────────────────
