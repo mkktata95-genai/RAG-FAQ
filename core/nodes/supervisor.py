@@ -5,6 +5,8 @@ P3 - Request ID injection
 
 Migration: Mistral-small → gpt-4o-mini
 Auth:       DefaultAzureCredential + bearer token (no API key)
+Fix:        Added IRRELEVANT intent for off-topic queries
+            (weather, sport, food, politics etc.)
 """
 
 import re
@@ -38,10 +40,7 @@ def get_credential() -> DefaultAzureCredential:
 
 
 def get_openai_client() -> AzureOpenAI:
-    """
-    Get or create singleton AzureOpenAI client.
-    Reused across all supervisor calls.
-    """
+    """Get or create singleton AzureOpenAI client."""
     global _openai_client
     if _openai_client is None:
         if not AZURE_OPENAI_ENDPOINT:
@@ -102,6 +101,11 @@ FAREWELL   - Bye, goodbye, see you, take care etc.
 CAPABILITY - What can you do, who are you, how can you help,
              what are you, tell me about yourself etc.
 
+IRRELEVANT - Questions completely unrelated to insurance or
+             pensions: weather, sport, food, politics,
+             entertainment, technology, travel, gaming,
+             celebrity news, recipes, football results etc.
+
 Respond with JSON only:
 {"intent": "<INTENT>", "confidence": <0.0-1.0>}
 
@@ -114,7 +118,15 @@ Examples:
 "What can you help with?" -> {"intent": "CAPABILITY", "confidence": 1.0}
 "lol ok bye then" -> {"intent": "FAREWELL", "confidence": 0.9}
 "u ok mate" -> {"intent": "CHITCHAT", "confidence": 0.95}
-"morning!" -> {"intent": "GREETING", "confidence": 1.0}"""
+"morning!" -> {"intent": "GREETING", "confidence": 1.0}
+"What is the weather today?" -> {"intent": "IRRELEVANT", "confidence": 1.0}
+"Who won the football?" -> {"intent": "IRRELEVANT", "confidence": 1.0}
+"Who won last football worldcup?" -> {"intent": "IRRELEVANT", "confidence": 1.0}
+"What's for dinner?" -> {"intent": "IRRELEVANT", "confidence": 1.0}
+"Tell me a joke" -> {"intent": "IRRELEVANT", "confidence": 1.0}
+"What is the capital of France?" -> {"intent": "IRRELEVANT", "confidence": 1.0}
+"Who is the prime minister?" -> {"intent": "IRRELEVANT", "confidence": 1.0}
+"Best restaurants near me" -> {"intent": "IRRELEVANT", "confidence": 1.0}"""
 
 # ── Greeting Responses ────────────────────────────────────────
 GREETING_RESPONSES = {
@@ -150,6 +162,12 @@ GREETING_RESPONSES = {
         "- Finding a lost pension\n"
         "- And much more!\n\n"
         "What would you like to know today?"
+    ),
+    "IRRELEVANT": (
+        "I can only help with questions about Royal London "
+        "insurance, pensions, ISAs and related financial "
+        "products. Is there anything in those areas "
+        "I can help you with today?"
     ),
 }
 
@@ -320,7 +338,7 @@ def supervisor_node(state: AgentState) -> AgentState:
     if intent != "INSURANCE" and confidence >= 0.85:
         state.final_response    = GREETING_RESPONSES.get(
             intent,
-            GREETING_RESPONSES["CAPABILITY"],
+            GREETING_RESPONSES["IRRELEVANT"],
         )
         state.refusal_triggered = False
         log.info(
