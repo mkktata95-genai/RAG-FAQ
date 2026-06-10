@@ -5,8 +5,8 @@ pushes to Azure AI Search.
 
 Migration: Cohere → text-embedding-3-large via Azure AI Foundry
 Auth:       DefaultAzureCredential + bearer token (no API key required)
-Fix:        Bypasses AIProjectClient.get_openai_client() bug in v2.2.0
-            by using AzureOpenAI directly with token provider
+Fix:        Uses AZURE_OPENAI_ENDPOINT (.openai.azure.com) for embeddings
+            as PROJECT_ENDPOINT does not route embedding requests
 
 Supports:
   --full:     Delete + recreate index (fresh start)
@@ -53,7 +53,7 @@ CHUNK_SIZE           = 1600
 CHUNK_OVERLAP        = 200
 INDEX_NAME           = os.getenv("AZURE_SEARCH_INDEX_NAME", "rlg-faq-index")
 EMBEDDING_DIMS       = int(os.getenv("AZURE_OPENAI_EMBEDDING_DIMENSIONS", "1024"))
-PROJECT_ENDPOINT     = os.getenv("PROJECT_ENDPOINT", "").rstrip("/")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
 SEARCH_ENDPOINT      = os.getenv("AZURE_SEARCH_ENDPOINT", "").rstrip("/")
 EMBEDDING_DEPLOYMENT = os.getenv(
     "AZURE_OPENAI_EMBEDDING_DEPLOYMENT",
@@ -61,12 +61,12 @@ EMBEDDING_DEPLOYMENT = os.getenv(
 )
 
 # Batch sizes
-EMBEDDING_BATCH_SIZE = 100   # Safe batch size for OpenAI embeddings
-UPLOAD_BATCH_SIZE    = 100   # Azure AI Search upload batch size
+EMBEDDING_BATCH_SIZE = 100
+UPLOAD_BATCH_SIZE    = 100
 
 # ── Singleton clients ─────────────────────────────────────────
-_credential     = None
-_openai_client  = None
+_credential    = None
+_openai_client = None
 
 
 def get_credential() -> DefaultAzureCredential:
@@ -82,28 +82,28 @@ def get_openai_client() -> AzureOpenAI:
     """
     Get or create singleton AzureOpenAI client.
 
-    Uses DefaultAzureCredential with bearer token provider.
-    Bypasses AIProjectClient.get_openai_client() which has a known
-    bug in v2.2.0 where it returns OpenAI instead of AzureOpenAI,
-    causing TypeError on api_version parameter.
+    Uses AZURE_OPENAI_ENDPOINT (.openai.azure.com) because
+    PROJECT_ENDPOINT does not route embedding requests.
+    Auth via DefaultAzureCredential + cognitiveservices audience.
     """
     global _openai_client
     if _openai_client is None:
-        if not PROJECT_ENDPOINT:
+        if not AZURE_OPENAI_ENDPOINT:
             raise ValueError(
-                "PROJECT_ENDPOINT is not set in .env"
+                "AZURE_OPENAI_ENDPOINT is not set in .env"
             )
         token_provider = get_bearer_token_provider(
             get_credential(),
             "https://cognitiveservices.azure.com/.default",
         )
         _openai_client = AzureOpenAI(
-            azure_endpoint=PROJECT_ENDPOINT,
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
             azure_ad_token_provider=token_provider,
             api_version="2024-12-01-preview",
         )
         log.info(
             "openai_client_created",
+            endpoint=AZURE_OPENAI_ENDPOINT,
             deployment=EMBEDDING_DEPLOYMENT,
             dimensions=EMBEDDING_DIMS,
         )
@@ -306,7 +306,7 @@ def get_embeddings(
     Generate embeddings in batches using text-embedding-3-large.
     Processes in batches of 100 for safe memory usage.
     """
-    client        = get_openai_client()
+    client         = get_openai_client()
     all_embeddings = []
     total_batches  = (
         len(texts) + EMBEDDING_BATCH_SIZE - 1
@@ -432,12 +432,13 @@ def main():
     print(f"   Index:    {INDEX_NAME}")
     print(f"   Model:    {EMBEDDING_DEPLOYMENT}")
     print(f"   Dims:     {EMBEDDING_DIMS}")
-    print(f"   Endpoint: {SEARCH_ENDPOINT}")
+    print(f"   Search:   {SEARCH_ENDPOINT}")
+    print(f"   OpenAI:   {AZURE_OPENAI_ENDPOINT}")
     print("=" * 55)
 
     # ── Validate config ───────────────────────────────
-    if not PROJECT_ENDPOINT:
-        print("❌ PROJECT_ENDPOINT not set in .env")
+    if not AZURE_OPENAI_ENDPOINT:
+        print("❌ AZURE_OPENAI_ENDPOINT not set in .env")
         sys.exit(1)
     if not SEARCH_ENDPOINT:
         print("❌ AZURE_SEARCH_ENDPOINT not set in .env")

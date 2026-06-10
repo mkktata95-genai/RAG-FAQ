@@ -4,8 +4,8 @@ Eliminates duplicate embedding generation.
 
 Migration: Cohere → text-embedding-3-large via Azure AI Foundry
 Auth:       DefaultAzureCredential + bearer token (no API key required)
-Fix:        Bypasses AIProjectClient.get_openai_client() bug in v2.2.0
-            by using AzureOpenAI directly with token provider
+Fix:        Uses AZURE_OPENAI_ENDPOINT (.openai.azure.com) for embeddings
+            as PROJECT_ENDPOINT does not route embedding requests
 """
 
 import os
@@ -18,7 +18,7 @@ load_dotenv()
 log = structlog.get_logger()
 
 # ── Config ────────────────────────────────────────────────────
-PROJECT_ENDPOINT      = os.getenv("PROJECT_ENDPOINT", "").rstrip("/")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
 EMBEDDING_DEPLOYMENT  = os.getenv(
     "AZURE_OPENAI_EMBEDDING_DEPLOYMENT",
     "text-embedding-3-large",
@@ -28,8 +28,8 @@ EMBEDDING_DIMENSIONS  = int(
 )
 
 # Singleton clients — created once, reused
-_credential:     DefaultAzureCredential | None = None
-_openai_client:  AzureOpenAI | None            = None
+_credential:    DefaultAzureCredential | None = None
+_openai_client: AzureOpenAI | None            = None
 
 
 def get_credential() -> DefaultAzureCredential:
@@ -45,28 +45,28 @@ def get_openai_client() -> AzureOpenAI:
     """
     Get or create singleton AzureOpenAI client.
 
-    Uses DefaultAzureCredential with bearer token provider.
-    Bypasses AIProjectClient.get_openai_client() which has a known
-    bug in v2.2.0 where it returns OpenAI instead of AzureOpenAI,
-    causing TypeError on api_version parameter.
+    Uses AZURE_OPENAI_ENDPOINT (.openai.azure.com) because
+    PROJECT_ENDPOINT does not route embedding requests.
+    Auth via DefaultAzureCredential + cognitiveservices audience.
     """
     global _openai_client
     if _openai_client is None:
-        if not PROJECT_ENDPOINT:
+        if not AZURE_OPENAI_ENDPOINT:
             raise ValueError(
-                "PROJECT_ENDPOINT is not set in .env"
+                "AZURE_OPENAI_ENDPOINT is not set in .env"
             )
         token_provider = get_bearer_token_provider(
             get_credential(),
             "https://cognitiveservices.azure.com/.default",
         )
         _openai_client = AzureOpenAI(
-            azure_endpoint=PROJECT_ENDPOINT,
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
             azure_ad_token_provider=token_provider,
             api_version="2024-12-01-preview",
         )
         log.info(
             "openai_client_created",
+            endpoint=AZURE_OPENAI_ENDPOINT,
             deployment=EMBEDDING_DEPLOYMENT,
             dimensions=EMBEDDING_DIMENSIONS,
         )
