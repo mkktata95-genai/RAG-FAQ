@@ -1,0 +1,23 @@
+# Environment - NEVER commit this
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Data files - too large for git
+scraper/data/*.json
+
+# Logs
+*.log
+logs/
+
+# VS Code
+.vscode/
+
+# Azure credentials cache
+.azure/
