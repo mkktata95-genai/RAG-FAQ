@@ -5,23 +5,8 @@ P3 - Request ID injection
 
 Migration: Mistral-small → gpt-4o-mini
 Auth:       DefaultAzureCredential + bearer token (no API key)
-Fix 1:      Added IRRELEVANT intent for off-topic queries
+Fix:        Added IRRELEVANT intent for off-topic queries
             (weather, sport, food, politics etc.)
-Fix 2:      Added context-aware routing override (June 2026)
-            Prevents misrouting when a query looks like CHITCHAT/
-            IRRELEVANT/THANKS but is actually a contextual follow-up
-            referencing the conversation history.
-
-            Covers 9 misrouting categories:
-              A. Frustration & complaint references
-              B. Confirmation/acknowledgement leading to follow-up
-              C. Clarification of a previous misunderstood answer
-              D. Topic continuation with ambiguous opener
-              E. Emotional response that needs continuation
-              F. Negative response / disagreement
-              G. Implicit query (short query, meaning from history)
-              H. Frustrated farewell (needs empathy not goodbye)
-              I. Continuation with thanks opener
 """
 
 import re
@@ -93,144 +78,6 @@ OBVIOUS_THANKS = {
     "thank you so much", "thanks a lot",
     "many thanks", "appreciated",
 }
-
-# ── Context-Aware Routing Override ───────────────────────────
-#
-# These word groups detect when a query that LOOKS like CHITCHAT,
-# THANKS, IRRELEVANT, or FAREWELL is actually a contextual follow-up
-# that REQUIRES conversation history to answer correctly.
-#
-# If ANY word/phrase from these groups matches AND conversation
-# history exists → override intent → route through full pipeline.
-#
-# CATEGORY A: Frustration & complaint references
-# "Why didn't you answer?" / "That's not what I asked" etc.
-HISTORY_REFERENCE_WORDS = [
-    "previous", "earlier", "before", "last time",
-    "you said", "didn't answer", "didnt answer",
-    "you told", "you mentioned", "already asked",
-    "already told", "not what i asked", "not what i said",
-    "not what i meant", "misunderstood", "you keep",
-    "repeating", "same thing", "try again", "asked you",
-    "my question", "my previous", "what i asked",
-]
-
-# CATEGORY F: Negative responses / disagreement
-# "No that's not right" / "Are you sure?" etc.
-DISAGREEMENT_WORDS = [
-    "that's not right", "thats not right",
-    "that's wrong", "thats wrong", "that's incorrect",
-    "thats incorrect", "that's not correct", "thats not correct",
-    "are you sure", "i don't think so", "i dont think so",
-    "i've heard differently", "ive heard differently",
-    "the website says", "that contradicts",
-    "that's not accurate", "thats not accurate",
-]
-
-# CATEGORY C: Clarification — user correcting a misunderstood answer
-# "No I meant my pension" / "Let me rephrase" etc.
-CLARIFICATION_WORDS = [
-    "i meant", "i was asking about", "let me rephrase",
-    "actually i meant", "no i meant", "not the",
-    "i said", "what i want to know", "i wasn't asking",
-    "i wasnt asking", "i meant to ask", "what i meant",
-    "to clarify", "to be clear",
-]
-
-# CATEGORY H: Frustrated farewell
-# "Whatever forget it" / "This is useless" / "Never mind" etc.
-# These need an empathetic response, not the standard farewell.
-FRUSTRATED_FAREWELL_WORDS = [
-    "whatever", "forget it", "never mind", "nevermind",
-    "this is useless", "this isn't helpful", "this isnt helpful",
-    "fine i'll", "fine ill", "i'll just call", "ill just call",
-    "not helpful", "waste of time", "pointless",
-]
-
-# CATEGORY G: Implicit short queries — meaningful ONLY with history
-# "Is that covered?" / "What are the fees?" / "Can I do it online?"
-# These are ≤5 words and contain a context-dependent word.
-IMPLICIT_QUERY_WORDS = [
-    "covered", "fees", "cost", "costs", "charges",
-    "how long", "how much", "take", "online",
-    "affect", "happen", "after", "change",
-    "different", "instead", "alternatively",
-    "what if", "what about", "same for",
-]
-
-# CATEGORY D & E: Continuation openers + emotional follow-up
-# "OK so what happens next?" / "I'm confused by that"
-CONTINUATION_WORDS = [
-    "but one more", "but what about", "but what if",
-    "now what about", "and what about", "so what does",
-    "what does that mean", "but how", "but when",
-    "can you simplify", "i'm confused", "im confused",
-    "confused by that", "confused by your",
-    "that sounds", "that seems expensive",
-    "that seems complicated",
-    # Category B: thanks + continuation
-    "thanks but", "thank you but", "cheers but",
-    "thanks and", "thank you and", "ok thanks but",
-    "ok thank you but", "great and", "ok and",
-    "got it but", "got it and", "understood but",
-]
-
-
-def is_contextual_follow_up(
-    query: str,
-    history: list[dict],
-) -> tuple[bool, str]:
-    """
-    Detect if a query that looks like non-INSURANCE is actually
-    a contextual follow-up that requires conversation history.
-
-    Returns:
-        (True, reason_category) if it should override to INSURANCE
-        (False, '') if it is genuinely non-insurance
-
-    Only activates if conversation_history is non-empty.
-    A first-message query with no history cannot be a follow-up.
-    """
-    if not history:
-        return False, ""
-
-    q = query.lower().strip()
-
-    # Category A: Explicit references to previous conversation
-    for phrase in HISTORY_REFERENCE_WORDS:
-        if phrase in q:
-            return True, "history_reference"
-
-    # Category F: Disagreement / correction
-    for phrase in DISAGREEMENT_WORDS:
-        if phrase in q:
-            return True, "disagreement"
-
-    # Category C: Clarification of previous answer
-    for phrase in CLARIFICATION_WORDS:
-        if phrase in q:
-            return True, "clarification"
-
-    # Category H: Frustrated farewell needs empathetic routing
-    for phrase in FRUSTRATED_FAREWELL_WORDS:
-        if phrase in q:
-            return True, "frustrated_farewell"
-
-    # Category D/E: Continuation opener
-    for phrase in CONTINUATION_WORDS:
-        if phrase in q:
-            return True, "continuation"
-
-    # Category G: Short implicit query (≤6 words) with context-dependent word
-    # Only applies if history exists (already checked above)
-    words = q.split()
-    if len(words) <= 6:
-        for word in IMPLICIT_QUERY_WORDS:
-            if word in q:
-                return True, "implicit_short_query"
-
-    return False, ""
-
 
 # ── Intent Classifier System Prompt ──────────────────────────
 INTENT_SYSTEM_PROMPT = """You are an intent classifier for
@@ -331,11 +178,6 @@ def quick_intent_check(query: str) -> str | None:
     Fast pattern check for obvious greetings.
     No API call needed — saves ~1-2s latency.
     Returns intent string or None if uncertain.
-
-    NOTE: This only matches EXACT short phrases.
-    "Why didn't you answer my previous question?" will NOT
-    match here — it falls through to classify_intent() and
-    then the context override check.
     """
     q = query.lower().strip()
     q = re.sub(r'[^\w\s]', '', q).strip()
@@ -462,24 +304,15 @@ def supervisor_node(state: AgentState) -> AgentState:
     """
     Entry point for the graph.
     Validates, sanitizes, classifies intent and prepares state.
-
-    Routing logic (in order):
-    1. Validate input (length, empty)
-    2. Quick pattern check (GREETING/FAREWELL/THANKS exact match)
-    3. LLM intent classification (gpt-4o-mini)
-    4. Context-aware override check — if query looks non-INSURANCE
-       BUT references conversation history → override to INSURANCE
-    5. Handle genuine non-insurance intents (early exit)
-    6. Continue pipeline for INSURANCE queries
     """
-    # ── Step 1: Assign request ID ─────────────────────────
+    # P3: Assign request ID
     if not state.request_id:
         state.request_id = generate_request_id()
 
-    # ── Step 2: Sanitize input ────────────────────────────
+    # P8: Sanitize input
     state.query = sanitize_input(state.query)
 
-    # ── Step 3: Validate length ───────────────────────────
+    # Validate length
     valid, message = validate_query_length(state.query)
     if not valid:
         state.refusal_triggered = True
@@ -491,55 +324,17 @@ def supervisor_node(state: AgentState) -> AgentState:
         )
         return state
 
-    # ── Step 4: Quick pattern check (no API call) ─────────
+    # ── Step 1: Quick pattern check (no API call) ─────────
     intent     = quick_intent_check(state.query)
     confidence = 1.0
     _used_llm  = False
 
-    # ── Step 5: LLM classifier only if uncertain ──────────
+    # ── Step 2: LLM classifier only if uncertain ──────────
     if intent is None:
         intent, confidence = classify_intent(state.query)
         _used_llm = True
 
-    # ── Step 6: Context-aware routing override ────────────
-    #
-    # BEFORE early-exiting on a non-INSURANCE intent, check whether
-    # this query is actually a contextual follow-up that requires
-    # history to answer correctly.
-    #
-    # Examples that would early-exit WITHOUT this check:
-    #   "Why you didnt answer my previous question?" → CHITCHAT → wrong
-    #   "That's not what I asked"                   → CHITCHAT → wrong
-    #   "Are you sure about that?"                  → CHITCHAT → wrong
-    #   "Is that covered?"                          → IRRELEVANT → wrong
-    #   "Never mind, forget it"                     → FAREWELL → wrong
-    #   "Thanks but what does that mean for me?"    → THANKS → wrong
-    #
-    # With the override, all of these route through the full pipeline
-    # where the generator has access to conversation_history.
-    #
-    _override_triggered = False
-    _override_reason    = ""
-
-    if intent != "INSURANCE" and confidence >= 0.85:
-        is_follow_up, reason = is_contextual_follow_up(
-            state.query,
-            state.conversation_history,
-        )
-        if is_follow_up:
-            _override_triggered = True
-            _override_reason    = reason
-            intent              = "INSURANCE"  # Force full pipeline
-            log.info(
-                "context_override_triggered",
-                original_intent=intent,
-                override_reason=reason,
-                query=state.query[:60],
-                history_turns=len(state.conversation_history),
-                request_id=state.request_id,
-            )
-
-    # ── Step 7: Handle genuine non-insurance intents ──────
+    # ── Step 3: Handle non-insurance intents ──────────────
     if intent != "INSURANCE" and confidence >= 0.85:
         state.final_response    = GREETING_RESPONSES.get(
             intent,
@@ -556,7 +351,7 @@ def supervisor_node(state: AgentState) -> AgentState:
         )
         return state
 
-    # ── Step 8: Insurance query — continue pipeline ───────
+    # ── Step 4: Insurance query — continue pipeline ───────
     if len(state.conversation_history) > 10:
         state.conversation_history = (
             state.conversation_history[-10:]
@@ -578,20 +373,12 @@ def supervisor_node(state: AgentState) -> AgentState:
         intent=intent,
         confidence=confidence,
         used_llm=_used_llm,
-        override_triggered=_override_triggered,
-        override_reason=_override_reason,
     )
 
     return state
 
 
 # ── Router functions ──────────────────────────────────────────
-def route_after_supervisor(state: AgentState) -> str:
-    if state.refusal_triggered or state.final_response:
-        return "end"
-    return "cache_check"
-
-
 def route_after_cache(state: AgentState) -> str:
     if state.cache_hit:
         return "end"

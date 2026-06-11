@@ -127,83 +127,6 @@ def get_search_index_client() -> SearchIndexClient:
     )
 
 
-# ── Content Cleaning ─────────────────────────────────────────
-def clean_content(text: str) -> str:
-    """
-    Remove external URLs from page content before chunking.
-
-    WHY THIS EXISTS:
-    Royal London's pages contain outbound hyperlinks to external
-    sites (gov.uk, moneyhelper.org.uk, citizensadvice.org.uk etc).
-    When scraped, these URLs end up inside the chunk text.
-    GPT reads them and reproduces them as clickable links or
-    citations in responses — making it look like Aria is
-    recommending external sites.
-
-    WHAT WE STRIP:
-    1. Markdown hyperlinks: [anchor text](https://external.com)
-       → keep the anchor text, remove the URL and brackets
-       → "visit [MoneyHelper](https://moneyhelper.org.uk)"
-         becomes "visit MoneyHelper"
-
-    2. Raw URLs: https://external.com/some/path
-       → remove entirely (bare URLs have no useful anchor text)
-
-    WHAT WE KEEP:
-    - royallondon.com URLs — these are the citation sources,
-      they must stay so the citation system works correctly
-    - All non-URL text — the actual content is preserved exactly
-    - Internal markdown links: [text](https://royallondon.com/...)
-      → kept as-is so citation extraction still works
-
-    SAFETY:
-    - Runs ONLY at index time (chunk_and_index.py), never at
-      query time — so the live pipeline is completely unaffected
-    - The function is pure (no side effects) and easily testable
-    - Does NOT modify source_url, title, section or any other field
-    - If the regex fails for any reason, original text is returned
-    """
-    import re
-
-    # Step 1: Strip markdown links to EXTERNAL sites
-    # Pattern: [any text](http://external.com/...)
-    # Keep: [text](https://www.royallondon.com/...)
-    # Remove: [text](https://www.moneyhelper.org.uk/...)
-    def replace_markdown_link(match):
-        anchor_text = match.group(1)
-        url         = match.group(2)
-        # Keep royallondon.com links intact — citation system needs them
-        if "royallondon.com" in url:
-            return match.group(0)
-        # For external links: keep the anchor text, drop the URL
-        return anchor_text
-
-    text = re.sub(
-        r'\[([^\]]+)\]\((https?://[^\)]+)\)',
-        replace_markdown_link,
-        text,
-    )
-
-    # Step 2: Strip remaining raw external URLs (not royallondon.com)
-    # These are bare URLs not wrapped in markdown — just remove them
-    def replace_raw_url(match):
-        url = match.group(0)
-        if "royallondon.com" in url:
-            return url  # Keep internal URLs
-        return ""       # Remove external bare URLs
-
-    text = re.sub(
-        r'https?://[^\s\)\]"\'<>,]+',
-        replace_raw_url,
-        text,
-    )
-
-    # Step 3: Clean up any double spaces left behind after URL removal
-    text = re.sub(r'  +', ' ', text)
-
-    return text.strip()
-
-
 # ── Chunking ──────────────────────────────────────────────────
 def chunk_pages(pages: list[dict]) -> list[dict]:
     """
@@ -228,10 +151,6 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
         if not content or len(content) < 50:
             log.warning("skipping_empty_page", url=url)
             continue
-
-        # Clean content: strip external URLs before chunking
-        # Keeps royallondon.com URLs intact for citation system
-        content = clean_content(content)
 
         # Prepend title → every chunk benefits from page context
         content_with_title = (
