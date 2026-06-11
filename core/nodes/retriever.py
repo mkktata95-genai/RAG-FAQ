@@ -2,6 +2,9 @@
 Retriever Node — hybrid search, reuses embedding from cache node.
 
 Migration: AzureKeyCredential → DefaultAzureCredential (no API key)
+Fix:        Added relevance score threshold check — if best chunk
+            scores below MIN_RELEVANCE_SCORE, treat as no results
+            to prevent hallucination on irrelevant context
 """
 
 import os
@@ -19,9 +22,22 @@ load_dotenv()
 log = structlog.get_logger()
 
 # ── Config ────────────────────────────────────────────────────
-SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT", "")
-INDEX_NAME      = os.getenv("AZURE_SEARCH_INDEX_NAME", "rlg-faq-index")
-TOP_K           = int(os.getenv("MAX_RETRIEVED_CHUNKS", "3"))
+SEARCH_ENDPOINT     = os.getenv("AZURE_SEARCH_ENDPOINT", "")
+INDEX_NAME          = os.getenv("AZURE_SEARCH_INDEX_NAME", "rlg-faq-index")
+TOP_K               = int(os.getenv("MAX_RETRIEVED_CHUNKS", "3"))
+
+# Minimum relevance score for retrieved chunks.
+# Hybrid search scores vary — chunks below this threshold
+# are considered irrelevant to the query and discarded.
+# This prevents GPT hallucinating answers when context
+# doesn't actually match the query (e.g. credit card query
+# returning pension chunks with low similarity).
+# Tune this value if legitimate queries get blocked:
+#   Too high (e.g. 0.03) → blocks valid queries
+#   Too low  (e.g. 0.005) → allows irrelevant context through
+MIN_RELEVANCE_SCORE = float(
+    os.getenv("MIN_RELEVANCE_SCORE", "0.01")
+)
 
 # ── Singleton client ──────────────────────────────────────────
 _credential:     DefaultAzureCredential | None = None
@@ -89,27 +105,54 @@ def retriever_node(state: AgentState) -> AgentState:
             top=TOP_K * 3,
         )
 
-        # Deduplicate by URL
-        chunks    = []
-        seen_urls = set()
+        # Deduplicate by URL + collect all candidates
+        candidates = []
+        seen_urls  = set()
 
         for result in results:
-            if len(chunks) >= TOP_K:
+            if len(candidates) >= TOP_K * 3:
                 break
-            url = result["source_url"]
+            url   = result["source_url"]
+            score = result.get("@search.score", 0.0)
             if url not in seen_urls:
-                chunks.append(RetrievedChunk(
+                candidates.append(RetrievedChunk(
                     chunk_id=result["chunk_id"],
                     content=result["content"],
                     source_url=url,
                     section=result.get("section", ""),
                     title=result.get("title", ""),
-                    score=result.get("@search.score", 0.0),
+                    score=score,
                 ))
                 seen_urls.add(url)
 
-        state.retrieved_chunks = chunks
-        latency                = (time.time() - start) * 1000
+        # ── Relevance score filter ────────────────────────────
+        # Check if best chunk meets minimum relevance threshold.
+        # If even the top result scores below MIN_RELEVANCE_SCORE,
+        # the query has no relevant content in our index — treat
+        # as no results to prevent hallucination.
+        if candidates:
+            best_score = max(c.score for c in candidates)
+            log.info(
+                "retrieval_scores",
+                best_score=round(best_score, 4),
+                min_threshold=MIN_RELEVANCE_SCORE,
+                candidates=len(candidates),
+            )
+
+            if best_score < MIN_RELEVANCE_SCORE:
+                log.warning(
+                    "low_relevance_scores",
+                    best_score=round(best_score, 4),
+                    threshold=MIN_RELEVANCE_SCORE,
+                    query=state.query[:50],
+                )
+                candidates = []
+
+        # Take top K from filtered candidates
+        chunks = candidates[:TOP_K]
+
+        state.retrieved_chunks        = chunks
+        latency                       = (time.time() - start) * 1000
         state.latency_ms["retriever"] = latency
 
         log.info(

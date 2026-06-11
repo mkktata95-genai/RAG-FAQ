@@ -4,6 +4,8 @@ answer length control and token tracking.
 
 Migration: Mistral → gpt-4.1 (main) + gpt-4o-mini (simple)
 Auth:       DefaultAzureCredential + bearer token (no API key)
+Fix:        Added UNKNOWN PRODUCT RULE to system prompt —
+            prevents hallucination when context doesn't match query
 """
 
 import os
@@ -129,6 +131,21 @@ Use [1] for the first source you reference,
 [2] for the second, [3] for the third.
 Never skip numbers or use numbers out of order.
 
+UNKNOWN PRODUCT RULE:
+Royal London offers: life insurance, pensions, ISAs,
+critical illness cover, income protection, and over 50s
+life insurance. If the customer asks about a product or
+service that does NOT appear in the provided context AND
+is not one of the above Royal London products — do NOT
+attempt to answer or use general knowledge.
+Instead respond with exactly:
+"I'm sorry, I don't have information about that in our
+knowledge base. For assistance please contact Royal London
+directly on 0345 600 0371 Monday to Friday 8am to 6pm."
+Examples of products Royal London does NOT offer:
+credit cards, bank accounts, mortgages, car insurance,
+home insurance, travel insurance, cryptocurrency.
+
 ANSWER RULES:
 1. Answer ONLY from the provided context
 2. ONLY include facts explicitly stated in context
@@ -145,6 +162,7 @@ NEVER:
 - Provide legal advice
 - Discuss competitor products negatively
 - Use asterisks around disclaimer text
+- Answer questions about products not in the context
 """
 
 
@@ -244,6 +262,8 @@ def build_user_prompt(state: AgentState) -> str:
         f"{context}\n\n"
         f"Customer question: {state.query}\n\n"
         f"Answer using only the context above. "
+        f"If the question is about a product or service not "
+        f"covered in the context, follow the UNKNOWN PRODUCT RULE. "
         f"Cite sources sequentially as [1][2][3] "
         f"in order of first use."
     )
@@ -328,9 +348,9 @@ def generator_node(state: AgentState) -> AgentState:
     """Generate response using gpt-4.1 or gpt-4o-mini."""
     start = time.time()
 
-    state.needs_empathy   = needs_empathy(state.query)
+    state.needs_empathy    = needs_empathy(state.query)
     state.needs_disclaimer = needs_disclaimer(state.query)
-    state.is_sensitive    = state.needs_empathy
+    state.is_sensitive     = state.needs_empathy
 
     try:
         # Route: simple queries → gpt-4o-mini, complex → gpt-4.1
