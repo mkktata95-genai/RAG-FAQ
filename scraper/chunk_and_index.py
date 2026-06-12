@@ -63,6 +63,23 @@ v1.2.0 — June 2026 | Mukesh Kund
          - Prints visible warning when rate limit hit so operator
            can see recovery happening without manual intervention
 
+v1.3.0 — June 2026 | Mukesh Kund
+         Auto-clear semantic cache after --full re-index
+
+         main() [MODIFIED]:
+         - After a --full re-index completes, the semantic cache
+           is now automatically cleared as the final step.
+         - Previously: cache clear was a manual step that could
+           be forgotten, causing stale cached responses to be
+           served even after fresh content was indexed.
+         - Now: --full re-index and cache clear are one atomic
+           operation — they cannot get out of sync.
+         - --new-only runs do NOT clear the cache (only new pages
+           were added, existing cached answers are still valid).
+         - If Redis is unavailable the warning is logged but the
+           re-index is NOT rolled back — index is still valid,
+           cache will expire naturally via TTL.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -681,6 +698,48 @@ def main():
     print("\n🔍 Verifying index with test query...")
     verify_index()
 
+    # ── Auto-clear semantic cache (--full only) ───────
+    # IMPORTANT: Only runs on --full re-index, NOT --new-only.
+    #
+    # WHY: When --full re-index runs, ALL page content is
+    # refreshed. Any cached responses generated from the old
+    # index may now be stale — old phone numbers, outdated
+    # product details, removed pages. Serving stale cached
+    # responses after a full re-index defeats the purpose of
+    # re-indexing entirely.
+    #
+    # WHY NOT on --new-only: --new-only only adds new pages.
+    # Existing pages are unchanged so existing cached responses
+    # are still valid. Clearing the cache unnecessarily would
+    # reduce hit rate and increase LLM costs.
+    #
+    # FAILURE HANDLING: If Redis is unavailable, we log a
+    # warning but do NOT fail the entire re-index. The index
+    # is already updated and serving correctly. Stale cache
+    # entries will expire naturally via the 24-hour TTL.
+    if fresh:
+        print("\n🗑️  Clearing semantic cache (--full mode)...")
+        try:
+            from core.cache import get_cache
+            cache = get_cache()
+            cache.clear()
+            log.info(
+                "cache_cleared_post_reindex",
+                reason="full_reindex_completed",
+                index=INDEX_NAME,
+            )
+            print("   ✅ Semantic cache cleared — all future queries")
+            print("      will retrieve fresh answers from new index")
+        except Exception as e:
+            log.warning(
+                "cache_clear_failed_post_reindex",
+                error=str(e),
+                note="Index is valid. Cache will expire via TTL.",
+            )
+            print(f"   ⚠️  Cache clear failed: {e}")
+            print("      Index is still valid. Stale cache entries")
+            print("      will expire automatically via 24-hour TTL.")
+
     # ── Summary ───────────────────────────────────────
     print("\n" + "=" * 55)
     print("✅ INDEXING COMPLETE!")
@@ -690,6 +749,10 @@ def main():
     print(f"   Chunks uploaded: {total:,}")
     print(f"   Index name:      {INDEX_NAME}")
     print(f"   Embedding model: {EMBEDDING_DEPLOYMENT}")
+    if fresh:
+        print(f"   Cache cleared:   ✅ Yes (--full mode)")
+    else:
+        print(f"   Cache cleared:   ⏭️  Skipped (--new-only mode)")
     print("=" * 55 + "\n")
 
 

@@ -14,8 +14,6 @@ v1.1.0 — Migration: Mistral-small → gpt-4o-mini
          - P3: Request ID injection (UUID per request)
          - Added IRRELEVANT intent for off-topic queries
            (weather, sport, food, politics, entertainment etc)
-           Previously these returned CHITCHAT response — now
-           correctly identified and redirected
 
 v1.2.0 — June 2026 | Mukesh Kund
          Context-aware routing override
@@ -24,38 +22,45 @@ v1.2.0 — June 2026 | Mukesh Kund
          - Discovered bug: "Why you didnt answer my previous
            question?" was classified as CHITCHAT → returned
            generic greeting at 0ms, ignoring conversation history
-         - Root cause: Supervisor checked intent BEFORE checking
-           if query was a contextual follow-up referencing history
          - Fix: after intent classification, if intent is non-
            INSURANCE, check is_contextual_follow_up() before
            early-exiting. If follow-up detected AND conversation
            history exists → override intent to INSURANCE → route
            through full pipeline where generator has history access
          - Override only fires when conversation_history non-empty
-           (genuine first-message greetings are unaffected)
+         - Covers 9 misrouting categories (A-I):
+           A. Frustration & complaint references
+           B. Continuation with ambiguous opener
+           C. Clarification of misunderstood answer
+           D. Thanks opener + follow-up question
+           E. Emotional response needing continuation
+           F. Negative response / disagreement
+           G. Implicit short query (meaning only from history)
+           H. Frustrated farewell
+           I. Negative correction
 
-         Covers 9 misrouting categories:
-           A — Frustration & complaint references
-               "Why didn't you answer?" / "You keep saying..."
-           B — Continuation with ambiguous opener
-               "OK so..." / "I'm confused by that"
-           C — Clarification of misunderstood answer
-               "I meant my pension, not life insurance"
-           D — Thanks opener + follow-up question
-               "Thanks but what does that mean for me?"
-           E — Emotional response needing continuation
-               "That sounds expensive, is there a cheaper option?"
-           F — Negative response / disagreement
-               "Are you sure about that?" / "That's not right"
-           G — Implicit short query (meaning only from history)
-               "Is that covered?" / "What are the fees?"
-           H — Frustrated farewell
-               "Never mind, forget it" / "This isn't helpful"
-           I — Negative correction
-               "No that's wrong" / "I've heard differently"
+v1.3.0 — June 2026 | Mukesh Kund
+         Account lookup detection before cache_check
 
-         Negative tests: genuine greetings/thanks/farewells
-         with no conversation history are completely unaffected
+         is_account_lookup() [NEW FUNCTION]:
+         - Detects queries where customer tries to get Aria to
+           look up personal account/policy/pension details
+         - MUST run before cache_check — cache_check's canonical
+           rewrite was transforming "My NI number is AB123456C,
+           can you look up my pension?" into "How do I find a
+           lost pension?" — bypassing the Account Access Rule
+           in the generator system prompt entirely
+         - Triggers on 25 patterns:
+             "look up my", "check my account", "my ni number is",
+             "my policy number is", "how much is in my" etc.
+         - On match: immediate refusal with 0345 600 0371
+           Pipeline exits at supervisor. No API calls made.
+           PII never sent to cache, embeddings, or LLM.
+         - Generator Account Access Rule remains as second layer
+
+         ACCOUNT_LOOKUP_REFUSAL [NEW CONSTANT]:
+         - Single source of truth for the refusal message
+         - Consistent with Account Access Rule in generator.py
 
 ═══════════════════════════════════════════════════════════════
 """
@@ -129,6 +134,218 @@ OBVIOUS_THANKS = {
     "thank you so much", "thanks a lot",
     "many thanks", "appreciated",
 }
+
+# ── Account Lookup Detection ──────────────────────────────────
+#
+# Detects queries where a customer is trying to get Aria to
+# look up their personal account, policy, or pension details.
+#
+# WHY THIS IS IN SUPERVISOR (not just generator):
+# The cache_check node runs a canonical rewrite using gpt-4o-mini
+# which can transform "My NI number is AB123456C, can you look
+# up my pension?" into "How do I find a lost pension?" — a
+# completely different query that bypasses the Account Access Rule
+# in the generator system prompt.
+#
+# By detecting account lookups HERE in the supervisor — before
+# cache_check ever runs — we:
+#   1. Exit immediately with the correct refusal
+#   2. Never call the embedding API on PII-containing queries
+#   3. Never store PII-containing queries in the cache
+#   4. Never pass PII to the LLM
+#
+# The generator Account Access Rule remains as a second layer
+# of defence for any edge cases that slip through.
+#
+ACCOUNT_LOOKUP_TRIGGERS = [
+    # Direct lookup requests
+    "look up my",
+    "look up my pension",
+    "look up my policy",
+    "check my account",
+    "check my policy",
+    "check my pension",
+    "access my account",
+    "access my policy",
+    "find my policy",
+    "find my pension",
+    "retrieve my",
+    "pull up my",
+    "search my",
+    # PII-first patterns (customer provides data then asks for lookup)
+    "my ni number is",
+    "my national insurance number is",
+    "my national insurance is",
+    "my policy number is",
+    "my date of birth is",
+    "my dob is",
+    "my account number is",
+    # What is my... patterns
+    "what is my policy",
+    "what is my pension",
+    "what is my balance",
+    "what is my surrender value",
+    "how much is in my",
+    "what's in my",
+    "whats in my",
+]
+
+ACCOUNT_LOOKUP_REFUSAL = (
+    "I'm not able to access account information directly. "
+    "For your account details please call us on "
+    "0345 600 0371 Monday to Friday 8am to 6pm."
+)
+
+
+def is_account_lookup(query: str) -> bool:
+    """
+    Detect if query is attempting to get Aria to look up
+    personal account/policy/pension details.
+
+    Must run BEFORE cache_check to prevent canonical rewriting
+    from transforming PII-containing queries into generic ones
+    that would bypass the Account Access Rule in the generator.
+    """
+    q = query.lower().strip()
+    return any(trigger in q for trigger in ACCOUNT_LOOKUP_TRIGGERS)
+
+# ── Context-Aware Routing Override ───────────────────────────
+#
+# These word groups detect when a query that LOOKS like CHITCHAT,
+# THANKS, IRRELEVANT, or FAREWELL is actually a contextual follow-up
+# that REQUIRES conversation history to answer correctly.
+#
+# If ANY word/phrase from these groups matches AND conversation
+# history exists → override intent → route through full pipeline.
+#
+# CATEGORY A: Frustration & complaint references
+# "Why didn't you answer?" / "That's not what I asked" etc.
+HISTORY_REFERENCE_WORDS = [
+    "previous", "earlier", "before", "last time",
+    "you said", "didn't answer", "didnt answer",
+    "you told", "you mentioned", "already asked",
+    "already told", "not what i asked", "not what i said",
+    "not what i meant", "misunderstood", "you keep",
+    "repeating", "same thing", "try again", "asked you",
+    "my question", "my previous", "what i asked",
+]
+
+# CATEGORY F: Negative responses / disagreement
+# "No that's not right" / "Are you sure?" etc.
+DISAGREEMENT_WORDS = [
+    "that's not right", "thats not right",
+    "that's wrong", "thats wrong", "that's incorrect",
+    "thats incorrect", "that's not correct", "thats not correct",
+    "are you sure", "i don't think so", "i dont think so",
+    "i've heard differently", "ive heard differently",
+    "the website says", "that contradicts",
+    "that's not accurate", "thats not accurate",
+]
+
+# CATEGORY C: Clarification — user correcting a misunderstood answer
+# "No I meant my pension" / "Let me rephrase" etc.
+CLARIFICATION_WORDS = [
+    "i meant", "i was asking about", "let me rephrase",
+    "actually i meant", "no i meant", "not the",
+    "i said", "what i want to know", "i wasn't asking",
+    "i wasnt asking", "i meant to ask", "what i meant",
+    "to clarify", "to be clear",
+]
+
+# CATEGORY H: Frustrated farewell
+# "Whatever forget it" / "This is useless" / "Never mind" etc.
+# These need an empathetic response, not the standard farewell.
+FRUSTRATED_FAREWELL_WORDS = [
+    "whatever", "forget it", "never mind", "nevermind",
+    "this is useless", "this isn't helpful", "this isnt helpful",
+    "fine i'll", "fine ill", "i'll just call", "ill just call",
+    "not helpful", "waste of time", "pointless",
+]
+
+# CATEGORY G: Implicit short queries — meaningful ONLY with history
+# "Is that covered?" / "What are the fees?" / "Can I do it online?"
+# These are ≤5 words and contain a context-dependent word.
+IMPLICIT_QUERY_WORDS = [
+    "covered", "fees", "cost", "costs", "charges",
+    "how long", "how much", "take", "online",
+    "affect", "happen", "after", "change",
+    "different", "instead", "alternatively",
+    "what if", "what about", "same for",
+]
+
+# CATEGORY D & E: Continuation openers + emotional follow-up
+# "OK so what happens next?" / "I'm confused by that"
+CONTINUATION_WORDS = [
+    "but one more", "but what about", "but what if",
+    "now what about", "and what about", "so what does",
+    "what does that mean", "but how", "but when",
+    "can you simplify", "i'm confused", "im confused",
+    "confused by that", "confused by your",
+    "that sounds", "that seems expensive",
+    "that seems complicated",
+    # Category B: thanks + continuation
+    "thanks but", "thank you but", "cheers but",
+    "thanks and", "thank you and", "ok thanks but",
+    "ok thank you but", "great and", "ok and",
+    "got it but", "got it and", "understood but",
+]
+
+
+def is_contextual_follow_up(
+    query: str,
+    history: list[dict],
+) -> tuple[bool, str]:
+    """
+    Detect if a query that looks like non-INSURANCE is actually
+    a contextual follow-up that requires conversation history.
+
+    Returns:
+        (True, reason_category) if it should override to INSURANCE
+        (False, '') if it is genuinely non-insurance
+
+    Only activates if conversation_history is non-empty.
+    A first-message query with no history cannot be a follow-up.
+    """
+    if not history:
+        return False, ""
+
+    q = query.lower().strip()
+
+    # Category A: Explicit references to previous conversation
+    for phrase in HISTORY_REFERENCE_WORDS:
+        if phrase in q:
+            return True, "history_reference"
+
+    # Category F: Disagreement / correction
+    for phrase in DISAGREEMENT_WORDS:
+        if phrase in q:
+            return True, "disagreement"
+
+    # Category C: Clarification of previous answer
+    for phrase in CLARIFICATION_WORDS:
+        if phrase in q:
+            return True, "clarification"
+
+    # Category H: Frustrated farewell needs empathetic routing
+    for phrase in FRUSTRATED_FAREWELL_WORDS:
+        if phrase in q:
+            return True, "frustrated_farewell"
+
+    # Category D/E: Continuation opener
+    for phrase in CONTINUATION_WORDS:
+        if phrase in q:
+            return True, "continuation"
+
+    # Category G: Short implicit query (≤6 words) with context-dependent word
+    # Only applies if history exists (already checked above)
+    words = q.split()
+    if len(words) <= 6:
+        for word in IMPLICIT_QUERY_WORDS:
+            if word in q:
+                return True, "implicit_short_query"
+
+    return False, ""
+
 
 # ── Intent Classifier System Prompt ──────────────────────────
 INTENT_SYSTEM_PROMPT = """You are an intent classifier for
@@ -229,6 +446,11 @@ def quick_intent_check(query: str) -> str | None:
     Fast pattern check for obvious greetings.
     No API call needed — saves ~1-2s latency.
     Returns intent string or None if uncertain.
+
+    NOTE: This only matches EXACT short phrases.
+    "Why didn't you answer my previous question?" will NOT
+    match here — it falls through to classify_intent() and
+    then the context override check.
     """
     q = query.lower().strip()
     q = re.sub(r'[^\w\s]', '', q).strip()
@@ -355,15 +577,24 @@ def supervisor_node(state: AgentState) -> AgentState:
     """
     Entry point for the graph.
     Validates, sanitizes, classifies intent and prepares state.
+
+    Routing logic (in order):
+    1. Validate input (length, empty)
+    2. Quick pattern check (GREETING/FAREWELL/THANKS exact match)
+    3. LLM intent classification (gpt-4o-mini)
+    4. Context-aware override check — if query looks non-INSURANCE
+       BUT references conversation history → override to INSURANCE
+    5. Handle genuine non-insurance intents (early exit)
+    6. Continue pipeline for INSURANCE queries
     """
-    # P3: Assign request ID
+    # ── Step 1: Assign request ID ─────────────────────────
     if not state.request_id:
         state.request_id = generate_request_id()
 
-    # P8: Sanitize input
+    # ── Step 2: Sanitize input ────────────────────────────
     state.query = sanitize_input(state.query)
 
-    # Validate length
+    # ── Step 3: Validate length ───────────────────────────
     valid, message = validate_query_length(state.query)
     if not valid:
         state.refusal_triggered = True
@@ -375,17 +606,75 @@ def supervisor_node(state: AgentState) -> AgentState:
         )
         return state
 
-    # ── Step 1: Quick pattern check (no API call) ─────────
+    # ── Step 3b: Account lookup detection ────────────────
+    # MUST run before intent classification and cache_check.
+    # cache_check's canonical rewrite can transform a PII-
+    # containing account lookup into a generic query (e.g.
+    # "My NI is AB123456C, look up my pension" becomes
+    # "How do I find a lost pension?") which bypasses the
+    # Account Access Rule in the generator entirely.
+    # Detecting here ensures:
+    #   - Immediate refusal before any API call
+    #   - PII never sent to cache, embeddings, or LLM
+    #   - Generator Account Access Rule is second layer only
+    if is_account_lookup(state.query):
+        state.final_response = ACCOUNT_LOOKUP_REFUSAL
+        log.info(
+            "account_lookup_blocked",
+            request_id=state.request_id,
+            query=mask_pii_for_logging(state.query)[:60],
+        )
+        return state
+
+    # ── Step 4: Quick pattern check (no API call) ─────────
     intent     = quick_intent_check(state.query)
     confidence = 1.0
     _used_llm  = False
 
-    # ── Step 2: LLM classifier only if uncertain ──────────
+    # ── Step 5: LLM classifier only if uncertain ──────────
     if intent is None:
         intent, confidence = classify_intent(state.query)
         _used_llm = True
 
-    # ── Step 3: Handle non-insurance intents ──────────────
+    # ── Step 6: Context-aware routing override ────────────
+    #
+    # BEFORE early-exiting on a non-INSURANCE intent, check whether
+    # this query is actually a contextual follow-up that requires
+    # history to answer correctly.
+    #
+    # Examples that would early-exit WITHOUT this check:
+    #   "Why you didnt answer my previous question?" → CHITCHAT → wrong
+    #   "That's not what I asked"                   → CHITCHAT → wrong
+    #   "Are you sure about that?"                  → CHITCHAT → wrong
+    #   "Is that covered?"                          → IRRELEVANT → wrong
+    #   "Never mind, forget it"                     → FAREWELL → wrong
+    #   "Thanks but what does that mean for me?"    → THANKS → wrong
+    #
+    # With the override, all of these route through the full pipeline
+    # where the generator has access to conversation_history.
+    #
+    _override_triggered = False
+    _override_reason    = ""
+
+    if intent != "INSURANCE" and confidence >= 0.85:
+        is_follow_up, reason = is_contextual_follow_up(
+            state.query,
+            state.conversation_history,
+        )
+        if is_follow_up:
+            _override_triggered = True
+            _override_reason    = reason
+            intent              = "INSURANCE"  # Force full pipeline
+            log.info(
+                "context_override_triggered",
+                original_intent=intent,
+                override_reason=reason,
+                query=state.query[:60],
+                history_turns=len(state.conversation_history),
+                request_id=state.request_id,
+            )
+
+    # ── Step 7: Handle genuine non-insurance intents ──────
     if intent != "INSURANCE" and confidence >= 0.85:
         state.final_response    = GREETING_RESPONSES.get(
             intent,
@@ -402,7 +691,7 @@ def supervisor_node(state: AgentState) -> AgentState:
         )
         return state
 
-    # ── Step 4: Insurance query — continue pipeline ───────
+    # ── Step 8: Insurance query — continue pipeline ───────
     if len(state.conversation_history) > 10:
         state.conversation_history = (
             state.conversation_history[-10:]
@@ -424,12 +713,20 @@ def supervisor_node(state: AgentState) -> AgentState:
         intent=intent,
         confidence=confidence,
         used_llm=_used_llm,
+        override_triggered=_override_triggered,
+        override_reason=_override_reason,
     )
 
     return state
 
 
 # ── Router functions ──────────────────────────────────────────
+def route_after_supervisor(state: AgentState) -> str:
+    if state.refusal_triggered or state.final_response:
+        return "end"
+    return "cache_check"
+
+
 def route_after_cache(state: AgentState) -> str:
     if state.cache_hit:
         return "end"

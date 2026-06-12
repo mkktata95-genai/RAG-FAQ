@@ -230,12 +230,37 @@
         }
 
         // Ordered list
+        // Uses a running counter so numbering is continuous
+        // even when GPT intersperses bullet points between
+        // numbered sections (e.g. 1. Header: • item • item 2. Header)
         if (line.match(/^\d+\.\s/)) {
           const items = [];
-          while (i < lines.length && lines[i].match(/^\d+\.\s/)) {
-            const content = lines[i].replace(/^\d+\.\s/, "");
-            items.push(<li key={i}>{parseInline(content)}</li>);
-            i++;
+          let olCounter = 1;
+          while (i < lines.length) {
+            const l = lines[i];
+            if (l.match(/^\d+\.\s/)) {
+              // Numbered heading line
+              const content = l.replace(/^\d+\.\s/, "");
+              items.push(<li key={i} value={olCounter}>{parseInline(content)}</li>);
+              olCounter++;
+              i++;
+            } else if (l.match(/^\s*[-*+]\s/)) {
+              // Bullet point nested under the current numbered section
+              // Render as a sub-list item so it stays visually grouped
+              const content = l.replace(/^\s*[-*+]\s/, "");
+              items.push(
+                <li key={i} style={{listStyleType:"disc", marginLeft:"16px", fontWeight:"normal"}}>
+                  {parseInline(content)}
+                </li>
+              );
+              i++;
+            } else if (l.trim() === "") {
+              // Blank line — keep going in case more numbered items follow
+              i++;
+            } else {
+              // Non-list line — end the ordered list
+              break;
+            }
           }
           elements.push(<ol key={key++}>{items}</ol>);
           continue;

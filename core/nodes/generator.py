@@ -42,6 +42,46 @@ v1.2.0 — June 2026 | Mukesh Kund
            look up my pension?" was giving pension-finding
            steps instead of refusing the account lookup
 
+v1.3.0 — June 2026 | Mukesh Kund
+         Empathy trigger refinement + account access hardening
+         + external service name restriction
+
+         EMPATHY_TRIGGERS [MODIFIED]:
+         - Removed triggers that are administrative tasks,
+           not genuine sensitive/distressing situations:
+             REMOVED: 'claim', 'make a claim' — standard FAQ
+             REMOVED: 'lost pension' — administrative task
+             REMOVED: 'condition' — too broad, matches too many
+             REMOVED: 'illness' — too broad (e.g. "critical illness
+               cover" is a product query, not a sensitive situation)
+             REMOVED: 'injury' — too broad
+             REMOVED: 'accident' — too broad
+             REMOVED: 'hospital' — too broad
+           - These were causing empathy to fire on standard FAQ
+             queries like "How do I make a claim?" and
+             "How do I find a lost pension?" — incorrect behaviour
+             that made responses feel inappropriate and generic
+           - Kept all triggers that represent genuine distress:
+             terminal illness, bereavement, death, redundancy,
+             financial hardship, divorce, mental health
+
+         SYSTEM PROMPT — ACCOUNT ACCESS RULE [STRENGTHENED]:
+         - Added explicit stop instruction: after the refusal
+           message, do not add any further guidance or steps
+         - Fixes: after refusing NI number account lookup, GPT
+           was continuing with pension-finding guidance because
+           it had pension-related chunks in context
+         - Now: refusal message is the complete response, full stop
+
+         SYSTEM PROMPT — CITATION RULE [STRENGTHENED]:
+         - Added explicit restriction on mentioning external
+           service names as recommendations
+         - GPT may acknowledge a service exists (e.g. "the
+           government's Pension Tracing Service") but must NOT
+           recommend it or present it as a resource to use
+         - Fixes: "you can also use services like MoneyHelper..."
+           appearing in responses — this is an RLG-only chatbot
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -105,15 +145,37 @@ def get_openai_client() -> AzureOpenAI:
 
 
 # ── Empathy Detection ─────────────────────────────────────────
+# IMPORTANT: Only include triggers that represent GENUINE distress
+# or sensitive personal circumstances — NOT administrative tasks.
+#
+# REMOVED in v1.3.0 (were causing false positives):
+#   'claim', 'make a claim' → standard FAQ, not sensitive
+#   'lost pension'          → administrative task, not distress
+#   'illness'               → too broad, matches 'critical illness cover'
+#   'condition'             → too broad, matches product descriptions
+#   'injury'                → too broad
+#   'accident'              → too broad
+#   'hospital'              → too broad
+#
 EMPATHY_TRIGGERS = [
-    "cancer", "terminal", "died", "death", "bereavement",
-    "critically ill", "serious illness", "disability",
-    "redundan", "unemployed", "struggling",
+    # Terminal / life-threatening illness
+    "cancer", "terminal", "critically ill", "serious illness",
+    "life-limiting", "life limiting",
+    # Bereavement
+    "died", "death", "bereavement", "passed away",
+    "losing someone", "loss of a loved",
+    # Disability
+    "disability", "disabled",
+    # Employment / financial hardship
+    "redundan", "unemployed", "losing my job", "lost my job",
     "financial difficulty", "financial hardship",
-    "divorce", "separation", "accident", "injury",
-    "diagnosed", "illness", "condition", "hospital",
-    "passed away", "losing my job", "can't afford",
+    "can't afford", "cannot afford", "struggling to pay",
+    # Relationship breakdown
+    "divorce", "separation", "separating",
+    # Mental health
     "mental health", "anxiety", "depression",
+    # Diagnosis
+    "diagnosed",
 ]
 
 # ── Financial Decision Detection ──────────────────────────────
@@ -167,13 +229,19 @@ Always cite sources sequentially starting from [1].
 Use [1] for the first source you reference,
 [2] for the second, [3] for the third.
 Never skip numbers or use numbers out of order.
-IMPORTANT: Only cite sources from royallondon.com.
-Do NOT include, link to, or mention any external
-website URLs in your response — even if they appear
-in the provided context. If the context references
-an external site (gov.uk, moneyhelper.org.uk etc),
-you may mention the service NAME (e.g. "the government's
-Pension Tracing Service") but never include its URL.
+IMPORTANT — DOMAIN RESTRICTION:
+Only cite sources from royallondon.com.
+Do NOT include or link to any external website URLs
+in your response — even if they appear in the context.
+Do NOT recommend or suggest external services, websites,
+or organisations as resources for the customer to use.
+You may acknowledge that government services exist
+(e.g. "the government offers a pension tracing service")
+but do NOT name specific third-party organisations,
+do NOT present them as recommendations, and do NOT
+suggest the customer use them.
+This is an RLG-only assistant. Direct all further
+help to 0345 600 0371.
 
 UNKNOWN PRODUCT RULE:
 Royal London offers: life insurance, pensions, ISAs,
@@ -195,10 +263,14 @@ You do NOT have access to any customer accounts, policy
 details, pension records, or personal data of any kind.
 If a customer asks you to look up, check, retrieve, or
 access their account, policy, pension, or personal
-information — do NOT attempt to do so. Respond with:
+information — do NOT attempt to do so.
+Respond with ONLY this exact message and nothing else:
 "I'm not able to access account information directly.
 For your account details please call us on
 0345 600 0371 Monday to Friday 8am to 6pm."
+Do NOT add any further guidance, steps, resources,
+or helpful information after this message.
+Stop there. The refusal is your complete response.
 This applies even if the customer provides their
 NI number, policy number, date of birth, or any
 other personal details.
@@ -220,6 +292,7 @@ NEVER:
 - Discuss competitor products negatively
 - Use asterisks around disclaimer text
 - Answer questions about products not in the context
+- Recommend or name third-party organisations or services
 """
 
 
