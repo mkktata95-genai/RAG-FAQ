@@ -61,7 +61,7 @@ EMBEDDING_DEPLOYMENT = os.getenv(
 )
 
 # Batch sizes
-EMBEDDING_BATCH_SIZE = 50  # Reduced from 100 — S0 TPM rate limit
+EMBEDDING_BATCH_SIZE = 100
 UPLOAD_BATCH_SIZE    = 100
 
 # ── Singleton clients ─────────────────────────────────────────
@@ -385,24 +385,8 @@ def get_embeddings(
 ) -> list[list[float]]:
     """
     Generate embeddings in batches using text-embedding-3-large.
-
-    Rate limit handling (Azure OpenAI S0 tier):
-    - Batch size reduced to 50 chunks (~20,000 tokens/batch)
-    - 2 second sleep between every batch to stay under TPM limit
-    - Automatic retry with exponential backoff on 429 errors
-    - Max 5 retries per batch before giving up
-
-    If you hit rate limits again: increase BATCH_SLEEP_SECONDS
-    or reduce EMBEDDING_BATCH_SIZE further.
-    If you upgrade to S1/S2 tier: reduce BATCH_SLEEP_SECONDS to 0.
+    Processes in batches of 100 for safe memory usage.
     """
-    import time
-    from openai import RateLimitError
-
-    BATCH_SLEEP_SECONDS = 2    # Sleep between every batch
-    MAX_RETRIES         = 5    # Max retries on 429
-    RETRY_BASE_SECONDS  = 10   # Base wait on 429 — doubles each retry
-
     client         = get_openai_client()
     all_embeddings = []
     total_batches  = (
@@ -410,60 +394,22 @@ def get_embeddings(
     ) // EMBEDDING_BATCH_SIZE
 
     for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-        batch        = texts[i : i + EMBEDDING_BATCH_SIZE]
-        batch_number = i // EMBEDDING_BATCH_SIZE + 1
-        retry        = 0
+        batch    = texts[i : i + EMBEDDING_BATCH_SIZE]
+        response = client.embeddings.create(
+            input=batch,
+            model=EMBEDDING_DEPLOYMENT,
+            dimensions=EMBEDDING_DIMS,
+        )
+        # Sort by index to guarantee order matches input
+        sorted_data = sorted(response.data, key=lambda e: e.index)
+        all_embeddings.extend([e.embedding for e in sorted_data])
 
-        while True:
-            try:
-                response = client.embeddings.create(
-                    input=batch,
-                    model=EMBEDDING_DEPLOYMENT,
-                    dimensions=EMBEDDING_DIMS,
-                )
-                # Sort by index to guarantee order matches input
-                sorted_data = sorted(
-                    response.data, key=lambda e: e.index
-                )
-                all_embeddings.extend(
-                    [e.embedding for e in sorted_data]
-                )
-                log.info(
-                    "embeddings_batch_done",
-                    batch=batch_number,
-                    total_batches=total_batches,
-                    chunk_count=len(all_embeddings),
-                )
-                break  # Success — exit retry loop
-
-            except RateLimitError as e:
-                retry += 1
-                if retry > MAX_RETRIES:
-                    log.error(
-                        "embeddings_rate_limit_max_retries",
-                        batch=batch_number,
-                        error=str(e),
-                    )
-                    raise
-
-                wait = RETRY_BASE_SECONDS * (2 ** (retry - 1))
-                log.warning(
-                    "embeddings_rate_limit_retry",
-                    batch=batch_number,
-                    retry=retry,
-                    wait_seconds=wait,
-                    error=str(e)[:80],
-                )
-                print(
-                    f"   ⚠️  Rate limit hit on batch {batch_number}. "
-                    f"Waiting {wait}s before retry {retry}/{MAX_RETRIES}..."
-                )
-                time.sleep(wait)
-
-        # Sleep between every batch to stay under TPM limit
-        # This prevents hitting 429 in the first place
-        if i + EMBEDDING_BATCH_SIZE < len(texts):
-            time.sleep(BATCH_SLEEP_SECONDS)
+        log.info(
+            "embeddings_batch_done",
+            batch=i // EMBEDDING_BATCH_SIZE + 1,
+            total_batches=total_batches,
+            chunk_count=len(all_embeddings),
+        )
 
     return all_embeddings
 
