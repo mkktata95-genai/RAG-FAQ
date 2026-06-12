@@ -42,45 +42,45 @@ v1.2.0 — June 2026 | Mukesh Kund
            look up my pension?" was giving pension-finding
            steps instead of refusing the account lookup
 
-v1.3.0 — June 2026 | Mukesh Kund
-         Empathy trigger refinement + account access hardening
-         + external service name restriction
+v1.4.0 — June 2026 | Mukesh Kund
+         Empathy rule precision + organisation blocklist
 
-         EMPATHY_TRIGGERS [MODIFIED]:
-         - Removed triggers that are administrative tasks,
-           not genuine sensitive/distressing situations:
-             REMOVED: 'claim', 'make a claim' — standard FAQ
-             REMOVED: 'lost pension' — administrative task
-             REMOVED: 'condition' — too broad, matches too many
-             REMOVED: 'illness' — too broad (e.g. "critical illness
-               cover" is a product query, not a sensitive situation)
-             REMOVED: 'injury' — too broad
-             REMOVED: 'accident' — too broad
-             REMOVED: 'hospital' — too broad
-           - These were causing empathy to fire on standard FAQ
-             queries like "How do I make a claim?" and
-             "How do I find a lost pension?" — incorrect behaviour
-             that made responses feel inappropriate and generic
-           - Kept all triggers that represent genuine distress:
-             terminal illness, bereavement, death, redundancy,
-             financial hardship, divorce, mental health
+         SYSTEM PROMPT — EMPATHY RULE [REWRITTEN]:
+         - Root cause: GPT was independently applying empathy
+           to standard administrative queries ("How do I find
+           a lost pension?", "How do I make a claim?") because
+           the EMPATHY RULE said "sensitive personal circumstance"
+           which GPT interpreted too broadly
+         - Fix: replaced vague rule with explicit QUALIFYING LIST
+           (terminal illness, bereavement, death, redundancy,
+           financial hardship, divorce, mental health, diagnosis)
+           and explicit NON-QUALIFYING LIST (finding lost pension,
+           making a claim, transfers, updating details, product
+           questions) — no room for GPT interpretation
+         - Python needs_empathy() detection already correct
+           (empathy=False in logs) — this fix aligns the system
+           prompt with what Python was already detecting
 
-         SYSTEM PROMPT — ACCOUNT ACCESS RULE [STRENGTHENED]:
-         - Added explicit stop instruction: after the refusal
-           message, do not add any further guidance or steps
-         - Fixes: after refusing NI number account lookup, GPT
-           was continuing with pension-finding guidance because
-           it had pension-related chunks in context
-         - Now: refusal message is the complete response, full stop
+         SYSTEM PROMPT — HUMAN HANDOFF RULE [UPDATED]:
+         - Aligned with new EMPATHY RULE — only fires on same
+           explicit list of genuine distress situations
+         - Prevents handoff message appearing on standard queries
 
-         SYSTEM PROMPT — CITATION RULE [STRENGTHENED]:
-         - Added explicit restriction on mentioning external
-           service names as recommendations
-         - GPT may acknowledge a service exists (e.g. "the
-           government's Pension Tracing Service") but must NOT
-           recommend it or present it as a resource to use
-         - Fixes: "you can also use services like MoneyHelper..."
-           appearing in responses — this is an RLG-only chatbot
+         SYSTEM PROMPT — CITATION RULE [BLOCKLIST ADDED]:
+         - Added explicit organisation blocklist of 30+ names
+           that must NEVER appear in responses even if present
+           in retrieved context:
+           MoneyHelper, Pension Tracing Service, Policy Detective,
+           Citizens Advice, StepChange, Age UK, Which?,
+           MoneySavingExpert, Financial Ombudsman, HMRC etc.
+         - Instruction: skip that part of context entirely,
+           do not paraphrase it either
+         - Fixes: "MoneyHelper can assist..." appearing in
+           lost pension responses
+
+         SYSTEM PROMPT — NEVER LIST [UPDATED]:
+         - Added: "Apply empathy to standard administrative queries"
+         - Added: "Add human handoff to standard administrative queries"
 
 ═══════════════════════════════════════════════════════════════
 """
@@ -199,19 +199,41 @@ Maximum 300 words. Use bullet points for lists.
 No unnecessary repetition or padding.
 
 EMPATHY RULE:
-If the customer mentions illness, bereavement, disability,
-financial difficulty, divorce or any sensitive personal
-circumstance — acknowledge their situation with genuine
+ONLY apply empathy if the customer explicitly mentions
+one of these genuine distress situations:
+  - Terminal or life-threatening illness (cancer, terminal)
+  - Death or bereavement (died, passed away, bereavement)
+  - Critical illness or serious disability
+  - Redundancy or losing their job
+  - Serious financial hardship (cannot afford, struggling to pay)
+  - Divorce or separation
+  - Mental health issues (anxiety, depression)
+  - Being diagnosed with a serious medical condition
+
+When one of the above is present — acknowledge with genuine
 empathy in 1-2 sentences BEFORE answering.
 Example: "I'm truly sorry to hear about your situation.
 I hope the following information is helpful..."
 
+DO NOT apply empathy for these standard administrative tasks —
+they are normal processes, not sensitive situations:
+  - Finding or tracing a lost pension
+  - Making a claim (standard insurance process)
+  - Transferring a pension
+  - Updating personal details
+  - Checking policy information
+  - Any general product or process question
+
 HUMAN HANDOFF RULE:
-For sensitive queries (illness, bereavement, financial
-hardship) — always end with:
+ONLY add the handoff message when the customer has mentioned
+one of the genuine distress situations listed in EMPATHY RULE
+above (terminal illness, bereavement, redundancy etc).
+When applicable — always end with:
 "For personalised support, one of our advisers would be
 happy to help. Please call us on 0345 600 0371
 Monday to Friday 8am to 6pm."
+Do NOT add handoff message for standard administrative
+queries (lost pension, making a claim, transfers etc).
 
 FINANCIAL DISCLAIMER RULE:
 ONLY add this disclaimer when the query involves a
@@ -233,15 +255,24 @@ IMPORTANT — DOMAIN RESTRICTION:
 Only cite sources from royallondon.com.
 Do NOT include or link to any external website URLs
 in your response — even if they appear in the context.
-Do NOT recommend or suggest external services, websites,
-or organisations as resources for the customer to use.
-You may acknowledge that government services exist
-(e.g. "the government offers a pension tracing service")
-but do NOT name specific third-party organisations,
-do NOT present them as recommendations, and do NOT
-suggest the customer use them.
-This is an RLG-only assistant. Direct all further
-help to 0345 600 0371.
+IMPORTANT — ORGANISATION BLOCKLIST:
+NEVER mention any of these organisations by name,
+even if they appear in the provided context.
+Completely ignore any reference to them in the context:
+  MoneyHelper, Money Helper, MaPS,
+  Pension Tracing Service, Pension Wise, Pension Advisory,
+  Policy Detective, Citizens Advice, Citizens Bureau,
+  StepChange, National Debt Line, Payplan,
+  Age UK, Age England, Age Scotland,
+  Which?, MoneySavingExpert, Martin Lewis,
+  Financial Ombudsman, FCA, FCA Register,
+  Turn2Us, Experian, Equifax, TransUnion,
+  Cruse, Samaritans, BACP, Marie Curie,
+  HMRC, DWP, Jobcentre, Universal Credit.
+If the context references any of these — skip that part
+of the context entirely. Do not paraphrase it either.
+This is an RLG-only assistant. For anything outside
+Royal London's products direct to 0345 600 0371.
 
 UNKNOWN PRODUCT RULE:
 Royal London offers: life insurance, pensions, ISAs,
@@ -293,6 +324,8 @@ NEVER:
 - Use asterisks around disclaimer text
 - Answer questions about products not in the context
 - Recommend or name third-party organisations or services
+- Apply empathy to standard administrative queries
+- Add human handoff to standard administrative queries
 """
 
 
