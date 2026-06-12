@@ -2,10 +2,47 @@
 Generator Node — LLM response with empathy, disclaimer,
 answer length control and token tracking.
 
-Migration: Mistral → gpt-4.1 (main) + gpt-4o-mini (simple)
-Auth:       DefaultAzureCredential + bearer token (no API key)
-Fix:        Added UNKNOWN PRODUCT RULE to system prompt —
-            prevents hallucination when context doesn't match query
+═══════════════════════════════════════════════════════════════
+CHANGE LOG
+═══════════════════════════════════════════════════════════════
+
+v1.0.0 — Initial version
+         Mistral Large, API key auth, basic generation
+
+v1.1.0 — Migration: Mistral → gpt-4.1 + gpt-4o-mini
+         - Main model: Mistral Large → gpt-4.1
+           (complex queries, sensitive topics, empathy)
+         - Fast model: Mistral Small → gpt-4o-mini
+           (simple FAQs, intent classification)
+         - Auth: API key → DefaultAzureCredential + bearer token
+         - Added UNKNOWN PRODUCT RULE to system prompt:
+           prevents hallucination when retrieved context does
+           not match the query (e.g. credit card queries)
+
+v1.2.0 — June 2026 | Mukesh Kund
+         External URL citation fix + account access rule
+
+         SYSTEM PROMPT — CITATION RULE [MODIFIED]:
+         - Added domain restriction: only cite royallondon.com
+         - GPT must not include or link to external URLs even
+           if they appear in the retrieved chunk content
+         - External service names may be mentioned (e.g.
+           "the government's Pension Tracing Service") but
+           their URLs must never appear in the response
+         - Fixes: MoneyHelper and Pension Tracing Service
+           appearing as clickable links inside answers
+
+         SYSTEM PROMPT — ACCOUNT ACCESS RULE [NEW RULE]:
+         - Aria does not have access to any customer accounts,
+           policy records, or personal data
+         - If customer provides NI number, policy number, DOB
+           or any personal details and asks for a lookup —
+           Aria must refuse and direct to 0345 600 0371
+         - Fixes: query "My NI number is AB123456C, can you
+           look up my pension?" was giving pension-finding
+           steps instead of refusing the account lookup
+
+═══════════════════════════════════════════════════════════════
 """
 
 import os

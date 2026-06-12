@@ -3,11 +3,6 @@ Royal London FAQ - Chunk and Index
 Chunks scraped content, generates embeddings,
 pushes to Azure AI Search.
 
-Migration: Cohere → text-embedding-3-large via Azure AI Foundry
-Auth:       DefaultAzureCredential + bearer token (no API key required)
-Fix:        Uses AZURE_OPENAI_ENDPOINT (.openai.azure.com) for embeddings
-            as PROJECT_ENDPOINT does not route embedding requests
-
 Supports:
   --full:     Delete + recreate index (fresh start)
   --new-only: Only index pages not already indexed (default)
@@ -15,6 +10,60 @@ Supports:
 Usage:
     python scraper/chunk_and_index.py --full
     python scraper/chunk_and_index.py --new-only
+
+═══════════════════════════════════════════════════════════════
+CHANGE LOG
+═══════════════════════════════════════════════════════════════
+
+v1.0.0 — Initial version
+         Cohere embeddings, API key auth, basic chunking
+
+v1.1.0 — Migration: Cohere → text-embedding-3-large
+         - Migrated embedding model to text-embedding-3-large
+           via Azure AI Foundry (1024 dims, Matryoshka MRL)
+         - Auth: API key → DefaultAzureCredential + bearer token
+           (no API key in code or .env)
+         - Fix: must use AZURE_OPENAI_ENDPOINT (.openai.azure.com)
+           PROJECT_ENDPOINT does not route embedding requests
+           (AIProjectClient v2.2.0 bug)
+
+v1.2.0 — June 2026 | Mukesh Kund
+         External URL stripping + rate limit handling
+
+         clean_content() [NEW FUNCTION]:
+         - Strips external URLs from page content before chunking
+         - Royal London pages contain outbound links to external
+           sites (moneyhelper.org.uk, gov.uk, citizensadvice.org.uk
+           etc). These were being scraped into chunk content and
+           GPT was reproducing them as clickable links in answers.
+         - Strips markdown links [text](https://external.com)
+           → keeps anchor text, removes external URL
+         - Strips bare external URLs https://external.com/...
+           → removes entirely
+         - Preserves all royallondon.com URLs so citation system
+           is completely unaffected
+         - Called inside chunk_pages() before title prepending
+         - ACTION REQUIRED: re-run --full after this change
+
+         get_embeddings() [MODIFIED]:
+         - EMBEDDING_BATCH_SIZE reduced 100 → 50
+           S0 tier TPM limit: ~120,000 tokens/min
+           50 chunks × ~400 tokens = ~20,000 tokens/batch (safe)
+           Revert to 100 if/when tier is upgraded to S1+
+         - Added 2 second sleep between every batch to stay
+           under TPM limit and prevent 429 errors proactively
+         - Added automatic retry with exponential backoff on
+           RateLimitError (429):
+             Retry 1 → wait 10s
+             Retry 2 → wait 20s
+             Retry 3 → wait 40s
+             Retry 4 → wait 80s
+             Retry 5 → wait 160s
+             After 5 retries → raises exception
+         - Prints visible warning when rate limit hit so operator
+           can see recovery happening without manual intervention
+
+═══════════════════════════════════════════════════════════════
 """
 
 import json
