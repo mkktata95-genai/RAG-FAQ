@@ -82,6 +82,27 @@ v1.4.0 — June 2026 | Mukesh Kund
          - Added: "Apply empathy to standard administrative queries"
          - Added: "Add human handoff to standard administrative queries"
 
+v1.5.0 — June 2026 | Mukesh Kund
+         History summary note for context override queries
+
+         build_user_prompt() [MODIFIED]:
+         - When state._override_triggered=True (set by supervisor
+           when a follow-up/frustration query is detected),
+           now injects an explicit note into the user prompt:
+             "NOTE: The customer is referring to the previous
+              conversation. You have conversation history above.
+              Acknowledge what was discussed and respond based
+              on that context. Do not say you have no information
+              — use the history."
+         - WHY: without this note, GPT received the follow-up
+           query ("Why didn't you answer?") with conversation
+           history in the prompt but still fired the UNKNOWN
+           PRODUCT RULE because the retrieved chunks were
+           irrelevant (canonical rewrite had destroyed the query).
+           Now: canonical rewrite skipped (cache_check v1.2.0)
+           AND generator explicitly told to use history.
+           Two complementary fixes working together.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -417,10 +438,33 @@ def build_user_prompt(state: AgentState) -> str:
             "markdown formatting whatsoever.\n\n"
         )
 
+    # Override note — injected when supervisor detected this query
+    # as a contextual follow-up (frustration, disagreement,
+    # clarification etc). Tells GPT explicitly to use the
+    # conversation history rather than treating this as a new
+    # product question and firing the UNKNOWN PRODUCT RULE.
+    override_note = ""
+    if state.__dict__.get("_override_triggered"):
+        override_note = (
+            "NOTE: The customer is referring to a previous "
+            "exchange in the conversation above. You DO have "
+            "access to the conversation history shown. "
+            "Acknowledge what was previously discussed and "
+            "respond based on that context. "
+            "Do NOT say you have no information about this — "
+            "use the conversation history to understand what "
+            "they are asking about and respond helpfully. "
+            "If they are expressing frustration, acknowledge "
+            "it genuinely, clarify your previous answer, and "
+            "offer further help or the phone number "
+            "0345 600 0371.\n\n"
+        )
+
     return (
         f"{history}"
         f"{empathy_note}"
         f"{disclaimer_note}"
+        f"{override_note}"
         f"Context from RLG documentation:\n\n"
         f"{context}\n\n"
         f"Customer question: {state.query}\n\n"

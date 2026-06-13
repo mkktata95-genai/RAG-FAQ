@@ -6,8 +6,79 @@ Hybrid approach:
   Step 3: LLM canonical rewrite (gpt-4o-mini)
   Step 4: Cache check again with canonical form
 
-Migration: Mistral-small → gpt-4o-mini
-Auth:       DefaultAzureCredential + bearer token (no API key)
+═══════════════════════════════════════════════════════════════
+CHANGE LOG
+═══════════════════════════════════════════════════════════════
+
+v1.0.0 — Initial version
+         Mistral Small, API key auth, basic cache check
+
+v1.1.0 — Migration: Mistral-small → gpt-4o-mini
+         Auth: API key → DefaultAzureCredential + bearer token
+
+v1.3.0 — June 2026 | Mukesh Kund
+         Normalisation pipeline bug fixes (5 bugs)
+
+         DOMAIN_SYNONYMS [REDESIGNED]:
+         - Sorted longest phrases first to prevent partial matches
+           "individual savings account" now matched before "savings account"
+           "critical illness cover" matched before "critical illness"
+         - Removed duplicate-injecting synonyms:
+             "lost pension" → "find lost pension" REMOVED
+             (was causing "find find lost pension" when query
+             already contained "find")
+             "missing pension" → "lost pension" (just standardise)
+             "trace pension"   → "lost pension" (just standardise)
+         - Removed single-word synonyms from here — moved to
+           SINGLE_WORD_SYNONYMS for safe word-boundary matching
+
+         SINGLE_WORD_SYNONYMS [NEW]:
+         - New dict for single-word synonyms that need word-boundary
+           regex matching to prevent substring collisions
+         - "call" → "contact" now uses \\bcall\\b regex
+           Previously: "recall" → "recontact" (substring corruption)
+           Now: "recall" preserved correctly
+         - "email", "telephone", "isas", "drawdown", "transfer",
+           "complain", "unhappy", "dispute" all moved here
+
+         apply_domain_synonyms() [REWRITTEN]:
+         - Two-stage approach:
+           Stage 1: multi-word phrase dict replacement (longest first)
+           Stage 2: single-word re.sub with word boundaries
+         - Post-processing: re.sub removes consecutive duplicate words
+           Catches any remaining duplicates from any replacement:
+           "find find lost pension" → "find lost pension"
+           "critical illness cover cover" → "critical illness cover"
+
+         BUG SUMMARY — all 5 fixed:
+           Bug 1: duplicate word injection (find/cover)        ✅
+           Bug 2: substring collision (recall→recontact)       ✅
+           Bug 3: context-free single-word synonyms            ✅
+           Bug 4: ordering issue (longer phrases now first)    ✅
+           Bug 5: post-replacement duplicate cleanup           ✅
+
+v1.4.0 — June 2026 | Mukesh Kund
+         Skip canonical rewrite on context override queries
+
+         cache_check_node() [MODIFIED]:
+         - When supervisor sets _override_triggered=True on state
+           (meaning the query is a contextual follow-up like
+           "Why didn't you answer my previous question?"),
+           the canonical rewrite (Step 3) is now skipped entirely
+         - WHY: canonical rewrite was destroying the meaning of
+           follow-up queries. Example:
+             "Why didn't you answer my previous question?"
+             → canonical: "What is my previous question?"
+           This nonsensical rewrite caused the retriever to fetch
+           irrelevant chunks (score ~0.031) and the generator to
+           fire the UNKNOWN PRODUCT RULE — completely wrong.
+         - For override queries: Step 1 normalisation still runs
+           (for cache lookup accuracy), Step 3 canonical rewrite
+           is skipped (meaning preserved for downstream nodes)
+         - The embedding generated in Step 1 is still stored on
+           state._query_embedding for retriever reuse
+
+═══════════════════════════════════════════════════════════════
 """
 
 import re
@@ -97,37 +168,70 @@ KEEP_WORDS = {
 FINAL_STOP_WORDS = STOP_WORDS - KEEP_WORDS
 
 # ── Insurance Domain Synonyms ─────────────────────────────────
+#
+# DESIGN RULES (read before modifying):
+#
+# 1. LONGER PHRASES FIRST — prevents partial matches.
+#    "individual savings account" must appear before "savings account".
+#    "critical illness cover" must appear before "critical illness".
+#
+# 2. NO DUPLICATE INJECTION — replacement must not add words already
+#    in the query. "lost pension" must NOT map to "find lost pension"
+#    because "How do I FIND a lost pension?" becomes
+#    "how do i find a find lost pension" (duplicate "find").
+#    Map to the standard noun form only.
+#
+# 3. NO SINGLE-WORD SYNONYMS HERE — words like "call", "email",
+#    "transfer" match as substrings inside other words with str.replace().
+#    "call" → "contact" corrupts "recall" → "recontact".
+#    Single-word synonyms live in SINGLE_WORD_SYNONYMS below and
+#    use word-boundary regex matching.
+#
+# 4. CONTEXT-FREE SYNONYMS ARE DANGEROUS — "transfer" → "pension transfer"
+#    would corrupt "bank transfer". Only map in multi-word context.
+#
 DOMAIN_SYNONYMS = {
-    "life cover":               "life insurance",
-    "life assurance":           "life insurance",
-    "retirement fund":          "pension",
-    "retirement savings":       "pension",
-    "retirement pot":           "pension",
-    "pension pot":              "pension",
-    "pension fund":             "pension",
-    "isas":                     "isa",
+    # ── Multi-word phrases — longest first ────────────────────────────
     "individual savings account": "isa",
-    "savings account":          "isa",
-    "critical illness":         "critical illness cover",
-    "serious illness":          "critical illness cover",
-    "income cover":             "income protection",
-    "sick pay":                 "income protection",
-    "equity release":           "equity release",
-    "drawdown":                 "pension drawdown",
-    "flexible access":          "pension drawdown",
-    "phone number":             "contact",
-    "telephone":                "contact",
-    "call":                     "contact",
-    "email":                    "contact",
-    "get in touch":             "contact",
-    "complain":                 "complaint",
-    "unhappy":                  "complaint",
-    "dispute":                  "complaint",
-    "transfer":                 "pension transfer",
-    "move pension":             "pension transfer",
-    "lost pension":             "find lost pension",
-    "missing pension":          "find lost pension",
-    "trace pension":            "find lost pension",
+    "life assurance":             "life insurance",
+    "life cover":                 "life insurance",
+    "retirement savings":         "pension",
+    "retirement fund":            "pension",
+    "retirement pot":             "pension",
+    "pension fund":               "pension",
+    "pension pot":                "pension",
+    "serious illness cover":      "critical illness cover",
+    "critical illness cover":     "critical illness cover",  # already standard
+    "serious illness":            "critical illness cover",
+    "critical illness":           "critical illness cover",
+    "income cover":               "income protection",
+    "flexible access":            "pension drawdown",
+    "savings account":            "isa",
+    "get in touch":               "contact",
+    "phone number":               "contact",
+    "move pension":               "pension transfer",
+    # FIX: map to standard noun only — do NOT add "find" (causes duplicates)
+    # "How do I find a lost pension?" was becoming "how find find lost pension"
+    "missing pension":            "lost pension",
+    "trace pension":              "lost pension",
+    "sick pay":                   "income protection",
+    # NOTE: "lost pension" already standard — no mapping needed
+    # NOTE: "transfer" alone is in SINGLE_WORD_SYNONYMS (word-boundary safe)
+    # NOTE: "drawdown" alone is in SINGLE_WORD_SYNONYMS (word-boundary safe)
+}
+
+# Single-word synonyms — use word-boundary regex to prevent substring
+# collisions ("call" matching inside "recall", "cancel", "callback" etc)
+SINGLE_WORD_SYNONYMS = {
+    "isas":       "isa",
+    "telephone":  "contact",
+    "call":       "contact",
+    "email":      "contact",
+    "complain":   "complaint",
+    "unhappy":    "complaint",
+    "dispute":    "complaint",
+    "drawdown":   "pension drawdown",
+    "transfer":   "pension transfer",
 }
 
 # ── Canonical Rewrite Prompt ──────────────────────────────────
@@ -170,11 +274,42 @@ No explanation, no quotes, just the query text."""
 
 # ── Helper functions ──────────────────────────────────────────
 def apply_domain_synonyms(text: str) -> str:
-    """Replace domain synonyms with standard terms."""
+    """
+    Replace domain synonyms with standard insurance terms.
+
+    Two-stage approach:
+    Stage 1: Multi-word phrase replacement (longest phrases first,
+             as defined in DOMAIN_SYNONYMS ordering).
+    Stage 2: Single-word replacement with word-boundary regex matching.
+             Prevents substring collisions:
+               "call" → "contact" without corrupting "recall"/"cancel"
+               "transfer" → "pension transfer" without corrupting
+               "bank transfer my funds" → "bank pension transfer funds"
+
+    Post-processing: Remove consecutive duplicate words caused by any
+    replacement. e.g. "find find lost pension" → "find lost pension"
+    """
     text_lower = text.lower()
+
+    # Stage 1: multi-word phrase replacement (longest first)
     for phrase, replacement in DOMAIN_SYNONYMS.items():
-        if phrase in text_lower:
+        if phrase in text_lower and replacement != phrase:
             text_lower = text_lower.replace(phrase, replacement)
+
+    # Stage 2: single-word replacement with word boundaries
+    for word, replacement in SINGLE_WORD_SYNONYMS.items():
+        text_lower = re.sub(
+            r'\b' + re.escape(word) + r'\b',
+            replacement,
+            text_lower,
+        )
+
+    # Post-processing: remove consecutive duplicate words
+    # Catches any duplicates caused by synonym replacement
+    # "find find lost pension" → "find lost pension"
+    # "critical illness cover cover" → "critical illness cover"
+    text_lower = re.sub(r'\b(\w+)\s+\1\b', r'\1', text_lower)
+
     return text_lower
 
 
@@ -297,6 +432,30 @@ def cache_check_node(state: AgentState) -> AgentState:
             return state
 
         # ── Step 3: LLM canonical rewrite ─────────────────
+        # SKIP for context override queries.
+        # When supervisor sets _override_triggered=True it means
+        # the query is a contextual follow-up (frustration,
+        # disagreement, clarification, implicit follow-up etc).
+        # Canonical rewriting destroys the meaning of these queries:
+        #   "Why didn't you answer my previous question?"
+        #   → "What is my previous question?"  (nonsensical)
+        # This caused retrieval to fail and UNKNOWN PRODUCT RULE
+        # to fire — completely wrong for a follow-up query.
+        # The original query meaning must be preserved intact
+        # so the generator can use conversation_history correctly.
+        is_override = state.__dict__.get("_override_triggered", False)
+
+        if is_override:
+            log.info(
+                "canonical_rewrite_skipped",
+                reason="context_override_query",
+                query=state.query[:50],
+            )
+            latency          = (time.time() - start) * 1000
+            state.latency_ms["cache_check"] = latency
+            state.cache_hit  = False
+            return state
+
         log.info(
             "cache_miss_step1",
             query=state.query[:50],

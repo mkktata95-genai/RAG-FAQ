@@ -62,6 +62,25 @@ v1.3.0 — June 2026 | Mukesh Kund
          - Single source of truth for the refusal message
          - Consistent with Account Access Rule in generator.py
 
+v1.4.0 — June 2026 | Mukesh Kund
+         Store override flags on state for downstream nodes
+
+         supervisor_node() [MODIFIED]:
+         - When context override fires, now stores two values
+           on state.__dict__ so downstream nodes can read them:
+             state.__dict__['_override_triggered'] = True
+             state.__dict__['_override_reason']    = reason
+           (Same pattern as _query_embedding — avoids breaking
+           Pydantic AgentState schema)
+         - cache_check reads _override_triggered to skip
+           canonical rewrite on follow-up queries
+         - generator reads _override_triggered to inject
+           history summary note instead of UNKNOWN PRODUCT RULE
+         - Fixes: "Why didn't you answer my previous question?"
+           was returning UNKNOWN PRODUCT RULE because canonical
+           rewrite transformed it to "What is my previous
+           question?" — destroying the contextual meaning
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -665,6 +684,15 @@ def supervisor_node(state: AgentState) -> AgentState:
             _override_triggered = True
             _override_reason    = reason
             intent              = "INSURANCE"  # Force full pipeline
+            # Store on state so downstream nodes can read it:
+            #   cache_check: skips canonical rewrite (it destroys
+            #                the emotional/contextual meaning of
+            #                follow-up queries)
+            #   generator:   injects history summary note so GPT
+            #                references prior conversation instead
+            #                of firing UNKNOWN PRODUCT RULE
+            state.__dict__["_override_triggered"] = True
+            state.__dict__["_override_reason"]    = reason
             log.info(
                 "context_override_triggered",
                 original_intent=intent,
