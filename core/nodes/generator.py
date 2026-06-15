@@ -103,6 +103,78 @@ v1.5.0 — June 2026 | Mukesh Kund
            AND generator explicitly told to use history.
            Two complementary fixes working together.
 
+v1.6.0 — June 2026 | Mukesh Kund
+         Empathy/disclaimer detection moved to supervisor.py +
+         UNKNOWN PRODUCT RULE refusal no longer cacheable
+
+         PART 1 — EMPATHY_TRIGGERS / FINANCIAL_DECISION_TRIGGERS /
+         needs_empathy() / needs_disclaimer() [REMOVED — MOVED to
+         supervisor.py v1.5.0]:
+         - ROOT CAUSE: cache_check runs BEFORE generator. A cache
+           hit (direct match or Stage 3 canonical rewrite) routes
+           straight to END — generator_node() never ran, so these
+           flags were never computed for cached responses.
+           Reproduced live: "I have been diagnosed with terminal
+           cancer" and "My wife passed away last week" were both
+           canonical-rewritten to generic FAQ phrasing in
+           cache_check, hit the cache at similarity=1.0, and
+           skipped empathy/disclaimer/handoff entirely.
+         - FIX: supervisor.py now computes state.needs_empathy
+           and state.needs_disclaimer immediately after
+           expand_query() — before cache_check runs — so
+           cache_check/cache_write can skip the semantic cache
+           for sensitive disclosures (see their v1.5.0/v1.1.0
+           changelogs).
+         - generator_node() [MODIFIED]:
+           - Removed the recompute lines:
+               state.needs_empathy    = needs_empathy(state.query)
+               state.needs_disclaimer = needs_disclaimer(state.query)
+               state.is_sensitive     = state.needs_empathy
+           - These flags now arrive on state already set by
+             supervisor — generator only READS them.
+         - is_simple_query() [MODIFIED]:
+           - Signature changed from is_simple_query(query) to
+             is_simple_query(query, is_sensitive) — the
+             "needs_empathy" complex-indicator is now passed in
+             from state.is_sensitive instead of being recomputed
+             locally (needs_empathy() no longer exists here).
+
+         PART 2 — UNKNOWN PRODUCT RULE refusal made non-cacheable:
+         - ROOT CAUSE: the UNKNOWN PRODUCT RULE response ("I'm
+           sorry, I don't have information about that in our
+           knowledge base...") is produced as a normal
+           generation_complete result (citations=0,
+           refusal_triggered stays False) — NOT via
+           refusal_triggered/refusal.py. cache_write_node only
+           skips on refusal_triggered, so this wrong "no
+           information" answer was being cached and then served
+           for OTHER phrasings of the same topic too (e.g. a
+           wrongly-refused "What types of pensions does Royal
+           London offer?" answer was returned, cached, and then
+           replayed verbatim for "What pension products does
+           Royal London offer", Cached 357ms).
+         - UNKNOWN_PRODUCT_RESPONSE [NEW CONSTANT]:
+           Single source of truth for the exact refusal text.
+           Referenced from SYSTEM_PROMPT (f-string) so the prompt
+           and the detection check can never drift apart.
+         - generator_node() [MODIFIED]:
+           After extract_citations(), if the response text
+           contains UNKNOWN_PRODUCT_RESPONSE, set
+           state.refusal_triggered = True and
+           state.final_response = UNKNOWN_PRODUCT_RESPONSE
+           (state.citations cleared to []). This reuses the
+           existing refusal_triggered routing
+           (route_after_generator → END), which already makes
+           cache_write_node skip via its
+           "refusal_triggered or not final_response" check — no
+           change needed to cache_write.py for this part.
+         - NOTE: this fixes the SYMPTOM (wrong refusals spreading
+           via cache). The underlying generator over-refusal for
+           legitimate "what does Royal London offer" style
+           queries (SYSTEM_PROMPT / model-routing tuning) is a
+           separate, lower-risk follow-up item — flagged but not
+           addressed in this change.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -165,52 +237,35 @@ def get_openai_client() -> AzureOpenAI:
     return _openai_client
 
 
-# ── Empathy Detection ─────────────────────────────────────────
-# IMPORTANT: Only include triggers that represent GENUINE distress
-# or sensitive personal circumstances — NOT administrative tasks.
-#
-# REMOVED in v1.3.0 (were causing false positives):
-#   'claim', 'make a claim' → standard FAQ, not sensitive
-#   'lost pension'          → administrative task, not distress
-#   'illness'               → too broad, matches 'critical illness cover'
-#   'condition'             → too broad, matches product descriptions
-#   'injury'                → too broad
-#   'accident'              → too broad
-#   'hospital'              → too broad
-#
-EMPATHY_TRIGGERS = [
-    # Terminal / life-threatening illness
-    "cancer", "terminal", "critically ill", "serious illness",
-    "life-limiting", "life limiting",
-    # Bereavement
-    "died", "death", "bereavement", "passed away",
-    "losing someone", "loss of a loved",
-    # Disability
-    "disability", "disabled",
-    # Employment / financial hardship
-    "redundan", "unemployed", "losing my job", "lost my job",
-    "financial difficulty", "financial hardship",
-    "can't afford", "cannot afford", "struggling to pay",
-    # Relationship breakdown
-    "divorce", "separation", "separating",
-    # Mental health
-    "mental health", "anxiety", "depression",
-    # Diagnosis
-    "diagnosed",
-]
+# ── Empathy / Financial Disclaimer Detection ──────────────────
+# MOVED to supervisor.py in v1.6.0 (EMPATHY_TRIGGERS,
+# FINANCIAL_DECISION_TRIGGERS, needs_empathy(), needs_disclaimer()).
+# supervisor_node() now sets state.needs_empathy and
+# state.needs_disclaimer BEFORE cache_check runs, so the semantic
+# cache can be skipped for sensitive disclosures. generator_node()
+# below only READS these flags (state.needs_empathy,
+# state.needs_disclaimer, state.is_sensitive). See supervisor.py
+# v1.5.0 changelog for full rationale.
 
-# ── Financial Decision Detection ──────────────────────────────
-FINANCIAL_DECISION_TRIGGERS = [
-    "should i", "should i invest", "which pension",
-    "best option", "recommend", "advice",
-    "what should", "is it worth", "better to",
-    "choose", "decide", "switch", "transfer",
-    "how much should", "when should",
-    "tax", "return", "growth", "performance",
-]
+
+# ── Unknown Product Rule Response ─────────────────────────────
+# Single source of truth for the UNKNOWN PRODUCT RULE refusal
+# text (v1.6.0). Used in SYSTEM_PROMPT (so GPT reproduces it
+# verbatim) AND checked in generator_node() after generation — if
+# GPT returns this text, it is treated as a refusal
+# (refusal_triggered=True), which makes cache_write_node skip
+# caching it via its existing
+# "refusal_triggered or not final_response" check. Prevents a
+# wrong "no information" answer for one phrasing from being
+# cached and then replayed for other phrasings of the same topic.
+UNKNOWN_PRODUCT_RESPONSE = (
+    "I'm sorry, I don't have information about that in our "
+    "knowledge base. For assistance please contact Royal London "
+    "directly on 0345 600 0371 Monday to Friday 8am to 6pm."
+)
 
 # ── System Prompt ─────────────────────────────────────────────
-SYSTEM_PROMPT = """You are a helpful and professional \
+SYSTEM_PROMPT = f"""You are a helpful and professional \
 customer service assistant for RLG (a UK insurance and \
 pensions provider).
 
@@ -303,9 +358,7 @@ service that does NOT appear in the provided context AND
 is not one of the above Royal London products — do NOT
 attempt to answer or use general knowledge.
 Instead respond with exactly:
-"I'm sorry, I don't have information about that in our
-knowledge base. For assistance please contact Royal London
-directly on 0345 600 0371 Monday to Friday 8am to 6pm."
+"{UNKNOWN_PRODUCT_RESPONSE}"
 Examples of products Royal London does NOT offer:
 credit cards, bank accounts, mortgages, car insurance,
 home insurance, travel insurance, cryptocurrency.
@@ -351,19 +404,19 @@ NEVER:
 
 
 # ── Helper functions ──────────────────────────────────────────
-def needs_empathy(query: str) -> bool:
-    query_lower = query.lower()
-    return any(t in query_lower for t in EMPATHY_TRIGGERS)
+# needs_empathy() and needs_disclaimer() MOVED to supervisor.py
+# in v1.6.0 — see SYSTEM_PROMPT note above and supervisor.py
+# v1.5.0 changelog.
 
 
-def needs_disclaimer(query: str) -> bool:
-    query_lower = query.lower()
-    return any(
-        t in query_lower for t in FINANCIAL_DECISION_TRIGGERS
-    )
+def is_simple_query(query: str, is_sensitive: bool) -> bool:
+    """
+    Route to gpt-4o-mini (True) or gpt-4.1 (False).
 
-
-def is_simple_query(query: str) -> bool:
+    is_sensitive is state.is_sensitive (== state.needs_empathy),
+    set by supervisor.py BEFORE this node runs — replaces the
+    previous local needs_empathy(query) call (v1.6.0).
+    """
     query_lower = query.lower()
     complex_indicators = [
         "compare" in query_lower,
@@ -372,7 +425,7 @@ def is_simple_query(query: str) -> bool:
         "calculate" in query_lower,
         len(query.split()) > 20,
         query.count("?") > 1,
-        needs_empathy(query),
+        is_sensitive,
     ]
     simple_indicators = [
         len(query.split()) < 10,
@@ -555,15 +608,15 @@ def generator_node(state: AgentState) -> AgentState:
     """Generate response using gpt-4.1 or gpt-4o-mini."""
     start = time.time()
 
-    state.needs_empathy    = needs_empathy(state.query)
-    state.needs_disclaimer = needs_disclaimer(state.query)
-    state.is_sensitive     = state.needs_empathy
+    # state.needs_empathy, state.needs_disclaimer and
+    # state.is_sensitive are now set by supervisor.py (v1.5.0),
+    # BEFORE cache_check runs — no longer computed here (v1.6.0).
 
     try:
         # Route: simple queries → gpt-4o-mini, complex → gpt-4.1
         deployment = (
             DEPLOYMENT_FAST
-            if is_simple_query(state.query)
+            if is_simple_query(state.query, state.is_sensitive)
             else DEPLOYMENT_MAIN
         )
 
@@ -595,8 +648,23 @@ def generator_node(state: AgentState) -> AgentState:
         updated_text, citations = extract_citations(
             state, raw_response
         )
-        state.raw_response = updated_text
-        state.citations    = citations
+
+        # ── UNKNOWN PRODUCT RULE refusal detection (v1.6.0) ──
+        # If GPT returned the UNKNOWN PRODUCT RULE refusal text,
+        # treat it as a refusal (refusal_triggered=True) so
+        # cache_write_node's existing
+        # "refusal_triggered or not final_response" check skips
+        # caching it. Prevents a wrong "no information" answer for
+        # one phrasing from being cached and then replayed for
+        # other phrasings of the same topic.
+        if UNKNOWN_PRODUCT_RESPONSE in updated_text:
+            state.refusal_triggered = True
+            state.raw_response      = UNKNOWN_PRODUCT_RESPONSE
+            state.final_response    = UNKNOWN_PRODUCT_RESPONSE
+            state.citations         = []
+        else:
+            state.raw_response = updated_text
+            state.citations    = citations
 
         # Track token usage
         usage = response.usage
@@ -618,10 +686,11 @@ def generator_node(state: AgentState) -> AgentState:
         log.info(
             "generation_complete",
             model=deployment,
-            citations=len(citations),
+            citations=len(state.citations),
             latency_ms=round(latency),
             empathy=state.needs_empathy,
             disclaimer=state.needs_disclaimer,
+            refusal_triggered=state.refusal_triggered,
             request_id=state.request_id,
             tokens=state.token_usage.get("total_tokens", 0),
         )

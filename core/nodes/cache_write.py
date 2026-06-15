@@ -1,5 +1,36 @@
 """
 Cache Write Node — stores successful response in semantic cache.
+
+═══════════════════════════════════════════════════════════════
+CHANGE LOG
+═══════════════════════════════════════════════════════════════
+
+v1.0.0 — Initial version
+         Writes response to semantic cache unless
+         refusal_triggered, no final_response, cache_hit, or
+         no embedding available.
+
+v1.1.0 — June 2026 | Mukesh Kund
+         Skip cache write for sensitive disclosures (empathy)
+
+         cache_write_node() [MODIFIED]:
+         - Added skip condition: state.needs_empathy is True
+         - WHY: state.needs_empathy is now set in supervisor.py
+           (v1.5.0) for genuine-distress queries (terminal
+           illness, bereavement, redundancy, financial hardship
+           etc), and cache_check.py (v1.5.0) skips the semantic
+           cache entirely for these queries so the full pipeline
+           always runs.
+         - Without this skip, a sensitive exchange's response
+           (which includes empathy + human handoff, tailored to
+           THIS customer's disclosure) could be written to cache
+           and later served cold — without empathy/handoff — to
+           a different customer whose query happens to be
+           semantically similar after normalisation.
+         - Mirrors the existing refusal_triggered / cache_hit
+           skip conditions below.
+
+═══════════════════════════════════════════════════════════════
 """
 
 import time
@@ -27,6 +58,19 @@ def cache_write_node(state: AgentState) -> AgentState:
         # Skip if cache was already a hit
         if state.cache_hit:
             log.info("cache_write_skipped", reason="cache_hit")
+            return state
+
+        # Skip if this is a sensitive disclosure (v1.1.0)
+        # state.needs_empathy is set in supervisor.py and
+        # cache_check.py already skipped the semantic cache for
+        # this query entirely (see cache_check.py v1.5.0). Do not
+        # write this response to cache either — it contains
+        # empathy/handoff text tailored to THIS customer's
+        # disclosure and must not be replayed to a different
+        # customer whose query is semantically similar after
+        # normalisation.
+        if state.needs_empathy:
+            log.info("cache_write_skipped", reason="needs_empathy")
             return state
 
         # Get query embedding from state

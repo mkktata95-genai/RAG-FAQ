@@ -1,10 +1,12 @@
 """
 Cache Check Node — checks semantic cache before hitting LLM.
 Hybrid approach:
-  Step 1: Lemmatization + stop words (free)
-  Step 2: Cache check with threshold 0.87
-  Step 3: LLM canonical rewrite (gpt-4o-mini)
-  Step 4: Cache check again with canonical form
+  Step 1:  Lemmatization + stop words (free)
+  Step 1b: Skip cache entirely if state.needs_empathy (v1.5.0) —
+           sensitive disclosures always go to the full pipeline
+  Step 2:  Cache check with threshold 0.87
+  Step 3:  LLM canonical rewrite (gpt-4o-mini)
+  Step 4:  Cache check again with canonical form
 
 ═══════════════════════════════════════════════════════════════
 CHANGE LOG
@@ -77,6 +79,53 @@ v1.4.0 — June 2026 | Mukesh Kund
            is skipped (meaning preserved for downstream nodes)
          - The embedding generated in Step 1 is still stored on
            state._query_embedding for retriever reuse
+
+v1.5.0 — June 2026 | Mukesh Kund
+         Skip semantic cache entirely for sensitive disclosures
+         (needs_empathy queries)
+
+         ROOT CAUSE — REPRODUCED LIVE:
+         "I have been diagnosed with terminal cancer"
+           → Stage 2 direct cache check: correct MISS
+             (best_similarity=0.3546)
+           → Stage 3 canonical_rewrite (gpt-4o-mini):
+             canonical="What is critical illness cover?"
+           → embedding of canonical form → cache_hit
+             similarity=1.0 against an earlier cached FAQ
+             answer for "What is critical illness cover?"
+           → full pipeline skipped, generator never runs,
+             empathy / disclaimer / human handoff never added
+
+         Same pattern: "My wife passed away last week"
+           → canonical "How do I make a claim?" → cache_hit
+             similarity=1.0 → cached claims-process answer,
+             no bereavement empathy or handoff number.
+
+         The CANONICAL_SYSTEM_PROMPT few-shot examples
+         ("Critical illness explained" → "What is critical
+         illness cover?", "I need to claim" → "How do I make a
+         claim?") generalise correctly for topic-matching, but
+         strip the emotional content that generator.py's
+         EMPATHY RULE depends on.
+
+         FIX:
+         - supervisor.py [MODIFIED separately, v1.5.0] now
+           computes state.needs_empathy BEFORE cache_check runs
+           (moved from generator.py).
+         - cache_check_node() [MODIFIED]:
+           Immediately after Step 1 (normalisation + embedding,
+           which the retriever still needs via
+           state._query_embedding), if state.needs_empathy is
+           True:
+             - cache_hit is set to False
+             - Stage 2 (direct cache.get) is skipped
+             - Stage 3 (canonical rewrite) is skipped entirely
+             - function returns early
+           This guarantees sensitive disclosures always reach
+           generator.py, where empathy/disclaimer/handoff logic
+           runs.
+         - cache_write.py [MODIFIED separately, v1.1.0] mirrors
+           this — sensitive exchanges are never written to cache.
 
 ═══════════════════════════════════════════════════════════════
 """
@@ -412,6 +461,31 @@ def cache_check_node(state: AgentState) -> AgentState:
 
         # Always store embedding for retriever reuse
         state.__dict__["_query_embedding"] = embedding
+
+        # ── Step 1b: Sensitive-disclosure check (v1.5.0) ──
+        # state.needs_empathy is set in supervisor.py BEFORE
+        # cache_check runs. If the customer's query contains a
+        # genuine-distress trigger (terminal illness, bereavement,
+        # redundancy, financial hardship etc — see
+        # EMPATHY_TRIGGERS in supervisor.py), skip the semantic
+        # cache entirely:
+        #   - Stage 2 (direct cache.get) is skipped
+        #   - Stage 3 (canonical rewrite) is skipped — this is
+        #     the step that was collapsing sensitive disclosures
+        #     into generic FAQ phrasing and producing false
+        #     1.0-similarity cache hits (see v1.5.0 changelog)
+        # The normalised embedding above is still stored on
+        # state._query_embedding so the retriever can reuse it.
+        if state.needs_empathy:
+            latency = (time.time() - start) * 1000
+            state.latency_ms["cache_check"] = latency
+            state.cache_hit = False
+            log.info(
+                "cache_check_skipped",
+                reason="needs_empathy",
+                query=state.query[:50],
+            )
+            return state
 
         # ── Step 2: First cache check ─────────────────────
         cached = cache.get(embedding)

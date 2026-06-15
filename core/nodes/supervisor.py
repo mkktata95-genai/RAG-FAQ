@@ -81,6 +81,67 @@ v1.4.0 — June 2026 | Mukesh Kund
            rewrite transformed it to "What is my previous
            question?" — destroying the contextual meaning
 
+v1.5.0 — June 2026 | Mukesh Kund
+         Empathy & financial disclaimer detection moved here
+         from generator.py — fixes cache bypass of empathy/
+         handoff for sensitive disclosures
+
+         ROOT CAUSE:
+         - EMPATHY_TRIGGERS / needs_empathy() and
+           FINANCIAL_DECISION_TRIGGERS / needs_disclaimer()
+           previously lived in generator.py and were only
+           evaluated inside generator_node() — the LAST node
+           before cache_write.
+         - cache_check runs BEFORE generator. On a cache hit
+           (Stage 2 direct match, or Stage 3 canonical-rewrite
+           match), the graph routes straight to END —
+           generator_node() never runs, so needs_empathy() was
+           never evaluated for cached responses.
+         - Reproduced live:
+             "I have been diagnosed with terminal cancer"
+               → Stage 2 direct cache check: correct MISS
+                 (best_similarity=0.3546)
+               → Stage 3 canonical_rewrite (gpt-4o-mini):
+                 canonical="What is critical illness cover?"
+               → cache_hit similarity=1.0 against an earlier
+                 cached FAQ answer — empathy/disclaimer/handoff
+                 never added.
+             "My wife passed away last week"
+               → canonical "How do I make a claim?"
+               → cache_hit similarity=1.0 → cached claims-
+                 process answer, no bereavement empathy or
+                 handoff number.
+
+         FIX — empathy/disclaimer detection moved to supervisor:
+         - EMPATHY_TRIGGERS, FINANCIAL_DECISION_TRIGGERS,
+           needs_empathy(), needs_disclaimer() [MOVED HERE from
+           generator.py, logic unchanged]
+         - supervisor_node() [MODIFIED]:
+           After expand_query(), now sets:
+             state.needs_empathy    = needs_empathy(state.query)
+             state.needs_disclaimer = needs_disclaimer(state.query)
+             state.is_sensitive     = state.needs_empathy
+           These are real AgentState/GraphState fields already
+           (see schemas.py) — they now carry a meaningful value
+           through cache_check, input_safety, retriever and
+           generator instead of only being set inside generator.
+         - supervisor_start log now includes needs_empathy and
+           needs_disclaimer for observability.
+         - cache_check.py [MODIFIED separately, v1.5.0] now
+           checks state.needs_empathy and skips the semantic
+           cache entirely (no Stage 2 lookup, no Stage 3
+           canonical rewrite) when True — guaranteeing the full
+           pipeline runs so generator's empathy/disclaimer/
+           handoff logic always fires for sensitive disclosures.
+         - cache_write.py [MODIFIED separately, v1.1.0] mirrors
+           this — sensitive exchanges are never written to
+           cache, so they cannot later be served cold to another
+           customer.
+         - generator.py [MODIFIED separately, v1.6.0] no longer
+           defines or recomputes these — it reads
+           state.needs_empathy / state.needs_disclaimer as set
+           by supervisor.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -153,6 +214,89 @@ OBVIOUS_THANKS = {
     "thank you so much", "thanks a lot",
     "many thanks", "appreciated",
 }
+
+# ── Empathy & Financial Disclaimer Detection ─────────────────
+#
+# MOVED HERE in v1.5.0 — was generator.py EMPATHY_TRIGGERS /
+# FINANCIAL_DECISION_TRIGGERS / needs_empathy() / needs_disclaimer().
+#
+# WHY THIS MUST RUN IN SUPERVISOR (not generator):
+# cache_check runs BEFORE generator. A cache hit (Stage 2 direct
+# match or Stage 3 canonical rewrite) routes straight to END, so
+# generator_node() — and therefore needs_empathy() — never ran for
+# cached responses. By computing these flags here in supervisor
+# (which always runs first), cache_check and cache_write can read
+# state.needs_empathy / state.needs_disclaimer and skip the
+# semantic cache for sensitive disclosures, guaranteeing
+# generator's empathy/handoff/disclaimer logic always fires.
+#
+# IMPORTANT: Only include triggers that represent GENUINE distress
+# or sensitive personal circumstances — NOT administrative tasks.
+#
+# REMOVED in generator.py v1.3.0 (were causing false positives,
+# kept removed here too):
+#   'claim', 'make a claim' → standard FAQ, not sensitive
+#   'lost pension'          → administrative task, not distress
+#   'illness'               → too broad, matches 'critical illness cover'
+#   'condition'             → too broad, matches product descriptions
+#   'injury'                → too broad
+#   'accident'              → too broad
+#   'hospital'              → too broad
+#
+EMPATHY_TRIGGERS = [
+    # Terminal / life-threatening illness
+    "cancer", "terminal", "critically ill", "serious illness",
+    "life-limiting", "life limiting",
+    # Bereavement
+    "died", "death", "bereavement", "passed away",
+    "losing someone", "loss of a loved",
+    # Disability
+    "disability", "disabled",
+    # Employment / financial hardship
+    "redundan", "unemployed", "losing my job", "lost my job",
+    "financial difficulty", "financial hardship",
+    "can't afford", "cannot afford", "struggling to pay",
+    # Relationship breakdown
+    "divorce", "separation", "separating",
+    # Mental health
+    "mental health", "anxiety", "depression",
+    # Diagnosis
+    "diagnosed",
+]
+
+# ── Financial Decision Detection ──────────────────────────────
+# MOVED HERE in v1.5.0 — was generator.py FINANCIAL_DECISION_TRIGGERS.
+FINANCIAL_DECISION_TRIGGERS = [
+    "should i", "should i invest", "which pension",
+    "best option", "recommend", "advice",
+    "what should", "is it worth", "better to",
+    "choose", "decide", "switch", "transfer",
+    "how much should", "when should",
+    "tax", "return", "growth", "performance",
+]
+
+
+def needs_empathy(query: str) -> bool:
+    """
+    MOVED HERE in v1.5.0 — was generator.py needs_empathy().
+    Logic unchanged. Now called from supervisor_node() before
+    cache_check runs, so the result is available on
+    state.needs_empathy for cache_check/cache_write to read.
+    """
+    query_lower = query.lower()
+    return any(t in query_lower for t in EMPATHY_TRIGGERS)
+
+
+def needs_disclaimer(query: str) -> bool:
+    """
+    MOVED HERE in v1.5.0 — was generator.py needs_disclaimer().
+    Logic unchanged.
+    """
+    query_lower = query.lower()
+    return any(
+        t in query_lower for t in FINANCIAL_DECISION_TRIGGERS
+    )
+
 
 # ── Account Lookup Detection ──────────────────────────────────
 #
@@ -731,6 +875,15 @@ def supervisor_node(state: AgentState) -> AgentState:
         state.conversation_history,
     )
 
+    # ── Step 8b: Empathy & financial disclaimer detection ─
+    # Computed HERE (not in generator.py) — see v1.5.0 changelog.
+    # cache_check (next node) reads state.needs_empathy to decide
+    # whether to skip the semantic cache entirely. generator.py
+    # (downstream) reads both flags but no longer computes them.
+    state.needs_empathy    = needs_empathy(state.query)
+    state.needs_disclaimer = needs_disclaimer(state.query)
+    state.is_sensitive     = state.needs_empathy
+
     # Log with PII masked
     masked_query = mask_pii_for_logging(state.query)
     log.info(
@@ -743,6 +896,8 @@ def supervisor_node(state: AgentState) -> AgentState:
         used_llm=_used_llm,
         override_triggered=_override_triggered,
         override_reason=_override_reason,
+        needs_empathy=state.needs_empathy,
+        needs_disclaimer=state.needs_disclaimer,
     )
 
     return state
