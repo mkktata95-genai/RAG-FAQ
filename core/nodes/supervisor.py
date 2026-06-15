@@ -142,6 +142,59 @@ v1.5.0 — June 2026 | Mukesh Kund
            state.needs_empathy / state.needs_disclaimer as set
            by supervisor.
 
+v1.6.0 — June 2026 | Mukesh Kund
+         Bereavement-specific handoff number detection
+
+         BACKGROUND:
+         - The technical design doc states the bereavement
+           support number (0370 850 2179) is "injected
+           separately by the user prompt builder when
+           bereavement-specific terms are detected" — but this
+           was never implemented. generator.py's
+           build_user_prompt only ever had access to
+           state.needs_empathy (a generic flag covering cancer,
+           redundancy, divorce, mental health etc.) with no way
+           to distinguish a genuine bereavement from those other
+           categories, so only the general number 0345 600 0371
+           was ever used.
+         - Confirmed live (Seq 2): a bereavement query got
+           correct empathy + content + citations, but the
+           handoff number was 0345 600 0371 instead of the
+           bereavement-specific 0370 850 2179.
+
+         FIX:
+         - BEREAVEMENT_TRIGGERS [NEW CONSTANT] / is_bereavement()
+           [NEW FUNCTION]: a STRICT SUBSET of EMPATHY_TRIGGERS
+           covering only genuine bereavement language ("died",
+           "passed away", "bereavement", "losing someone",
+           "loss of a loved"). Deliberately excludes the broader
+           "death" trigger from EMPATHY_TRIGGERS, which also
+           matches product-feature questions like "what is the
+           death benefit on my policy" — those should keep their
+           existing empathy framing but must NOT receive the
+           bereavement support line.
+         - This is a STRICT SUBSET BY DESIGN: _bereavement=True
+           must always imply needs_empathy=True, so cache_check
+           always skips the semantic cache (v1.5.0) and
+           generator_node always runs to apply the bereavement
+           note (v1.7.0). Any future addition to
+           BEREAVEMENT_TRIGGERS must also be present in
+           EMPATHY_TRIGGERS, or the bereavement note may never be
+           reached.
+         - supervisor_node() [MODIFIED]: alongside
+           needs_empathy/needs_disclaimer in Step 8b, now sets
+             state.__dict__["_bereavement"] = is_bereavement(state.query)
+           using the same state.__dict__ pattern as
+           _override_triggered/_override_reason — and, per
+           graph.py v1.1.0, this now actually propagates to
+           generator.py.
+         - supervisor_start log now includes bereavement.
+         - generator.py [MODIFIED separately, v1.7.0]:
+           build_user_prompt() injects a note instructing the
+           model to use 0370 850 2179 instead of 0345 600 0371
+           for the human handoff in this response only, when
+           state.__dict__["_bereavement"] is True.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -296,6 +349,40 @@ def needs_disclaimer(query: str) -> bool:
     return any(
         t in query_lower for t in FINANCIAL_DECISION_TRIGGERS
     )
+
+
+# ── Bereavement Detection ─────────────────────────────────────
+# NEW in v1.6.0 — see CHANGE LOG for full rationale.
+#
+# STRICT SUBSET OF EMPATHY_TRIGGERS BY DESIGN. Every term below
+# must also appear in EMPATHY_TRIGGERS, so that
+# _bereavement=True always implies needs_empathy=True. This
+# guarantees:
+#   - cache_check.py (v1.5.0) skips the semantic cache, so
+#   - generator_node() always runs and can apply the
+#     bereavement-specific handoff number (generator.py v1.7.0).
+#
+# Deliberately narrower than EMPATHY_TRIGGERS's "death"/"died"
+# pair — "death" alone also matches product-feature questions
+# such as "what is the death benefit on my policy", which should
+# keep empathy framing but must NOT receive the bereavement
+# support line (0370 850 2179) instead of the general number.
+BEREAVEMENT_TRIGGERS = [
+    "died", "passed away", "bereavement",
+    "losing someone", "loss of a loved",
+]
+
+
+def is_bereavement(query: str) -> bool:
+    """
+    NEW in v1.6.0. Detects genuine bereavement language so
+    generator.py can inject the bereavement-specific handoff
+    number (0370 850 2179) instead of the general number
+    (0345 600 0371). See BEREAVEMENT_TRIGGERS comment above for
+    why this is a strict subset of EMPATHY_TRIGGERS.
+    """
+    query_lower = query.lower()
+    return any(t in query_lower for t in BEREAVEMENT_TRIGGERS)
 
 
 # ── Account Lookup Detection ──────────────────────────────────
@@ -884,6 +971,13 @@ def supervisor_node(state: AgentState) -> AgentState:
     state.needs_disclaimer = needs_disclaimer(state.query)
     state.is_sensitive     = state.needs_empathy
 
+    # v1.6.0: Bereavement-specific handoff number detection.
+    # Stored via state.__dict__ — same pattern as
+    # _override_triggered/_override_reason (v1.4.0), and now
+    # correctly propagated to generator.py per graph.py v1.1.0.
+    _bereavement = is_bereavement(state.query)
+    state.__dict__["_bereavement"] = _bereavement
+
     # Log with PII masked
     masked_query = mask_pii_for_logging(state.query)
     log.info(
@@ -898,6 +992,7 @@ def supervisor_node(state: AgentState) -> AgentState:
         override_reason=_override_reason,
         needs_empathy=state.needs_empathy,
         needs_disclaimer=state.needs_disclaimer,
+        bereavement=_bereavement,
     )
 
     return state

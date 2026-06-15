@@ -1,5 +1,84 @@
 """
 LangGraph assembly — wires all nodes into the agent graph.
+
+═══════════════════════════════════════════════════════════════
+CHANGE LOG
+═══════════════════════════════════════════════════════════════
+
+v1.0.0 — Initial version
+         8-node pipeline (Supervisor -> Cache Check -> Input
+         Safety -> Retriever -> Generator -> Output Safety ->
+         Formatter -> Cache Write).
+         pydantic_to_dict()/dict_to_pydantic() special-cased a
+         single state.__dict__ extra (_query_embedding) so it
+         survives the AgentState <-> GraphState conversion that
+         happens at every node boundary.
+
+v1.1.0 — June 2026 | Mukesh Kund
+         Fix silent loss of state.__dict__ extras at node
+         boundaries (_override_triggered / _override_reason
+         / _bereavement)
+
+         ROOT CAUSE:
+         - model_dump() only serialises AgentState's DECLARED
+           Pydantic fields. Any value set directly on
+           state.__dict__ (the "same pattern as
+           _query_embedding", per supervisor.py v1.4.0) was
+           silently dropped the moment a node's return value
+           was converted back to GraphState — UNLESS that key
+           had its own explicit special-case here.
+         - Only _query_embedding had such a special-case.
+         - supervisor.py v1.4.0 started setting
+           state.__dict__["_override_triggered"] and
+           state.__dict__["_override_reason"] for contextual
+           follow-up queries, intending cache_check.py and
+           generator.py to read them downstream — but they were
+           dropped before cache_check.py ever ran, so
+           is_override = state.__dict__.get("_override_triggered",
+           False) was ALWAYS False. The entire v1.2.0-v1.5.0
+           context-override mechanism (categories A-I) has never
+           worked end-to-end.
+
+         LIVE REPRO (request_id=76e0615c-...):
+         - "Why didn't you answer my previous question?"
+           -> supervisor_start: override_triggered=True,
+              override_reason=history_reference  (CORRECT)
+           -> cache_check still ran canonical_rewrite ->
+              canonical='What is my previous question?'
+              (_override_triggered not visible here - WRONG)
+           -> generation_complete: citations=0,
+              refusal_triggered=True (UNKNOWN PRODUCT RULE
+              response, instead of using conversation history)
+
+         FIX:
+         - pydantic_to_dict()/dict_to_pydantic() now propagate a
+           registered list of single-underscore __dict__ extras
+           (_DICT_EXTRA_KEYS) generically, instead of hard-coding
+           only _query_embedding.
+         - GraphState TypedDict additionally declares each key in
+           _DICT_EXTRA_KEYS explicitly. This is REQUIRED, not just
+           documentation: LangGraph's StateGraph builds one
+           channel per key declared in the state schema, and only
+           persists updates for keys it has a channel for. A key
+           returned by a node but absent from GraphState's
+           annotations would be silently dropped when LangGraph
+           merges that node's output into the graph state, even
+           if pydantic_to_dict() includes it in the returned dict.
+         - run_query()'s initial_state now seeds default values
+           for the two new keys (_override_triggered=False,
+           _override_reason="") alongside _query_embedding=None.
+         - _bereavement (new in this round, set by supervisor.py
+           v1.6.0, read by generator.py v1.7.0 for the
+           bereavement-specific handoff number) is registered the
+           same way and seeded as _bereavement=False — this is
+           the first __dict__ extra to be correctly propagated
+           from day one rather than retrofitted.
+         - To add a future __dict__ extra: add it to
+           _DICT_EXTRA_KEYS, add it to GraphState, and seed it in
+           run_query()'s initial_state. No other changes to
+           pydantic_to_dict()/dict_to_pydantic() are needed.
+
+═══════════════════════════════════════════════════════════════
 """
 
 import structlog
@@ -49,14 +128,37 @@ class GraphState(TypedDict):
     token_usage: dict
     error: Any
     _query_embedding: Any
+    # v1.1.0 — declared so LangGraph creates channels for these
+    # state.__dict__ extras (see _DICT_EXTRA_KEYS and CHANGE LOG
+    # above). Without a declared key here, LangGraph silently
+    # drops the value when merging a node's returned dict into
+    # the graph state, regardless of what pydantic_to_dict()
+    # returns.
+    _override_triggered: Any
+    _override_reason: Any
+    _bereavement: Any
+
+
+# v1.1.0 — single-underscore state.__dict__ extras that must
+# survive every AgentState <-> GraphState conversion. Each entry
+# here MUST also:
+#   1. be declared as a key in GraphState above, and
+#   2. be seeded with a default value in run_query()'s
+#      initial_state below.
+# See CHANGE LOG v1.1.0 for why both steps are required.
+_DICT_EXTRA_KEYS = (
+    "_query_embedding",
+    "_override_triggered",
+    "_override_reason",
+    "_bereavement",
+)
 
 
 def pydantic_to_dict(state: AgentState) -> GraphState:
     """Convert Pydantic AgentState to TypedDict."""
     d = state.model_dump()
-    d["_query_embedding"] = state.__dict__.get(
-        "_query_embedding"
-    )
+    for key in _DICT_EXTRA_KEYS:
+        d[key] = state.__dict__.get(key)
     return d
 
 
@@ -67,10 +169,9 @@ def dict_to_pydantic(state: GraphState) -> AgentState:
         if not k.startswith("_")
     }
     obj = AgentState(**clean)
-    if state.get("_query_embedding"):
-        obj.__dict__["_query_embedding"] = (
-            state["_query_embedding"]
-        )
+    for key in _DICT_EXTRA_KEYS:
+        if key in state:
+            obj.__dict__[key] = state[key]
     return obj
 
 
@@ -245,6 +346,10 @@ def run_query(
         "token_usage": {},
         "error": None,
         "_query_embedding": None,
+        # v1.1.0 — see _DICT_EXTRA_KEYS / CHANGE LOG above.
+        "_override_triggered": False,
+        "_override_reason": "",
+        "_bereavement": False,
     }
 
     result = graph.invoke(initial_state)

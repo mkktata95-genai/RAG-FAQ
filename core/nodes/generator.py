@@ -175,6 +175,106 @@ v1.6.0 — June 2026 | Mukesh Kund
            separate, lower-risk follow-up item — flagged but not
            addressed in this change.
 
+v1.7.0 — June 2026 | Mukesh Kund
+         PART 1 — Punctuation-dependent over-refusal
+         (PRODUCT CATEGORY QUESTIONS RULE)
+
+         ROOT CAUSE — confirmed via paired live repro
+         (request_id=8daf9246-... vs 99e63e54-...), context
+         (chunks_found=5, retrieval scores) equivalent in both:
+           "What types of pensions does Royal London offer?"
+             -> is_simple_query: word_count<10 (+1), "?" with
+                count==1 (+1), no keyword match (+0) = 2/2
+             -> routed to gpt-4o-mini
+             -> citations=0, refusal_triggered=True
+                (UNKNOWN_PRODUCT_RESPONSE)
+           "What pension products does Royal London offer"
+             (no "?")
+             -> is_simple_query: word_count<10 (+1), no "?" (+0),
+                no keyword match (+0) = 1/2
+             -> routed to gpt-4.1
+             -> citations=2, correct cited answer
+         Both phrasings retrieved the same "What is a pension &
+         the different types" page (general explanatory content,
+         not phrased as "Royal London offers..."). gpt-4o-mini
+         over-applied ANSWER RULE 2 ("ONLY include facts
+         explicitly stated in context, do NOT add general
+         knowledge") against this chunk and fell through to
+         UNKNOWN PRODUCT RULE; gpt-4.1 did not. The customer's
+         outcome depended entirely on a trailing "?" choosing
+         gpt-4o-mini vs gpt-4.1 — for an FCA-regulated assistant,
+         two equivalent phrasings of "what pension types do you
+         offer" producing "here are the types" vs "I have no
+         information, call us" is a Consumer Duty issue, not just
+         an inconsistency.
+
+         FIX — SYSTEM PROMPT, new PRODUCT CATEGORY QUESTIONS RULE
+         [NEW RULE, placed immediately after UNKNOWN PRODUCT RULE]:
+         - Scoped narrowly: applies ONLY when (a) the customer
+           asks what TYPES/KINDS/OPTIONS exist within a product
+           CATEGORY already on Royal London's offered-products
+           list (pensions, ISAs, life insurance, critical illness
+           cover, income protection, over 50s life insurance), AND
+           (b) the context contains general explanatory content
+           about that category.
+         - In that case, the model should answer from that
+           content even if it is not phrased as "Royal London
+           offers...".
+         - Explicitly does NOT relax ANSWER RULE 2 for queries
+           asking SPECIFIC facts (growth rates, guaranteed
+           amounts, payout/premium figures, eligibility) — those
+           remain governed by ANSWER RULE 2 exactly as before.
+         - UNKNOWN PRODUCT RULE still applies if the context has
+           NO relevant explanatory content for that category.
+         - Model routing (is_simple_query) is UNCHANGED — this
+           fix makes the answer correct and consistent regardless
+           of which model handles it, which is lower-risk than
+           retuning the simple/complex heuristic and directly
+           addresses "same answer in the KB, different outcome
+           depending on phrasing".
+         - MUST be tested against BOTH phrasings from the repro
+           pair above (one routes gpt-4o-mini, one routes gpt-4.1)
+           to confirm consistent, correct answers from both models.
+
+         PART 2 — Bereavement-specific handoff number
+         (companion to supervisor.py v1.6.0)
+
+         BACKGROUND: see supervisor.py v1.6.0 changelog. The
+         design doc describes the bereavement number
+         (0370 850 2179) as "injected separately by the user
+         prompt builder when bereavement-specific terms are
+         detected" but this was never implemented — only the
+         general number 0345 600 0371 existed anywhere in
+         generator.py.
+
+         FIX:
+         - BEREAVEMENT_HANDOFF_NUMBER [NEW CONSTANT]: single
+           source of truth for "0370 850 2179", referenced from
+           both SYSTEM_PROMPT and build_user_prompt() so they
+           cannot drift apart (same pattern as
+           UNKNOWN_PRODUCT_RESPONSE in v1.6.0).
+         - SYSTEM PROMPT — HUMAN HANDOFF RULE [MODIFIED]: added a
+           sentence noting that if the user prompt contains a
+           NOTE specifying an alternative handoff number for this
+           response, that number must be used INSTEAD of
+           0345 600 0371 for the human handoff message ONLY — all
+           other numbers in the response (financial disclaimer,
+           unknown product rule, account access rule) are
+           unaffected.
+         - build_user_prompt() [MODIFIED]: when
+           state.__dict__.get("_bereavement") is True (set by
+           supervisor.py v1.6.0, now correctly propagated per
+           graph.py v1.1.0), injects a bereavement_note
+           instructing the model to use
+           BEREAVEMENT_HANDOFF_NUMBER for the human handoff in
+           this response only.
+         - Placed alongside empathy_note: BEREAVEMENT_TRIGGERS is
+           a strict subset of EMPATHY_TRIGGERS (supervisor.py
+           v1.6.0), so _bereavement=True always implies
+           state.needs_empathy=True and empathy_note is also
+           present — the two notes work together (empathy framing
+           + correct handoff number).
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -264,6 +364,14 @@ UNKNOWN_PRODUCT_RESPONSE = (
     "directly on 0345 600 0371 Monday to Friday 8am to 6pm."
 )
 
+# ── Bereavement Handoff Number ────────────────────────────────
+# NEW in v1.7.0 — single source of truth for the
+# bereavement-specific support line, referenced from both
+# SYSTEM_PROMPT (HUMAN HANDOFF RULE) and build_user_prompt()'s
+# bereavement_note so they cannot drift apart. See supervisor.py
+# v1.6.0 / generator.py v1.7.0 changelogs.
+BEREAVEMENT_HANDOFF_NUMBER = "0370 850 2179"
+
 # ── System Prompt ─────────────────────────────────────────────
 SYSTEM_PROMPT = f"""You are a helpful and professional \
 customer service assistant for RLG (a UK insurance and \
@@ -310,6 +418,12 @@ happy to help. Please call us on 0345 600 0371
 Monday to Friday 8am to 6pm."
 Do NOT add handoff message for standard administrative
 queries (lost pension, making a claim, transfers etc).
+If the user prompt below contains a NOTE specifying an
+alternative phone number for this response (for example,
+the dedicated bereavement support line), use THAT number
+INSTEAD of 0345 600 0371 in the handoff message above —
+for the handoff message only. Do not change any other
+phone number in your response.
 
 FINANCIAL DISCLAIMER RULE:
 ONLY add this disclaimer when the query involves a
@@ -362,6 +476,29 @@ Instead respond with exactly:
 Examples of products Royal London does NOT offer:
 credit cards, bank accounts, mortgages, car insurance,
 home insurance, travel insurance, cryptocurrency.
+
+PRODUCT CATEGORY QUESTIONS RULE:
+This rule is an exception to ANSWER RULE 2 below, scoped
+narrowly as follows.
+If the customer asks what TYPES, KINDS, or OPTIONS exist
+within one of Royal London's product categories listed in
+the UNKNOWN PRODUCT RULE above (for example "what types of
+pensions does Royal London offer", "what kinds of life
+insurance do you have", "what ISA options are there") —
+and the provided context contains general explanatory
+content about that category (for example a page explaining
+what a pension is and the different types of pension) —
+answer using that content, even if it is not phrased as
+"Royal London offers...".
+This exception does NOT apply to questions asking for a
+SPECIFIC fact about Royal London's own products or a named
+customer's policy — for example exact growth rates,
+guaranteed amounts, specific payout or premium figures, or
+personal eligibility. Those remain governed by ANSWER RULE 2:
+only state such figures if explicitly given in the context.
+Only fall back to the UNKNOWN PRODUCT RULE response above if
+the context contains no relevant explanatory content about
+that product category at all.
 
 ACCOUNT ACCESS RULE:
 You do NOT have access to any customer accounts, policy
@@ -482,6 +619,24 @@ def build_user_prompt(state: AgentState) -> str:
             "situation. Please acknowledge with empathy first.\n\n"
         )
 
+    # Bereavement note — NEW in v1.7.0. _bereavement is set by
+    # supervisor.py v1.6.0 and is a strict subset of
+    # needs_empathy, so when this is True, empathy_note above is
+    # also present. Tells GPT to use the bereavement-specific
+    # support line for the human handoff in this response only —
+    # see SYSTEM_PROMPT HUMAN HANDOFF RULE.
+    bereavement_note = ""
+    if state.__dict__.get("_bereavement"):
+        bereavement_note = (
+            "NOTE: This query relates to a bereavement. For the "
+            "HUMAN HANDOFF RULE in this response, use the "
+            f"dedicated bereavement support line "
+            f"{BEREAVEMENT_HANDOFF_NUMBER} instead of "
+            "0345 600 0371. Do not change any other phone "
+            "number in your response — only the human handoff "
+            "number.\n\n"
+        )
+
     disclaimer_note = ""
     if state.needs_disclaimer:
         disclaimer_note = (
@@ -516,6 +671,7 @@ def build_user_prompt(state: AgentState) -> str:
     return (
         f"{history}"
         f"{empathy_note}"
+        f"{bereavement_note}"
         f"{disclaimer_note}"
         f"{override_note}"
         f"Context from RLG documentation:\n\n"
