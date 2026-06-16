@@ -47,21 +47,50 @@ SEMANTIC_CONFIG = {
 }
 
 
-def get_token() -> str:
-    """Get Azure access token for Search using az CLI."""
-    print("Getting Azure access token...", end="", flush=True)
-    result = subprocess.run(
-        ["az", "account", "get-access-token",
-         "--resource", "https://search.azure.com",
-         "--query", "accessToken", "-o", "tsv"],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        print(f"\n❌ Failed to get token: {result.stderr}")
+def get_token(token_file: str = None) -> str:
+    """
+    Get Azure access token for Search.
+    If token_file is provided, reads token from that file.
+    Otherwise tries az CLI subprocess.
+    """
+    # Option 1: read from file (most reliable on Windows venv)
+    if token_file and os.path.exists(token_file):
+        print(f"Reading token from {token_file}...", end="", flush=True)
+        with open(token_file, "r", encoding="utf-8") as f:
+            token = f.read().strip()
+        if token:
+            print(" done")
+            return token
+        print(" ❌ file is empty")
         sys.exit(1)
-    token = result.stdout.strip()
-    print(" done")
-    return token
+
+    # Option 2: az CLI — try common Windows paths
+    print("Getting Azure access token via az CLI...", end="", flush=True)
+    az_candidates = [
+        "az",
+        r"C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin\az.cmd",
+        r"C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd",
+    ]
+    for az_cmd in az_candidates:
+        try:
+            result = subprocess.run(
+                [az_cmd, "account", "get-access-token",
+                 "--resource", "https://search.azure.com",
+                 "--query", "accessToken", "-o", "tsv"],
+                capture_output=True, text=True, shell=(az_cmd != "az")
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                print(" done")
+                return result.stdout.strip()
+        except FileNotFoundError:
+            continue
+
+    print("\n❌ Could not get token via az CLI.")
+    print("   Run this in PowerShell first:")
+    print("   $token = (az account get-access-token --resource https://search.azure.com --query accessToken -o tsv)")
+    print("   $token | Out-File -FilePath token.txt -Encoding utf8 -NoNewline")
+    print("   Then: python add_semantic_config.py --token-file token.txt")
+    sys.exit(1)
 
 
 def load_backup() -> dict:
@@ -212,7 +241,12 @@ def main():
     print(f"Modified index saved to {modified_path} (local backup)")
 
     # 6. Get token
-    token = get_token()
+    token_file = None
+    if "--token-file" in sys.argv:
+        idx = sys.argv.index("--token-file")
+        if idx + 1 < len(sys.argv):
+            token_file = sys.argv[idx + 1]
+    token = get_token(token_file)
 
     # 7. Push to Azure
     status, body = push_to_azure(index_def, token)
