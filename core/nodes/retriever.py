@@ -15,6 +15,38 @@ v1.0.0 — Initial version
 v1.1.0 — June 2026 | Mukesh Kund
          Skip Azure Search entirely for context-override queries
 
+v1.2.0 — June 2026 | Mukesh Kund
+         Enable Azure AI Search semantic ranker (L2 reranker)
+
+         ROOT CAUSE:
+         - Hybrid search (BM25 + vector) scores chunks by keyword
+           frequency and embedding cosine similarity. Both are
+           shallow signals that don’t understand what the query
+           is ASKING FOR vs what a chunk is ANSWERING.
+         - "What types of pensions does Royal London offer?"
+           matched workplace-pensions chunks (high BM25, repeated
+           keywords) instead of the what-is-a-pension chunk
+           (correct answer, weaker keyword density).
+         - AGM/press-release chunks won on BM25 because they
+           contain "pension", "Royal London" repeatedly —
+           irrelevant but keyword-rich.
+
+         FIX:
+         - query_type="semantic" activates Azure’s L2 semantic
+           reranker — a transformer model that re-scores top-50
+           hybrid candidates by reading actual query intent and
+           chunk meaning, not just keyword counts.
+         - semantic_configuration_name="rlg-semantic-config"
+           tells the ranker which fields to use:
+             title    → primary signal
+             content  → main scoring body
+             section  → keyword boost
+         - TOP_K raised 3 → 5: more candidates, richer context.
+         - SEMANTIC_MIN_SCORE replaces MIN_RELEVANCE_SCORE for
+           semantic mode — semantic scores use a 0–4 scale,
+           not the hybrid scale. Default 0.5.
+         - NO re-indexing required.
+
          ROOT CAUSE / LIVE REPRO:
          - When _override_triggered=True (set by supervisor.py
            v1.4.0+ for contextual follow-up queries such as "Why
@@ -75,9 +107,23 @@ load_dotenv()
 log = structlog.get_logger()
 
 # ── Config ────────────────────────────────────────────────────
-SEARCH_ENDPOINT     = os.getenv("AZURE_SEARCH_ENDPOINT", "")
-INDEX_NAME          = os.getenv("AZURE_SEARCH_INDEX_NAME", "rlg-faq-index")
-TOP_K               = int(os.getenv("MAX_RETRIEVED_CHUNKS", "3"))
+SEARCH_ENDPOINT          = os.getenv("AZURE_SEARCH_ENDPOINT", "")
+INDEX_NAME               = os.getenv("AZURE_SEARCH_INDEX_NAME", "rlg-faq-index")
+TOP_K                    = int(os.getenv("MAX_RETRIEVED_CHUNKS", "5"))   # v1.2.0: 3→5
+# v1.2.0 — Semantic ranker configuration.
+# Name must match the configuration created in Azure Portal
+# (Indexes → rlg-faq-index → Semantic configurations).
+# Set AZURE_SEARCH_SEMANTIC_CONFIG="" in .env to disable
+# and fall back to pure hybrid search.
+SEMANTIC_CONFIG          = os.getenv(
+    "AZURE_SEARCH_SEMANTIC_CONFIG", "rlg-semantic-config"
+)
+# Semantic reranker scores on a 0-4 scale (not the hybrid
+# 0-35 scale). 0.5 filters genuinely irrelevant results
+# while keeping borderline-relevant ones.
+SEMANTIC_MIN_SCORE       = float(
+    os.getenv("SEMANTIC_MIN_SCORE", "0.5")
+)
 
 # Minimum relevance score for retrieved chunks.
 # Hybrid search scores vary — chunks below this threshold
@@ -166,7 +212,16 @@ def retriever_node(state: AgentState) -> AgentState:
             fields="embedding",
         )
 
-        results = search_client.search(
+        # v1.2.0 — Use semantic ranker if configured.
+        # Semantic ranking is a two-stage process:
+        #   Stage 1: hybrid BM25+vector retrieves top-50
+        #   Stage 2: L2 transformer reranks those 50 by
+        #            actual query-answer relevance
+        # This fixes the "wrong chunk wins" problem where
+        # keyword-dense but irrelevant chunks (AGM pages,
+        # workplace pensions) outscored the correct answer.
+        use_semantic = bool(SEMANTIC_CONFIG)
+        search_kwargs = dict(
             search_text=state.query,
             vector_queries=[vector_query],
             select=[
@@ -175,6 +230,11 @@ def retriever_node(state: AgentState) -> AgentState:
             ],
             top=TOP_K * 3,
         )
+        if use_semantic:
+            search_kwargs["query_type"] = "semantic"
+            search_kwargs["semantic_configuration_name"] = SEMANTIC_CONFIG
+
+        results = search_client.search(**search_kwargs)
 
         # Deduplicate by URL + collect all candidates
         candidates = []
@@ -184,7 +244,14 @@ def retriever_node(state: AgentState) -> AgentState:
             if len(candidates) >= TOP_K * 3:
                 break
             url   = result["source_url"]
-            score = result.get("@search.score", 0.0)
+            # v1.2.0 — prefer @search.rerankerScore (semantic)
+            # over @search.score (hybrid) when available.
+            # rerankerScore is on a 0-4 scale and is a much
+            # better signal of true relevance.
+            score = (
+                result.get("@search.rerankerScore")
+                or result.get("@search.score", 0.0)
+            )
             if url not in seen_urls:
                 candidates.append(RetrievedChunk(
                     chunk_id=result["chunk_id"],
@@ -197,24 +264,32 @@ def retriever_node(state: AgentState) -> AgentState:
                 seen_urls.add(url)
 
         # ── Relevance score filter ────────────────────────────
-        # Check if best chunk meets minimum relevance threshold.
-        # If even the top result scores below MIN_RELEVANCE_SCORE,
-        # the query has no relevant content in our index — treat
-        # as no results to prevent hallucination.
+        # v1.2.0: Use SEMANTIC_MIN_SCORE when semantic ranker
+        # is active (scores 0-4 scale), otherwise fall back to
+        # MIN_RELEVANCE_SCORE for hybrid scores (0-35 scale).
+        # This prevents hallucination when no relevant content
+        # exists for the query in our index.
         if candidates:
-            best_score = max(c.score for c in candidates)
+            best_score     = max(c.score for c in candidates)
+            threshold      = (
+                SEMANTIC_MIN_SCORE
+                if use_semantic
+                else MIN_RELEVANCE_SCORE
+            )
             log.info(
                 "retrieval_scores",
                 best_score=round(best_score, 4),
-                min_threshold=MIN_RELEVANCE_SCORE,
+                min_threshold=threshold,
                 candidates=len(candidates),
+                semantic=use_semantic,
             )
 
-            if best_score < MIN_RELEVANCE_SCORE:
+            if best_score < threshold:
                 log.warning(
                     "low_relevance_scores",
                     best_score=round(best_score, 4),
-                    threshold=MIN_RELEVANCE_SCORE,
+                    threshold=threshold,
+                    semantic=use_semantic,
                     query=state.query[:50],
                 )
                 candidates = []
