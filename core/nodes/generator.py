@@ -390,8 +390,16 @@ v1.9.0 — June 2026 | Mukesh Kund
          - Falls back gracefully: if conversation_history is empty
            or no User turn is found, override_note stays "" and the
            pipeline continues normally.
-         - No SYSTEM_PROMPT changes, no routing changes, no other
-           node changes. Only build_user_prompt() is modified.
+         - No SYSTEM_PROMPT changes, no routing changes.
+         - Companion change: retriever.py v1.1.0 now skips Azure
+           Search entirely for _override_triggered=True queries,
+           so state.retrieved_chunks is always [] when override
+           is active. build_user_prompt() now omits the context
+           block and its closing instruction entirely when chunks
+           are empty AND override is active — preventing an empty
+           "Context from RLG documentation: (nothing)" block
+           being sent to the model, and ensuring it relies solely
+           on conversation history as intended.
 
 ═══════════════════════════════════════════════════════════════
 """
@@ -830,6 +838,29 @@ def build_user_prompt(state: AgentState) -> str:
                 "offer further help or the phone number "
                 "0345 600 0371.\n\n"
             )
+
+    # v1.9.0 companion: when override is active, retriever.py
+    # v1.1.0 returns empty chunks. Omit the context block and
+    # its closing instruction entirely — the model should use
+    # conversation history only, not be told to "answer using
+    # only the context above" when there is no context.
+    is_override_active = (
+        state.__dict__.get("_override_triggered")
+        and not state.retrieved_chunks
+    )
+
+    if is_override_active:
+        return (
+            f"{history}"
+            f"{empathy_note}"
+            f"{bereavement_note}"
+            f"{disclaimer_note}"
+            f"{override_note}"
+            f"Customer question: {state.query}\n\n"
+            f"Use the conversation history above to answer. "
+            f"Do NOT cite any sources or add [1][2][3] markers "
+            f"— there are no retrieved documents for this query."
+        )
 
     return (
         f"{history}"

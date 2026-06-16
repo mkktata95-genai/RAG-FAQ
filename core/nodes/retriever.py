@@ -1,10 +1,63 @@
 """
 Retriever Node — hybrid search, reuses embedding from cache node.
 
-Migration: AzureKeyCredential → DefaultAzureCredential (no API key)
-Fix:        Added relevance score threshold check — if best chunk
-            scores below MIN_RELEVANCE_SCORE, treat as no results
-            to prevent hallucination on irrelevant context
+═══════════════════════════════════════════════════════════════
+CHANGE LOG
+═══════════════════════════════════════════════════════════════
+
+v1.0.0 — Initial version
+         Migration: AzureKeyCredential → DefaultAzureCredential
+         (no API key).
+         Added relevance score threshold check — if best chunk
+         scores below MIN_RELEVANCE_SCORE, treat as no results
+         to prevent hallucination on irrelevant context.
+
+v1.1.0 — June 2026 | Mukesh Kund
+         Skip Azure Search entirely for context-override queries
+
+         ROOT CAUSE / LIVE REPRO:
+         - When _override_triggered=True (set by supervisor.py
+           v1.4.0+ for contextual follow-up queries such as "Why
+           didn't you answer my previous question?"),
+           cache_check.py (v1.5.0+) correctly skips canonical
+           rewrite and returns state with cache_hit=False, so
+           the full pipeline runs including the retriever.
+         - The retriever ran with the raw normalised query
+           "why didnt answer previous question" — which has no
+           meaningful match in the Royal London index. Azure AI
+           Search returned its best-scoring chunks regardless
+           (best_score=0.0311, candidates=5) — in this case,
+           AGM Resolutions pages (2022/2021/2024).
+         - generator.py's override_note correctly pushed the
+           model to use conversation history instead of the
+           retrieved context, so the response content was right
+           — but extract_citations() still found [1][2][3]
+           markers placed by the model against those irrelevant
+           chunks, causing "2022 AGM Resolutions / 2021 AGM
+           Resolutions / Our 2024 AGM" citation chips to appear
+           below an ISA recap. Confusing and unprofessional for
+           a customer-facing FCA-regulated assistant.
+
+         FIX:
+         - retriever_node() checks _override_triggered at the
+           top, BEFORE the embedding lookup or search call.
+         - If True: set state.retrieved_chunks=[], log
+           retrieval_skipped (reason=context_override), and
+           return state immediately. No Azure Search call is
+           made, no irrelevant chunks can be retrieved, and
+           extract_citations() will find no [n] markers
+           (generator.py v1.9.0+ build_context() returns ""
+           for empty chunks, and build_user_prompt() omits
+           the context block entirely when chunks are empty
+           and override is active, using conversation history
+           only).
+         - The no_chunks_retrieved / refusal path that normally
+           fires when retrieval returns empty IS NOT triggered
+           here — the override path returns early before that
+           block, so the override query proceeds to generator
+           with empty chunks but no refusal flag set.
+
+═══════════════════════════════════════════════════════════════
 """
 
 import os
@@ -77,6 +130,24 @@ def get_search_client() -> SearchClient:
 def retriever_node(state: AgentState) -> AgentState:
     """Hybrid search using cached embedding from cache_check node."""
     start = time.time()
+
+    # v1.1.0 — skip search entirely for context-override queries.
+    # The generator uses conversation history (via override_note)
+    # for these queries, not retrieved chunks. Running the search
+    # with a query like "why didnt answer previous question"
+    # returns irrelevant chunks (AGM pages, score ~0.03) which
+    # produce meaningless citation chips in the UI even though
+    # the model correctly ignores them. Returning empty chunks
+    # here prevents that — see CHANGE LOG v1.1.0 above.
+    if state.__dict__.get("_override_triggered"):
+        state.retrieved_chunks = []
+        state.latency_ms["retriever"] = 0
+        log.info(
+            "retrieval_skipped",
+            reason="context_override",
+            query=state.query[:50],
+        )
+        return state
 
     try:
         # Reuse embedding from cache_check node if available
