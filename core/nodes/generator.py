@@ -275,6 +275,85 @@ v1.7.0 — June 2026 | Mukesh Kund
            present — the two notes work together (empathy framing
            + correct handoff number).
 
+v1.8.0 — June 2026 | Mukesh Kund
+         Three SYSTEM PROMPT fixes found during v1.7.0 testing
+         (Seq 7/8: bereavement + cancer-payout queries)
+
+         PART 1 — Unwanted "Sources:" URL block in responses
+         [CITATION RULE MODIFIED]:
+         - ROOT CAUSE: build_context() includes each chunk's
+           source_url in the context sent to the model
+           ("[1] Source: <title> (<url>)\\n<content>") so the
+           model can identify [1]/[2]/[3]. The CITATION RULE told
+           the model to use [1][2][3] inline markers (which
+           extract_citations() turns into the clickable source
+           chips shown below the response) but said nothing about
+           NOT also reproducing those URLs as text.
+         - Reproduced live (Seq 7/8): gpt-4.1 added its own
+           "Sources:" section listing all 3 raw URLs as plain
+           text, duplicating the citation chips already rendered
+           by the UI. gpt-4o-mini (ISA/pension queries, Seq 3/4)
+           did not do this — inconsistent output format depending
+           on which model handled the query.
+         - FIX: CITATION RULE now explicitly says do NOT add a
+           "Sources:"/"Source:" section or otherwise repeat
+           source URLs as text — [1][2][3] markers are sufficient,
+           the interface renders source links separately. The URL
+           shown in brackets after each source label in the
+           context is for the model's reference only (to map
+           [n] to the right source), never to be reproduced.
+
+         PART 2 — Citation markers attached to the wrong sentence
+         [CITATION RULE MODIFIED]:
+         - Reproduced live (Seq 8 — "My mum is dying of cancer...
+           how much money will she get"): the response's [1][2][3]
+           markers were all attached to the sentence "This
+           information is not available in the context provided
+           and cannot be confirmed without access to her policy
+           details" — i.e. markers were placed on the sentence
+           saying the sources DON'T cover this, rather than on
+           the earlier sentences whose general claims (when a
+           policy pays out, what terminal illness cover means)
+           those sources DO support.
+         - FIX: CITATION RULE now explicitly says citation markers
+           must only be attached to sentences containing a claim
+           drawn from the provided context — never to sentences
+           stating information is unavailable, cannot be
+           confirmed, or directing the customer to contact Royal
+           London/an adviser (those are not claims from the
+           sources and must carry no [n] markers).
+
+         PART 3 — Bereavement handoff number bled into the next,
+         unrelated empathy response [HUMAN HANDOFF RULE MODIFIED]:
+         - Reproduced live: Seq 7 ("My wife passed away last
+           week...") correctly got the bereavement number
+           (0370 850 2179, via v1.7.0's bereavement_note). Seq 8,
+           the VERY NEXT message ("My mum is DYING of cancer... how
+           much will she get") correctly got
+           state.__dict__["_bereavement"]=False (mum is still
+           alive — this is a hypothetical, not a bereavement) and
+           so received NO bereavement_note — yet its response also
+           said "0370 850 2179". Root cause: build_user_prompt()
+           includes the last 6 conversation_history turns,
+           including Seq 7's full response text containing
+           "0370 850 2179" — gpt-4.1 reused that number from
+           history "for consistency" despite this turn's NOTE not
+           authorising it.
+         - FIX: HUMAN HANDOFF RULE now explicitly states that the
+           handoff number for THIS response must be decided
+           independently of any phone numbers appearing in the
+           conversation history above — if this response's NOTE
+           does not specify an alternative number, use
+           0345 600 0371 even if a different number appeared in a
+           previous assistant turn.
+
+         NONE of these three changes alter is_simple_query,
+         model routing, retrieval, needs_empathy/needs_disclaimer/
+         _bereavement/_override_triggered detection, or
+         build_context()'s output — all SYSTEM_PROMPT-only,
+         additive to existing rules. cache_check.py, supervisor.py
+         and graph.py are unchanged in this round.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -424,6 +503,12 @@ the dedicated bereavement support line), use THAT number
 INSTEAD of 0345 600 0371 in the handoff message above —
 for the handoff message only. Do not change any other
 phone number in your response.
+Decide the handoff number for THIS response on its own —
+do NOT copy a phone number from a previous assistant turn
+shown in the conversation history above. If this
+response's NOTE does not specify an alternative number,
+use 0345 600 0371, even if a different number appeared in
+an earlier turn of this conversation.
 
 FINANCIAL DISCLAIMER RULE:
 ONLY add this disclaimer when the query involves a
@@ -441,6 +526,22 @@ Always cite sources sequentially starting from [1].
 Use [1] for the first source you reference,
 [2] for the second, [3] for the third.
 Never skip numbers or use numbers out of order.
+Only attach a [1][2][3] marker to a sentence that
+contains a claim drawn directly from the provided
+context. Do NOT attach citation markers to a sentence
+that says information is unavailable, cannot be
+confirmed, or that directs the customer to contact
+Royal London or speak to an adviser — those sentences
+are not claims from the sources and must carry no [n]
+markers.
+Do NOT add a "Sources:" or "Source:" section, list
+source URLs as plain text, or otherwise repeat source
+links anywhere in your response. The [1][2][3] markers
+are sufficient on their own — the interface displays the
+source links separately. The URL shown in brackets after
+each source label in the context below is for your
+reference only, to identify which [n] corresponds to
+which source — never reproduce that URL in your answer.
 IMPORTANT — DOMAIN RESTRICTION:
 Only cite sources from royallondon.com.
 Do NOT include or link to any external website URLs

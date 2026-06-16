@@ -30,6 +30,32 @@ v1.1.0 — June 2026 | Mukesh Kund
          - Mirrors the existing refusal_triggered / cache_hit
            skip conditions below.
 
+v1.2.0 — June 2026 | Mukesh Kund
+         Skip cache write for contextual follow-up (override)
+         responses
+
+         cache_write_node() [MODIFIED]:
+         - Added skip condition:
+           state.__dict__.get("_override_triggered") is True
+         - WHY: graph.py v1.1.0 fixed propagation of
+           _override_triggered, so cache_check.py (v1.5.0) now
+           correctly skips canonical rewrite for contextual
+           follow-up queries (e.g. "Why didn't you answer my
+           previous question?") and the full pipeline runs with
+           generator.py referencing conversation_history.
+         - Reproduced live: such a response (e.g. a recap of an
+           earlier ISA answer, written specifically to address
+           "why didn't you answer me") was being written to
+           cache (cache_set cache_size=3). A later, unrelated
+           user asking something semantically close to "why
+           didn't you answer my previous question?" could then be
+           served THIS customer's ISA recap — nonsensical, since
+           it depends entirely on a conversation history the new
+           user does not share.
+         - Same rationale and pattern as the v1.1.0 needs_empathy
+           skip: a response generated using THIS conversation's
+           history must not be replayed to a different customer.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -71,6 +97,21 @@ def cache_write_node(state: AgentState) -> AgentState:
         # normalisation.
         if state.needs_empathy:
             log.info("cache_write_skipped", reason="needs_empathy")
+            return state
+
+        # Skip if this is a contextual follow-up / override
+        # response (v1.2.0). graph.py v1.1.0 propagates
+        # _override_triggered from supervisor.py through to here.
+        # This response was generated using THIS conversation's
+        # history (e.g. "Why didn't you answer my previous
+        # question?" -> recap of an earlier answer) and must not
+        # be replayed to a different customer whose query happens
+        # to be semantically similar after normalisation.
+        if state.__dict__.get("_override_triggered"):
+            log.info(
+                "cache_write_skipped",
+                reason="override_triggered",
+            )
             return state
 
         # Get query embedding from state
