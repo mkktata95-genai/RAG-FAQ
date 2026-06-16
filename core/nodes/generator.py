@@ -354,6 +354,45 @@ v1.8.0 — June 2026 | Mukesh Kund
          additive to existing rules. cache_check.py, supervisor.py
          and graph.py are unchanged in this round.
 
+v1.9.0 — June 2026 | Mukesh Kund
+         Override note anchored to the immediately preceding query
+         (Bug 10)
+
+         ROOT CAUSE:
+         - build_user_prompt() includes the last 6 conversation
+           history turns (formatted as "User: .../Assistant: ..."
+           chronologically). When _override_triggered=True, the
+           override_note told the model to "acknowledge what was
+           previously discussed and respond based on that context"
+           — but gave no guidance on WHICH previous turn to anchor
+           to.
+         - Live repro (request_id=09d8c15-...):
+           Conversation history contained (in order):
+             Q1: My wife passed away (bereavement)
+             Q2: My mum is dying of cancer (payout)
+             Q3: What is an ISA?  <-- immediately preceding
+             Q4: Why didn't you answer my previous question?
+           The model anchored to Q2 ("Your question about the
+           payout from your mum's policy is important") — the most
+           emotionally salient topic in history — rather than Q3
+           (ISA), which was the actual most recent user question
+           and the natural referent of "my previous question".
+
+         FIX (build_user_prompt() only):
+         - When building the override_note, the last User turn from
+           conversation_history[-6:] is now extracted and injected
+           explicitly:
+             "The customer's PREVIOUS question (the one immediately
+             before this message) was: '<last user question>'"
+           This pins the model to the correct referent regardless
+           of how many emotionally prominent turns appear earlier
+           in history.
+         - Falls back gracefully: if conversation_history is empty
+           or no User turn is found, override_note stays "" and the
+           pipeline continues normally.
+         - No SYSTEM_PROMPT changes, no routing changes, no other
+           node changes. Only build_user_prompt() is modified.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -752,22 +791,45 @@ def build_user_prompt(state: AgentState) -> str:
     # clarification etc). Tells GPT explicitly to use the
     # conversation history rather than treating this as a new
     # product question and firing the UNKNOWN PRODUCT RULE.
+    # v1.9.0: now explicitly extracts the LAST User turn from
+    # history and injects it into the note, so the model anchors
+    # to the immediately preceding question rather than the most
+    # emotionally salient topic in a longer history.
     override_note = ""
     if state.__dict__.get("_override_triggered"):
-        override_note = (
-            "NOTE: The customer is referring to a previous "
-            "exchange in the conversation above. You DO have "
-            "access to the conversation history shown. "
-            "Acknowledge what was previously discussed and "
-            "respond based on that context. "
-            "Do NOT say you have no information about this — "
-            "use the conversation history to understand what "
-            "they are asking about and respond helpfully. "
-            "If they are expressing frustration, acknowledge "
-            "it genuinely, clarify your previous answer, and "
-            "offer further help or the phone number "
-            "0345 600 0371.\n\n"
-        )
+        # Extract the last User turn from conversation history
+        # so we can tell the model exactly which question to
+        # address. Falls back to "" if history is empty/no User
+        # turn found (pipeline continues normally without note).
+        last_user_q = ""
+        if state.conversation_history:
+            recent = state.conversation_history[-6:]
+            for turn in reversed(recent):
+                if turn.get("role", "").lower() == "user":
+                    last_user_q = turn.get("content", "").strip()
+                    break
+
+        if last_user_q:
+            override_note = (
+                "NOTE: The customer is referring to a previous "
+                "exchange in the conversation above. "
+                f"The customer's PREVIOUS question (the one "
+                f"immediately before this message) was: "
+                f"'{last_user_q}'. "
+                "Address THAT question specifically — do NOT "
+                "anchor to an earlier turn even if it was more "
+                "emotionally prominent. "
+                "You DO have access to the conversation history "
+                "shown. Acknowledge what was previously discussed "
+                "and respond based on that context. "
+                "Do NOT say you have no information about this — "
+                "use the conversation history to understand what "
+                "they are asking about and respond helpfully. "
+                "If they are expressing frustration, acknowledge "
+                "it genuinely, clarify your previous answer, and "
+                "offer further help or the phone number "
+                "0345 600 0371.\n\n"
+            )
 
     return (
         f"{history}"
