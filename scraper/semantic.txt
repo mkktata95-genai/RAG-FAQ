@@ -1,0 +1,20 @@
+$token = (az account get-access-token --resource https://search.azure.com --query accessToken -o tsv)
+
+$body = '{
+  "name": "rlg-semantic-config",
+  "prioritizedFields": {
+    "titleField": { "fieldName": "title" },
+    "prioritizedContentFields": [
+      { "fieldName": "content" }
+    ],
+    "prioritizedKeywordsFields": [
+      { "fieldName": "section" }
+    ]
+  }
+}'
+
+Invoke-RestMethod `
+  -Uri "https://rlg-dev-dit-uks-srch-aisplatform.search.windows.net/indexes/rlg-faq-index/semantic-configurations/rlg-semantic-config?api-version=2023-11-01" `
+  -Method PUT `
+  -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
+  -Body $body
