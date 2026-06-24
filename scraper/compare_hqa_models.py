@@ -60,9 +60,10 @@ import structlog
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from azure.search.documents import SearchClient
 from openai import AzureOpenAI
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+_dotenv_path = find_dotenv(usecwd=False)
+load_dotenv(_dotenv_path)
 log = structlog.get_logger()
 
 # ── Config ────────────────────────────────────────────────────
