@@ -60,16 +60,15 @@ import structlog
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from azure.search.documents import SearchClient
 from openai import AzureOpenAI
-from dotenv import load_dotenv, find_dotenv
+from dotenv import load_dotenv
 
-_dotenv_path = find_dotenv(usecwd=False)
-load_dotenv(_dotenv_path)
+load_dotenv()
 log = structlog.get_logger()
 
 # ── Config ────────────────────────────────────────────────────
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
 AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT", "").rstrip("/")
-INDEX_NAME            = os.getenv("AZURE_SEARCH_INDEX_NAME", "rlg-faq-index")
+INDEX_NAME            = os.getenv("AZURE_SEARCH_INDEX_NAME", "rlg-faq-index-v2")
 DEPLOYMENT_FAST       = os.getenv("AZURE_OPENAI_DEPLOYMENT_FAST", "gpt-4o-mini")
 DEPLOYMENT_MAIN       = os.getenv("AZURE_OPENAI_DEPLOYMENT_MAIN", "gpt-4.1")
 API_VERSION           = "2024-12-01-preview"
@@ -195,129 +194,256 @@ def get_clients() -> tuple[SearchClient, AzureOpenAI]:
 
 
 # ── Sampling strategy ─────────────────────────────────────────
+def _fetch_pool(
+    search_client: SearchClient,
+    content_type_filter: str | None,
+    top: int,
+) -> list[dict]:
+    """
+    Fetch a pool of raw chunks from Azure Search.
+
+    Uses content_type filter when provided (content_type IS
+    filterable) to target specific content types directly.
+    chunk_index and total_chunks are NOT filterable so
+    position classification is done Python-side after fetch.
+
+    Returns list of raw result dicts.
+    """
+    kwargs = dict(
+        search_text="*",
+        select=[
+            "chunk_id", "content", "title", "source_url",
+            "section", "content_type", "product_category",
+            "chunk_index", "total_chunks", "augmented_questions",
+            "has_video",
+        ],
+        top=top,
+    )
+    if content_type_filter:
+        kwargs["filter"] = f"content_type eq '{content_type_filter}'"
+
+    results = search_client.search(**kwargs)
+    return list(results)
+
+
+def _classify_chunk(r: dict) -> dict | None:
+    """
+    Convert raw search result to classified chunk dict.
+    Returns None if chunk has no HQA questions.
+    """
+    aq = r.get("augmented_questions", "") or ""
+    if not aq.strip():
+        return None
+
+    word_count = len((r.get("content") or "").split())
+    idx        = r.get("chunk_index", 0)
+    total      = r.get("total_chunks", 1)
+
+    if word_count < SHORT_CHUNK_THRESHOLD:
+        size_category = "short"
+    elif word_count > LONG_CHUNK_THRESHOLD:
+        size_category = "long"
+    else:
+        size_category = "medium"
+
+    if idx == 0:
+        position = "first"
+    elif total > 1 and idx == total - 1:
+        position = "last"
+    else:
+        position = "middle"
+
+    return {
+        "chunk_id":            r["chunk_id"],
+        "content":             r["content"],
+        "title":               r.get("title", ""),
+        "source_url":          r.get("source_url", ""),
+        "section":             r.get("section", ""),
+        "content_type":        r.get("content_type", "article"),
+        "product_category":    r.get("product_category", "general"),
+        "chunk_index":         idx,
+        "total_chunks":        total,
+        "augmented_questions": aq,
+        "has_video":           r.get("has_video", False),
+        "word_count":          word_count,
+        "size_category":       size_category,
+        "position":            position,
+    }
+
+
 def fetch_representative_chunks(
     search_client: SearchClient,
     target_count: int = DEFAULT_SAMPLE_SIZE,
 ) -> list[dict]:
     """
-    Fetch representative chunks across all three sampling dimensions:
+    Fetch representative chunks across all three sampling dimensions.
+
+    v2 FIX (Option B):
+    Previous version fetched only 200 chunks via search_text="*"
+    which returned arbitrary internal-order results — mostly
+    short/middle chunks, zero long or first-position chunks.
+    The sort by size_priority/pos_priority only worked on what
+    was fetched, so long/first chunks were never seen.
+
+    New approach — three targeted fetch passes:
+
+    Pass 1 — Per content type (content_type IS filterable):
+        Fetch up to 200 chunks per content type separately.
+        Azure Search returns them in internal score order per type,
+        giving a genuine cross-type sample.
+
+    Pass 2 — Dimension enforcement (Python-side):
+        After classifying all fetched chunks, check coverage of
+        all three dimensions:
+            size:     short / medium / long
+            position: first / middle / last
+            type:     all content types
+        If any dimension bucket is empty, add targeted chunks
+        from the full pool to fill gaps.
+
+    Pass 3 — Slot allocation:
+        Allocate final sample slots proportionally by content type
+        weight, prioritising long and first/last positions within
+        each type.
+
+    This guarantees coverage across all three dimensions regardless
+    of how Azure Search orders its results.
 
     Dimension 1 — Content type (webinar/guide/article/faq/tool/corporate)
-    Dimension 2 — Chunk size (short/medium/long by word count)
-    Dimension 3 — Chunk position (first/middle/last within page)
-
-    Only fetches chunks that HAVE augmented_questions — chunks without
-    HQA questions can't be graded.
-
-    Strategy:
-    - Allocate slots proportionally across content types
-    - Within each content type, ensure mix of sizes and positions
-    - Prioritise: webinar (longest/most complex) and guide (largest group)
+    Dimension 2 — Chunk size (short <300w / medium 300-700w / long >700w)
+    Dimension 3 — Chunk position (first / middle / last within page)
     """
     print(f"\n📊 Fetching representative sample ({target_count} chunks)...")
+    print(f"   Strategy: targeted fetch per content type + dimension enforcement")
 
-    # Content types to sample — weight by importance for grading
-    # Webinars: long transcripts, highest context pollution risk
-    # Guides: largest group, most customer-facing
-    # Others: smaller groups, proportional representation
+    # Content types to sample — weight by pollution risk and group size
     type_weights = {
         "webinar":   0.25,  # highest pollution risk — oversample
-        "guide":     0.30,  # largest group
+        "guide":     0.30,  # largest group, most customer-facing
         "article":   0.20,
-        "corporate": 0.10,  # lowest priority
+        "corporate": 0.10,
         "faq":       0.10,
         "tool":      0.05,
     }
 
-    chunks_by_type  = defaultdict(list)
-    all_chunks      = []
-    fetched         = 0
-    max_fetch       = min(target_count * 10, 500)  # fetch pool to sample from
+    # ── Pass 1: targeted fetch per content type ───────────────
+    # fetch 200 per type so we have enough to cover all
+    # size/position combinations within each type
+    FETCH_PER_TYPE = 200
+    all_chunks:    list[dict] = []
+    seen_ids:      set        = set()
+    chunks_by_type            = defaultdict(list)
 
-    # Fetch a pool of chunks with augmented_questions
+    for content_type in type_weights:
+        try:
+            raw = _fetch_pool(
+                search_client,
+                content_type_filter=content_type,
+                top=FETCH_PER_TYPE,
+            )
+            type_count = 0
+            for r in raw:
+                chunk = _classify_chunk(r)
+                if chunk and chunk["chunk_id"] not in seen_ids:
+                    seen_ids.add(chunk["chunk_id"])
+                    all_chunks.append(chunk)
+                    chunks_by_type[content_type].append(chunk)
+                    type_count += 1
+            if type_count > 0:
+                print(f"   {content_type:<15} {type_count:>4} chunks fetched")
+        except Exception as e:
+            log.warning(
+                "fetch_type_error",
+                content_type=content_type,
+                error=str(e),
+            )
+
+    # Also fetch general pool to catch content types not in our
+    # weights list (e.g. "video", "news") and fill any gaps
     try:
-        # Note: augmented_questions is SearchableField (not filterable)
-        # so we cannot use filter="augmented_questions ne ''".
-        # Instead fetch all chunks and filter in Python below
-        # using the existing "if not aq.strip(): continue" check.
-        results = search_client.search(
-            search_text="*",
-            select=[
-                "chunk_id", "content", "title", "source_url",
-                "section", "content_type", "product_category",
-                "chunk_index", "total_chunks", "augmented_questions",
-                "has_video",
-            ],
-            top=max_fetch,
-        )
-        for r in results:
-            aq = r.get("augmented_questions", "") or ""
-            if not aq.strip():
-                continue
-            chunk = {
-                "chunk_id":           r["chunk_id"],
-                "content":            r["content"],
-                "title":              r.get("title", ""),
-                "source_url":         r.get("source_url", ""),
-                "section":            r.get("section", ""),
-                "content_type":       r.get("content_type", "article"),
-                "product_category":   r.get("product_category", "general"),
-                "chunk_index":        r.get("chunk_index", 0),
-                "total_chunks":       r.get("total_chunks", 1),
-                "augmented_questions": aq,
-                "has_video":          r.get("has_video", False),
-                "word_count":         len(r["content"].split()),
-            }
-            # Classify size
-            wc = chunk["word_count"]
-            if wc < SHORT_CHUNK_THRESHOLD:
-                chunk["size_category"] = "short"
-            elif wc > LONG_CHUNK_THRESHOLD:
-                chunk["size_category"] = "long"
-            else:
-                chunk["size_category"] = "medium"
-
-            # Classify position
-            idx   = chunk["chunk_index"]
-            total = chunk["total_chunks"]
-            if idx == 0:
-                chunk["position"] = "first"
-            elif total > 1 and idx == total - 1:
-                chunk["position"] = "last"
-            else:
-                chunk["position"] = "middle"
-
-            chunks_by_type[chunk["content_type"]].append(chunk)
-            all_chunks.append(chunk)
-            fetched += 1
-
+        raw = _fetch_pool(search_client, None, top=500)
+        extra = 0
+        for r in raw:
+            chunk = _classify_chunk(r)
+            if chunk and chunk["chunk_id"] not in seen_ids:
+                seen_ids.add(chunk["chunk_id"])
+                all_chunks.append(chunk)
+                chunks_by_type[chunk["content_type"]].append(chunk)
+                extra += 1
+        if extra:
+            print(f"   {'other':<15} {extra:>4} chunks fetched")
     except Exception as e:
-        log.error("fetch_chunks_error", error=str(e))
-        print(f"   ❌ Error fetching chunks: {e}")
+        log.warning("fetch_general_pool_error", error=str(e))
+
+    total_fetched = len(all_chunks)
+    print(f"\n   Total pool: {total_fetched:,} chunks across "
+          f"{len(chunks_by_type)} content types")
+
+    if not all_chunks:
+        print("   ❌ No chunks fetched")
         return []
 
-    print(f"   Fetched {fetched} chunks with HQA questions")
-    print(f"   Content type distribution:")
-    for ct, chunks in sorted(chunks_by_type.items()):
-        print(f"     {ct:<15} {len(chunks):>4} chunks")
+    # ── Pass 2: dimension coverage check ─────────────────────
+    # Build lookup buckets by (size, position) for gap-filling
+    by_size     = defaultdict(list)
+    by_position = defaultdict(list)
+    for c in all_chunks:
+        by_size[c["size_category"]].append(c)
+        by_position[c["position"]].append(c)
 
-    # ── Select representative sample ──────────────────────────
-    selected = []
+    print(f"\n   Pool coverage:")
+    print(f"   By size:     " + " | ".join(
+        f"{k}: {len(v)}" for k, v in sorted(by_size.items())
+    ))
+    print(f"   By position: " + " | ".join(
+        f"{k}: {len(v)}" for k, v in sorted(by_position.items())
+    ))
+
+    # ── Pass 3: slot allocation ───────────────────────────────
+    size_priority = {"long": 0, "medium": 1, "short": 2}
+    pos_priority  = {"first": 0, "last": 1, "middle": 2}
+
+    selected  = []
+    final_ids = set()
+
+    # Guarantee at least 1 chunk per non-empty dimension bucket
+    # This ensures long and first/last are always represented
+    guaranteed_buckets = [
+        # (bucket_dict, key, label)
+        (by_size,     "long",  "long chunks"),
+        (by_size,     "medium","medium chunks"),
+        (by_position, "first", "first-position chunks"),
+        (by_position, "last",  "last-position chunks"),
+    ]
+    for bucket_dict, key, label in guaranteed_buckets:
+        candidates = bucket_dict.get(key, [])
+        if candidates:
+            # Pick the one from the highest-weight content type
+            best = sorted(
+                candidates,
+                key=lambda c: list(type_weights.keys()).index(
+                    c["content_type"]
+                ) if c["content_type"] in type_weights else 99
+            )[0]
+            if best["chunk_id"] not in final_ids:
+                selected.append(best)
+                final_ids.add(best["chunk_id"])
+
+    # Fill remaining slots by content type weight
+    remaining_slots = target_count - len(selected)
 
     for content_type, weight in type_weights.items():
-        type_chunks = chunks_by_type.get(content_type, [])
+        type_chunks = [
+            c for c in chunks_by_type.get(content_type, [])
+            if c["chunk_id"] not in final_ids
+        ]
         if not type_chunks:
             continue
 
-        # Slots for this content type
-        slots = max(1, round(target_count * weight))
+        slots = max(1, round(remaining_slots * weight))
         slots = min(slots, len(type_chunks))
 
-        # Within this type, select across size and position dimensions
-        # Priority: long chunks (highest pollution risk), first/last positions
-        size_priority  = {"long": 0, "medium": 1, "short": 2}
-        pos_priority   = {"first": 0, "last": 1, "middle": 2}
-
+        # Sort: long first, then first/last positions, then middle
         sorted_chunks = sorted(
             type_chunks,
             key=lambda c: (
@@ -326,41 +452,52 @@ def fetch_representative_chunks(
             )
         )
 
-        # Take from start (highest priority) and spread through list
+        # Take evenly spaced for variety within type
         if len(sorted_chunks) <= slots:
-            selected.extend(sorted_chunks)
+            picks = sorted_chunks
         else:
-            # Take evenly spaced + first + last for variety
-            step    = len(sorted_chunks) // slots
-            indices = list(range(0, len(sorted_chunks), step))[:slots]
-            for i in indices:
-                selected.append(sorted_chunks[i])
+            step  = max(1, len(sorted_chunks) // slots)
+            picks = [sorted_chunks[i]
+                     for i in range(0, len(sorted_chunks), step)][:slots]
 
-    # Deduplicate by chunk_id
-    seen     = set()
-    deduped  = []
-    for c in selected:
-        if c["chunk_id"] not in seen:
-            seen.add(c["chunk_id"])
-            deduped.append(c)
+        for c in picks:
+            if c["chunk_id"] not in final_ids:
+                selected.append(c)
+                final_ids.add(c["chunk_id"])
 
     # Trim to target
-    deduped = deduped[:target_count]
+    selected = selected[:target_count]
 
-    print(f"\n   Selected {len(deduped)} representative chunks:")
+    # ── Final distribution report ─────────────────────────────
     size_counts = defaultdict(int)
     pos_counts  = defaultdict(int)
     type_counts = defaultdict(int)
-    for c in deduped:
+    for c in selected:
         size_counts[c["size_category"]] += 1
         pos_counts[c["position"]]       += 1
         type_counts[c["content_type"]]  += 1
 
-    print(f"   By size:     " + " | ".join(f"{k}: {v}" for k, v in size_counts.items()))
-    print(f"   By position: " + " | ".join(f"{k}: {v}" for k, v in pos_counts.items()))
-    print(f"   By type:     " + " | ".join(f"{k}: {v}" for k, v in type_counts.items()))
+    print(f"\n   ✅ Selected {len(selected)} representative chunks:")
+    print(f"   By size:     " + " | ".join(
+        f"{k}: {v}" for k, v in sorted(size_counts.items())
+    ))
+    print(f"   By position: " + " | ".join(
+        f"{k}: {v}" for k, v in sorted(pos_counts.items())
+    ))
+    print(f"   By type:     " + " | ".join(
+        f"{k}: {v}" for k, v in sorted(type_counts.items())
+    ))
 
-    return deduped
+    # Warn if any critical dimension bucket still empty
+    for size in ["long", "medium"]:
+        if size_counts.get(size, 0) == 0:
+            print(f"   ⚠️  No {size} chunks found — index may not "
+                  f"have chunks of this size")
+    for pos in ["first", "last"]:
+        if pos_counts.get(pos, 0) == 0:
+            print(f"   ⚠️  No {pos}-position chunks found")
+
+    return selected
 
 
 # ── Model grading ─────────────────────────────────────────────
