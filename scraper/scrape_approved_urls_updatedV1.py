@@ -159,6 +159,13 @@ from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 from crawl4ai.content_filter_strategy import PruningContentFilter
 
+# v3.1.0 fix: load_dotenv() with no args loads from CWD.
+# If script is run from scraper/ subfolder, .env is not found
+# and all os.getenv() calls silently return hardcoded defaults.
+# find_dotenv() walks UP the directory tree until it finds .env
+# — works correctly regardless of which directory you run from.
+_dotenv_path = find_dotenv(usecwd=False)
+load_dotenv(_dotenv_path)
 log = structlog.get_logger()
 
 # ── Config ────────────────────────────────────────────

@@ -181,7 +181,6 @@ v2.0.0 — June 2026 | Mukesh Kund
              @app.timer_trigger(schedule="0 0 1 * *")  # monthly
              def monthly_reindex(timer): run_pipeline(mode="full")
 
-
 v3.0.0 — June 2026 | Mukesh Kund
          Rich metadata fields from scraper enrichment
 
@@ -211,6 +210,28 @@ v3.0.0 — June 2026 | Mukesh Kund
          - product_category added as keywords_field
 
          NO CHANGE to HQA, chunking, or embedding logic.
+
+v3.1.0 — June 2026 | Mukesh Kund
+         Fix: load_dotenv() and core module import path
+
+         ROOT CAUSE:
+         - load_dotenv() with no arguments loads .env from the
+           CURRENT WORKING DIRECTORY. If script is run from
+           scraper/ subfolder instead of project root, .env is
+           not found and all os.getenv() calls silently return
+           hardcoded defaults (e.g. "rlg-faq-index" instead of
+           "rlg-faq-index-v2"). This caused the existing index
+           to be overwritten instead of creating a new one.
+         - from core.cache import get_cache failed with
+           "No module named core" when script run from scraper/
+           because core/ is not in sys.path in that context.
+
+         FIX:
+         - load_dotenv() replaced with find_dotenv() which walks
+           UP the directory tree until it finds .env — works
+           correctly regardless of which directory you run from.
+         - sys.path patched before core.cache import to add
+           project root — ensures core/ is always importable.
 
 ═══════════════════════════════════════════════════════════════
 """
@@ -246,10 +267,16 @@ from azure.search.documents.indexes.models import (
     SemanticSearch,
 )
 from azure.search.documents.models import VectorizedQuery
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-load_dotenv()
+# v3.1.0 fix: load_dotenv() with no args loads from CWD.
+# If script is run from scraper/ subfolder, .env is not found
+# and all os.getenv() calls silently return hardcoded defaults.
+# find_dotenv() walks UP the directory tree until it finds .env
+# — works correctly regardless of which directory you run from.
+_dotenv_path = find_dotenv(usecwd=False)
+load_dotenv(_dotenv_path)
 log = structlog.get_logger()
 
 # ── Config ────────────────────────────────────────────────────
@@ -1819,6 +1846,15 @@ def run_pipeline(
         # ── Step 7: Auto-clear cache on full re-index ─────────
         if fresh:
             try:
+                # v3.1.0 fix: add project root to sys.path so
+                # 'core' module is importable regardless of CWD
+                import sys as _sys
+                from pathlib import Path as _Path
+                _project_root = str(
+                    _Path(__file__).resolve().parent.parent
+                )
+                if _project_root not in _sys.path:
+                    _sys.path.insert(0, _project_root)
                 from core.cache import get_cache
                 cache = get_cache()
                 cache.clear()
@@ -1997,6 +2033,13 @@ def main():
     if fresh:
         print("\n🗑️  Clearing semantic cache (--full mode)...")
         try:
+            # v3.1.0 fix: add project root to sys.path
+            import sys as _sys
+            _project_root = str(
+                Path(__file__).resolve().parent.parent
+            )
+            if _project_root not in _sys.path:
+                _sys.path.insert(0, _project_root)
             from core.cache import get_cache
             cache = get_cache()
             cache.clear()
