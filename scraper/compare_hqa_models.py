@@ -236,6 +236,10 @@ def fetch_representative_chunks(
 
     # Fetch a pool of chunks with augmented_questions
     try:
+        # Note: augmented_questions is SearchableField (not filterable)
+        # so we cannot use filter="augmented_questions ne ''".
+        # Instead fetch all chunks and filter in Python below
+        # using the existing "if not aq.strip(): continue" check.
         results = search_client.search(
             search_text="*",
             select=[
@@ -244,7 +248,6 @@ def fetch_representative_chunks(
                 "chunk_index", "total_chunks", "augmented_questions",
                 "has_video",
             ],
-            filter="augmented_questions ne ''",
             top=max_fetch,
         )
         for r in results:
