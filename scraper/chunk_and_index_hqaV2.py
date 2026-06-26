@@ -335,10 +335,13 @@ load_dotenv(_dotenv_path)
 log = structlog.get_logger()
 
 # ── Config ────────────────────────────────────────────────────
-# SCRAPED_FILE is the fallback if --file not specified and no
-# JSON file is auto-detected in scraper/data/.
+# SCRAPED_FILE is the last-resort fallback only — used when:
+#   1. No --file argument passed, AND
+#   2. find_latest_scraped_file() finds no matching JSON.
+# Normal flow never reaches this constant.
+# Update this if you need a guaranteed fallback file.
 SCRAPED_FILE          = (
-    "scraper/data/royal_london_faq_clean_20260609_142353.json"
+    "scraper/data/royal_london_faq_approved_20260623_111343.json"
 )
 CHUNK_SIZE            = 1600
 CHUNK_OVERLAP         = 200
@@ -2066,32 +2069,66 @@ def verify_index():
 # ── File auto-detection ───────────────────────────────────────
 def find_latest_scraped_file() -> str:
     """
-    Auto-detect the most recently modified JSON file in
-    scraper/data/. Used when --file is not specified.
+    Auto-detect the most recently modified SCRAPER output JSON
+    in scraper/data/. Used when --file is not specified.
 
-    v2.0.0 FIX: Replaces hardcoded SCRAPED_FILE constant —
-    no manual update needed after each scraper run.
+    v2.0.0: Replaces hardcoded SCRAPED_FILE constant.
+    v4.0.0 FIX: Now filters by filename prefix pattern
+        "royal_london_faq_approved_*.json"
+        instead of picking ANY *.json in scraper/data/.
 
-    Falls back to SCRAPED_FILE constant if no JSON found.
+    WHY THIS FIX WAS NEEDED:
+    scraper/data/ accumulates multiple JSON files over time:
+        royal_london_faq_approved_<ts>.json  ← scraper output ✅
+        collision_report_<ts>.json           ← diagnostic output ❌
+        quality_report_<ts>.json             ← evaluator output ❌
+        hqa_model_comparison_<ts>.json       ← comparison output ❌
+        approved_updates_<ts>.json           ← approval template ❌
+
+    Before this fix, any of these could be picked as "latest"
+    if created after the scraper run — causing chunk_pages() to
+    fail with "AttributeError: str object has no attribute get"
+    because these files have different JSON structures.
+
+    Now only files matching the scraper output pattern are
+    considered — completely safe regardless of what other JSON
+    files accumulate in scraper/data/.
+
+    Falls back to SCRAPED_FILE constant if no matching file found.
     """
     data_dir = Path("scraper/data")
     if not data_dir.exists():
         return SCRAPED_FILE
 
-    json_files = sorted(
-        data_dir.glob("*.json"),
+    # Only match scraper output files — pattern set by
+    # scrape_approved_urls.py save_scraped_pages() function.
+    # This intentionally excludes all diagnostic/report JSONs.
+    SCRAPER_OUTPUT_PATTERN = "royal_london_faq_approved_*.json"
+
+    matching_files = sorted(
+        data_dir.glob(SCRAPER_OUTPUT_PATTERN),
         key=lambda p: p.stat().st_mtime,
-        reverse=True,
+        reverse=True,  # Most recently modified first
     )
 
-    if json_files:
-        latest = str(json_files[0])
+    if matching_files:
+        latest = str(matching_files[0])
         log.info(
             "auto_detected_scraped_file",
             file=latest,
+            pattern=SCRAPER_OUTPUT_PATTERN,
+            candidates_found=len(matching_files),
         )
         return latest
 
+    # No matching scraper output found — log clearly so user
+    # knows why it fell back, not a silent failure
+    log.warning(
+        "no_scraped_file_found",
+        pattern=SCRAPER_OUTPUT_PATTERN,
+        data_dir=str(data_dir),
+        note="Run scrape_approved_urls.py first, or pass --file explicitly",
+    )
     return SCRAPED_FILE
 
 
