@@ -397,7 +397,10 @@ def call_aria(query: str) -> dict:
                     # Final metadata event
                     citations       = event.get("citations", [])
                     model_used      = event.get("model_used", "unknown")
-                    latency_ms      = event.get("latency_ms", 0)
+                    # latency_ms from SSE is a dict of per-node
+                    # latencies (dict[str, float]) per schemas.py.
+                    # We use elapsed wall-clock time for display.
+                    latency_ms      = event.get("latency_ms", {})
                     cached          = event.get("cached", False)
                     needs_empathy   = event.get("needs_empathy", False)
                     needs_disclaimer= event.get("needs_disclaimer", False)
@@ -410,7 +413,8 @@ def call_aria(query: str) -> dict:
             "response":         "".join(full_response).strip(),
             "citations":        citations,
             "model_used":       model_used or "unknown",
-            "latency_ms":       latency_ms or elapsed,
+            "latency_ms":       elapsed,           # wall-clock ms for display
+            "latency_breakdown": latency_ms,         # dict of per-node latencies
             "elapsed_ms":       elapsed,
             "cached":           cached,
             "needs_empathy":    needs_empathy,
@@ -550,10 +554,12 @@ def format_response_block(
     # Model routing
     model    = query_result.get("model_used", "unknown") or "unknown"
     cached   = query_result.get("cached", False)
-    latency  = query_result.get("latency_ms", 0)
+    # latency_ms is wall-clock elapsed ms (int) after fix in call_aria
+    _lat_raw = query_result.get("latency_ms", 0)
+    latency  = int(_lat_raw) if isinstance(_lat_raw, (int, float)) else 0
     empathy  = query_result.get("needs_empathy", False)
     disclaim = query_result.get("needs_disclaimer", False)
-    tokens   = query_result.get("token_usage", {})
+    tokens   = query_result.get("token_usage", {}) or {}
 
     status_parts = [f"Model: {model}"]
     if cached:
@@ -566,9 +572,9 @@ def format_response_block(
     lines.append(f"  │  {' | '.join(status_parts)}")
     lines.append(f"  │  Latency: {latency}ms")
 
-    if tokens:
-        in_tok  = tokens.get("input_tokens", 0)
-        out_tok = tokens.get("output_tokens", 0)
+    if tokens and isinstance(tokens, dict):
+        in_tok  = tokens.get("input_tokens") or tokens.get("prompt_tokens", 0)
+        out_tok = tokens.get("output_tokens") or tokens.get("completion_tokens", 0)
         if in_tok or out_tok:
             lines.append(f"  │  Tokens: {in_tok} in / {out_tok} out")
 
@@ -679,9 +685,10 @@ def generate_report(
             if r.get("success") and r.get("needs_empathy")
         )
         latencies = [
-            r.get("latency_ms", 0)
+            int(r.get("latency_ms", 0))
             for r in results.values()
             if r.get("success") and not r.get("cached")
+            and isinstance(r.get("latency_ms", 0), (int, float))
             and r.get("latency_ms", 0) > 0
         ]
         avg_lat = round(sum(latencies) / len(latencies)) if latencies else 0
@@ -726,7 +733,8 @@ def generate_report(
             elif r.get("cached"):
                 row += f"  {'CACHE':>6}"
             else:
-                lat = r.get("latency_ms", 0)
+                _l  = r.get("latency_ms", 0)
+                lat = int(_l) if isinstance(_l, (int, float)) else 0
                 row += f"  {lat:>5}ms"
         row += f"  {note}"
         lines.append(row)
@@ -787,7 +795,8 @@ def generate_report(
                 cells.append("CACHE")
                 lats.append(None)
             else:
-                lat = r.get("latency_ms", 0)
+                _l  = r.get("latency_ms", 0)
+                lat = int(_l) if isinstance(_l, (int, float)) else 0
                 cells.append(f"{lat}ms")
                 lats.append(lat)
 
@@ -871,7 +880,8 @@ def main():
             if result["success"]:
                 cached_str = " ⚡CACHE" if result.get("cached") else ""
                 model_str  = (result.get("model_used") or "?")[:12]
-                lat        = result.get("latency_ms", 0)
+                _l         = result.get("latency_ms", 0)
+                lat        = int(_l) if isinstance(_l, (int, float)) else 0
                 print(f"  → {model_str:<12} {lat:>6}ms{cached_str}")
             else:
                 print(f"  → ❌ {result['error'][:40]}")
