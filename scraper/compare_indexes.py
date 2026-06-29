@@ -476,22 +476,34 @@ def check_server_health() -> bool:
 
 # ── Server restart instructions ────────────────────────────────
 def print_server_instructions(config: dict):
-    """Print clear server restart instructions for each config."""
+    """
+    Print clear server restart instructions for each config.
+
+    IMPORTANT: Uses PowerShell env vars ($env:) instead of .env
+    edits. PowerShell env vars take priority over .env and
+    guarantee the correct model/index is used regardless of
+    any cached dotenv state in the Python process.
+    """
     env = config["env_settings"]
     print("\n" + "╔" + "═" * 68 + "╗")
     print(f"║  {'SERVER RESTART REQUIRED':^66}  ║")
     print("╠" + "═" * 68 + "╣")
     print(f"║  Configuration: {config['label']:<52}║")
     print("╠" + "═" * 68 + "╣")
-    print(f"║  Step 1: Update your .env file:                              ║")
+    print(f"║  Step 1: In your SERVER terminal, run these commands:        ║")
     for key, val in env.items():
-        line = f"  {key}={val}"
-        print(f"║  {line:<66}  ║")
+        line = f'  $env:{key}="{val}"'
+        # pad to 66 chars
+        padded = f"{line:<68}"
+        print(f"║{padded}║")
     print("╠" + "═" * 68 + "╣")
-    print(f"║  Step 2: Stop current server (Ctrl+C in server terminal)    ║")
+    print(f"║  Step 2: Stop current server (Ctrl+C)                       ║")
     print(f"║                                                              ║")
-    print(f"║  Step 3: Restart server:                                     ║")
+    print(f"║  Step 3: Start server (in SAME terminal after step 1):      ║")
     print(f"║    uvicorn server:app --reload                               ║")
+    print("╠" + "═" * 68 + "╣")
+    print(f"║  WHY PowerShell vars? They override .env reliably.          ║")
+    print(f"║  Editing .env may not work if OS env vars are cached.       ║")
     print("╠" + "═" * 68 + "╣")
     print(f"║  Step 4: Come back here and press ENTER when ready          ║")
     print("╚" + "═" * 68 + "╝")
