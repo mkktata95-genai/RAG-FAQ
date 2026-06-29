@@ -56,7 +56,7 @@ load_dotenv(_dotenv_path)
 # ── Config ─────────────────────────────────────────────────────
 SERVER_URL    = "http://localhost:8000"
 CHAT_ENDPOINT = f"{SERVER_URL}/api/chat"
-HEALTH_URL    = f"{SERVER_URL}/health"
+HEALTH_URL    = f"{SERVER_URL}/api/health"
 REQUEST_TIMEOUT = 120  # seconds — complex queries can take 30s+
 DELAY_BETWEEN_QUERIES = 2  # seconds — avoid rate limiting
 
@@ -444,10 +444,28 @@ def call_aria(query: str) -> dict:
 
 # ── Health check ───────────────────────────────────────────────
 def check_server_health() -> bool:
-    """Check if server is running and healthy."""
+    """
+    Check if server is running and healthy.
+    Calls GET /api/health which returns:
+        {"status": "healthy", "services": {...}, "cache": {...}}
+    Accepts both "healthy" and "degraded" — degraded means
+    server is running but a downstream service (safety, redis)
+    is unavailable. Still good enough to run queries.
+    """
     try:
-        r = requests.get(HEALTH_URL, timeout=5)
-        return r.status_code == 200
+        r = requests.get(HEALTH_URL, timeout=10)
+        if r.status_code == 200:
+            data   = r.json()
+            status = data.get("status", "")
+            # Accept healthy or degraded — both mean server is up
+            return status in ("healthy", "degraded")
+    except Exception:
+        pass
+
+    # Fallback: any HTTP response means server is up
+    try:
+        r = requests.get(SERVER_URL, timeout=5)
+        return True
     except Exception:
         return False
 
