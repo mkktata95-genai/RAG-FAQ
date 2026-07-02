@@ -122,6 +122,16 @@ EXPECTED_DOMAIN           = "royallondon.com"
 # Directory to scan for the customer Excel when --file not provided
 SCRAPER_DATA_DIR = "scraper/data"
 
+# ── DEFAULT FILENAME (edit this if auto-detect picks the wrong file) ──
+# Set this to the customer Excel filename (just the name, not the full
+# path) to use it as the preferred file when no --file flag is given.
+# Auto-detect still runs, but this filename wins if it exists.
+# Leave as None to always use the most recently modified Excel.
+#
+# Example:
+#   DEFAULT_EXCEL_FILENAME = "royal_london_website_chatbot_urls.xlsx"
+DEFAULT_EXCEL_FILENAME = "royal_london_website_chatbot_urls.xlsx"
+
 # HTTP headers — mimic a real browser to avoid bot-detection blocks
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -135,21 +145,36 @@ REQUEST_HEADERS = {
 # ── Auto-detect latest Excel ──────────────────────────────────
 def find_latest_excel(data_dir: str) -> str | None:
     """
-    Find the most recently modified .xlsx file in data_dir that
-    is NOT itself a validation report (those are outputs, not inputs).
+    Find the customer Excel file in data_dir.
 
-    This means you can just run `python scraper/validate_urls.py`
-    without specifying --file every time. If the customer sends a
-    new Excel with a different filename, it's picked up automatically
-    — no code change needed.
+    Priority order:
+    1. DEFAULT_EXCEL_FILENAME (if set and exists in data_dir)
+       — explicit preferred filename, no guessing needed
+    2. Most recently modified .xlsx that is not a validation
+       report and not a Windows Excel lock file (~$ prefix)
+
+    Windows lock file note:
+    When Excel has a file open, it creates a hidden temp file
+    called ~$<filename>.xlsx in the same folder. openpyxl
+    cannot read these — they are not real Excel files. The
+    ~$ prefix filter ensures these are never picked up
+    regardless of their modification time.
     """
     data_path = Path(data_dir)
     if not data_path.exists():
         return None
 
+    # Priority 1 — preferred filename explicitly set
+    if DEFAULT_EXCEL_FILENAME:
+        preferred = data_path / DEFAULT_EXCEL_FILENAME
+        if preferred.exists():
+            return str(preferred)
+
+    # Priority 2 — most recently modified valid Excel
     candidates = [
         f for f in data_path.glob("*.xlsx")
-        if "url_validation_report" not in f.name.lower()
+        if not f.name.startswith("~$")              # exclude Windows lock files
+        and "url_validation_report" not in f.name.lower()  # exclude our own reports
     ]
 
     if not candidates:
@@ -976,10 +1001,15 @@ def main():
             print(
                 f"\n❌ ERROR: No Excel file found in {SCRAPER_DATA_DIR}/\n"
                 f"   Either place the customer Excel there, or use:\n"
-                f"   python scraper/validate_urls.py --file path/to/file.xlsx"
+                f"   python scraper/validate_urls.py --file path/to/file.xlsx\n"
+                f"   Or set DEFAULT_EXCEL_FILENAME at the top of this script."
             )
             sys.exit(1)
-        print(f"\n📂 Auto-detected input: {Path(excel_path).name}")
+        name = Path(excel_path).name
+        if DEFAULT_EXCEL_FILENAME and name == DEFAULT_EXCEL_FILENAME:
+            print(f"\n📂 Using preferred file: {name}")
+        else:
+            print(f"\n📂 Auto-detected input: {name} (most recently modified)")
 
     print("\n" + "=" * 65)
     print("   Royal London — Pre-Scrape URL Validation")
