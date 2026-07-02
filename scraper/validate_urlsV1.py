@@ -59,17 +59,18 @@ v1.1.0 — July 2026 | Mukesh Kund
          lowercase URL normalisation
 
          --retry-timeouts:
-         After the initial check, re-checks all URLs that timed
-         out using a lower concurrency (3 simultaneous, to avoid
-         server-side rate limiting causing false timeouts) and a
-         longer per-URL timeout (configurable via
-         --retry-timeout, default 25s). Results are merged back
-         into the main results before the report is written.
-         Rationale: a URL timing out under 15 simultaneous
-         requests is not definitive — the server may simply be
-         slow under load. 30 timeouts in the original run
-         prompted this feature; re-checking at lower concurrency
-         frequently resolves several of them.
+         After the initial check, progressively re-checks all
+         URLs that timed out across up to 2 additional rounds:
+           Round 1: concurrency=15, timeout=12s  (initial)
+           Round 2: concurrency=3,  timeout=30s  (auto-retry)
+           Round 3: concurrency=1,  timeout=45s  (final pass)
+         Each round only re-checks URLs still timing out from
+         the previous round — so if Round 2 resolves 50 of 60
+         timeouts, Round 3 only runs on the remaining 10.
+         After Round 3, any URL still timing out is confirmed
+         unreachable and labelled clearly in the report:
+         "Timed out on all 3 rounds (12s / 30s / 45s)".
+         This is fully automatic — no manual re-runs needed.
 
          Clean URL List sheet (Sheet 4):
          Contains ONLY unique, confirmed-live (HTTP 200) URLs,
@@ -109,13 +110,17 @@ from openpyxl.styles import (
 from openpyxl.utils import get_column_letter
 
 # ── Config ────────────────────────────────────────────────────
-DEFAULT_EXCEL            = "scraper/data/royal_london_verification_retried.xlsx"
-DEFAULT_CONCURRENCY      = 15
-DEFAULT_TIMEOUT          = 12       # seconds per request
-DEFAULT_RETRY_TIMEOUT    = 25       # seconds for retry pass (longer — slower concurrency)
-DEFAULT_RETRY_CONCURRENCY = 3       # lower concurrency for retry — avoids rate-limit false timeouts
-MAX_RETRIES              = 1        # retry once on timeout/connection error within a single check
-EXPECTED_DOMAIN          = "royallondon.com"
+DEFAULT_EXCEL             = None   # auto-detected from scraper/data/
+DEFAULT_CONCURRENCY       = 15
+DEFAULT_TIMEOUT           = 12     # Round 1: fast pass, 15 concurrent
+DEFAULT_RETRY_TIMEOUT     = 30     # Round 2: 3 concurrent, 30s
+DEFAULT_RETRY_TIMEOUT_R3  = 45     # Round 3: 1 concurrent, 45s — final confirmation
+DEFAULT_RETRY_CONCURRENCY = 3      # Round 2 concurrency
+MAX_RETRIES               = 1
+EXPECTED_DOMAIN           = "royallondon.com"
+
+# Directory to scan for the customer Excel when --file not provided
+SCRAPER_DATA_DIR = "scraper/data"
 
 # HTTP headers — mimic a real browser to avoid bot-detection blocks
 REQUEST_HEADERS = {
@@ -127,7 +132,30 @@ REQUEST_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,*/*",
 }
 
-# ── Colour palette ────────────────────────────────────────────
+# ── Auto-detect latest Excel ──────────────────────────────────
+def find_latest_excel(data_dir: str) -> str | None:
+    """
+    Find the most recently modified .xlsx file in data_dir that
+    is NOT itself a validation report (those are outputs, not inputs).
+
+    This means you can just run `python scraper/validate_urls.py`
+    without specifying --file every time. If the customer sends a
+    new Excel with a different filename, it's picked up automatically
+    — no code change needed.
+    """
+    data_path = Path(data_dir)
+    if not data_path.exists():
+        return None
+
+    candidates = [
+        f for f in data_path.glob("*.xlsx")
+        if "url_validation_report" not in f.name.lower()
+    ]
+
+    if not candidates:
+        return None
+
+    return str(max(candidates, key=lambda f: f.stat().st_mtime))
 GREEN  = "C6EFCE"   # live
 YELLOW = "FFEB9C"   # redirect / warning
 RED    = "FFC7CE"   # dead / error
@@ -450,85 +478,91 @@ async def check_all_urls(
 async def retry_timeouts(
     results: list[dict],
     retry_timeout: int = DEFAULT_RETRY_TIMEOUT,
+    retry_timeout_r3: int = DEFAULT_RETRY_TIMEOUT_R3,
     retry_concurrency: int = DEFAULT_RETRY_CONCURRENCY,
 ) -> list[dict]:
     """
-    v1.1.0 — Re-check all timed-out URLs at lower concurrency
-    and longer timeout, then merge updated statuses back.
+    v1.1.0 — Progressive 3-round retry for timed-out URLs.
 
-    WHY this is needed:
-    A URL timing out under 15 simultaneous requests is not
-    conclusive — Royal London's server may rate-limit or slow
-    down under concurrent load, causing transient timeouts that
-    have nothing to do with the page being dead. Re-checking at
-    concurrency=3 with a longer per-URL timeout gives each page
-    a fair individual chance before marking it as truly
-    unreachable.
+    Round 1 (main check): concurrency=15, timeout=12s
+    Round 2 (this func):  concurrency=3,  timeout=30s
+    Round 3 (this func):  concurrency=1,  timeout=45s
 
-    Only re-checks entries whose current status is "timeout".
-    Updates their result dict in-place in the results list.
-    Returns the same results list with updated statuses.
+    Each round only re-checks URLs that STILL timed out in the
+    previous round — so if Round 2 resolves 50 of 60 timeouts,
+    Round 3 only runs on the remaining 10. Total extra time
+    stays small even with many initial timeouts.
+
+    After Round 3, anything still timing out is genuinely
+    unreachable — marked with a clear note so the report is
+    unambiguous about whether it was a fluke or a real failure.
     """
-    timeout_results = [r for r in results if r["status"] == "timeout"]
-    if not timeout_results:
-        print("   No timeouts to retry.")
-        return results
-
-    print(
-        f"   Re-checking {len(timeout_results)} timed-out URL(s) "
-        f"(concurrency={retry_concurrency}, timeout={retry_timeout}s)..."
-    )
-
-    # Build fresh entries from the timed-out results
-    retry_entries = [
-        {
-            "url":      r["url"],
-            "title":    r["title"],
-            "category": r["category"],
-            "row_num":  r["row_num"],
-        }
-        for r in timeout_results
+    ROUNDS = [
+        {"label": "Round 2", "concurrency": retry_concurrency, "timeout": retry_timeout},
+        {"label": "Round 3", "concurrency": 1,                 "timeout": retry_timeout_r3},
     ]
 
-    # Run with reduced concurrency and extended timeout
-    retry_checked = await check_all_urls(
-        retry_entries,
-        concurrency=retry_concurrency,
-        timeout=retry_timeout,
-    )
+    for round_cfg in ROUNDS:
+        still_timing_out = [r for r in results if r["status"] == "timeout"]
+        if not still_timing_out:
+            print(f"   No more timeouts — skipping {round_cfg['label']}.")
+            break
 
-    # Merge retry results back — match by url
-    retry_by_url = {r["url"]: r for r in retry_checked}
-    resolved = 0
-    still_timeout = 0
+        print(
+            f"\n   {round_cfg['label']}: re-checking "
+            f"{len(still_timing_out)} URL(s) — "
+            f"concurrency={round_cfg['concurrency']}, "
+            f"timeout={round_cfg['timeout']}s..."
+        )
 
-    for result in results:
-        if result["status"] == "timeout" and result["url"] in retry_by_url:
-            updated = retry_by_url[result["url"]]
+        retry_entries = [
+            {"url": r["url"], "title": r["title"],
+             "category": r["category"], "row_num": r["row_num"]}
+            for r in still_timing_out
+        ]
+
+        retry_checked = await check_all_urls(
+            retry_entries,
+            concurrency=round_cfg["concurrency"],
+            timeout=round_cfg["timeout"],
+        )
+        retry_by_url = {r["url"]: r for r in retry_checked}
+
+        resolved = 0
+        still_timeout = 0
+        for result in results:
+            if result["status"] != "timeout":
+                continue
+            updated = retry_by_url.get(result["url"])
+            if not updated:
+                continue
             if updated["status"] != "timeout":
-                # URL is now reachable — update the result
                 result["status"]      = updated["status"]
                 result["status_code"] = updated["status_code"]
                 result["final_url"]   = updated["final_url"]
                 result["issue"]       = (
-                    updated["issue"] +
-                    " (resolved on retry)"
+                    f"{updated['issue']} (resolved on {round_cfg['label'].lower()})"
                     if updated["issue"]
-                    else "(resolved on retry)"
+                    else f"(resolved on {round_cfg['label'].lower()})"
                 )
                 resolved += 1
             else:
-                result["issue"] = (
-                    f"Timed out on initial check AND retry "
-                    f"(×2 attempts, {retry_timeout}s each)"
-                )
                 still_timeout += 1
 
-    print(
-        f"   Retry complete: "
-        f"{resolved} resolved ✅  |  "
-        f"{still_timeout} still timing out ⏱️"
-    )
+        print(
+            f"   {round_cfg['label']} complete: "
+            f"{resolved} resolved ✅  |  {still_timeout} still timing out ⏱️"
+        )
+
+    # Mark anything surviving all rounds as confirmed unreachable
+    for result in results:
+        if result["status"] == "timeout":
+            result["issue"] = (
+                f"Timed out on all 3 rounds "
+                f"(12s / {retry_timeout}s / {retry_timeout_r3}s) — "
+                f"confirmed unreachable"
+            )
+
     return results
 
 
@@ -901,8 +935,12 @@ def main():
         description="Validate Royal London approved URLs before scraping"
     )
     parser.add_argument(
-        "--file", default=DEFAULT_EXCEL,
-        help="Path to customer Excel file",
+        "--file", default=None,
+        help=(
+            "Path to customer Excel file. If not provided, automatically "
+            "finds the most recently modified .xlsx in scraper/data/ "
+            "that is not itself a validation report."
+        ),
     )
     parser.add_argument(
         "--concurrency", type=int, default=DEFAULT_CONCURRENCY,
@@ -913,26 +951,35 @@ def main():
         help="Seconds before a URL is marked as timeout (default: 12)",
     )
     parser.add_argument(
-        "--retry-timeouts", action="store_true",
+        "--no-retry", action="store_true",
         help=(
-            "After initial check, re-check timed-out URLs at lower "
-            "concurrency and longer timeout before writing report. "
-            "Recommended when initial run shows timeout count > 0."
+            "Skip the automatic retry pass for timed-out URLs. "
+            "By default, any timed-out URLs are automatically re-checked "
+            "at lower concurrency before the report is written."
         ),
     )
     parser.add_argument(
         "--retry-timeout", type=int, default=DEFAULT_RETRY_TIMEOUT,
-        help=(
-            f"Timeout in seconds for the retry pass (default: "
-            f"{DEFAULT_RETRY_TIMEOUT}s). Only used with --retry-timeouts."
-        ),
+        help=f"Timeout for Round 2 retry pass (default: {DEFAULT_RETRY_TIMEOUT}s). Round 3 always uses {DEFAULT_RETRY_TIMEOUT_R3}s at concurrency=1.",
     )
     args = parser.parse_args()
 
-    excel_path = args.file
-    if not Path(excel_path).exists():
-        print(f"\n❌ ERROR: File not found: {excel_path}")
-        sys.exit(1)
+    # ── Resolve Excel file ─────────────────────────────────────
+    if args.file:
+        excel_path = args.file
+        if not Path(excel_path).exists():
+            print(f"\n❌ ERROR: File not found: {excel_path}")
+            sys.exit(1)
+    else:
+        excel_path = find_latest_excel(SCRAPER_DATA_DIR)
+        if not excel_path:
+            print(
+                f"\n❌ ERROR: No Excel file found in {SCRAPER_DATA_DIR}/\n"
+                f"   Either place the customer Excel there, or use:\n"
+                f"   python scraper/validate_urls.py --file path/to/file.xlsx"
+            )
+            sys.exit(1)
+        print(f"\n📂 Auto-detected input: {Path(excel_path).name}")
 
     print("\n" + "=" * 65)
     print("   Royal London — Pre-Scrape URL Validation")
@@ -941,7 +988,7 @@ def main():
     print(f"   Concurrency:    {args.concurrency} simultaneous requests")
     print(f"   Timeout:        {args.timeout}s per URL")
     print(f"   Retries:        {MAX_RETRIES} on timeout/connection error")
-    print(f"   Retry-timeouts: {'yes — ' + str(DEFAULT_RETRY_CONCURRENCY) + ' concurrent, ' + str(args.retry_timeout) + 's' if args.retry_timeouts else 'no (use --retry-timeouts to enable)'}")
+    print(f"   Auto-retry:     {'disabled (--no-retry)' if args.no_retry else f'3 rounds — 12s/15c → {args.retry_timeout}s/3c → {DEFAULT_RETRY_TIMEOUT_R3}s/1c'}")
 
     # ── Load URLs ──────────────────────────────────────────────
     print("\n📋 Loading URLs from Excel...")
@@ -965,22 +1012,26 @@ def main():
         check_all_urls(entries, args.concurrency, args.timeout)
     )
 
-    # ── Retry timeouts (optional) ──────────────────────────────
+    # ── Auto-retry timeouts ────────────────────────────────────
+    # Enabled by default — disabled only with --no-retry.
+    # A timeout under 15 concurrent requests is not conclusive;
+    # re-checking at concurrency=3 with a longer timeout gives
+    # each page a fair individual chance before marking it dead.
     timeout_count = sum(1 for r in results if r["status"] == "timeout")
-    if args.retry_timeouts and timeout_count > 0:
-        print(f"\n⏱️  Retrying {timeout_count} timed-out URLs...")
+    if timeout_count > 0 and not args.no_retry:
+        print(f"\n⏱️  {timeout_count} URL(s) timed out — starting progressive retry (30s → 45s)...")
         results = asyncio.run(
             retry_timeouts(
                 results,
                 retry_timeout=args.retry_timeout,
+                retry_timeout_r3=DEFAULT_RETRY_TIMEOUT_R3,
                 retry_concurrency=DEFAULT_RETRY_CONCURRENCY,
             )
         )
-    elif timeout_count > 0 and not args.retry_timeouts:
+    elif timeout_count > 0 and args.no_retry:
         print(
             f"\n   ℹ️  {timeout_count} URL(s) timed out. "
-            f"Re-run with --retry-timeouts to check these more "
-            f"carefully before sharing the report."
+            f"Remove --no-retry to re-check these automatically."
         )
 
     # ── Detect duplicates ──────────────────────────────────────
