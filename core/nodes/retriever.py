@@ -390,32 +390,33 @@ def retriever_node(state: AgentState) -> AgentState:
         try:
             results = list(search_client.search(**search_kwargs))
         except Exception as e:
-            err     = str(e)
-            retried = False
+            err = str(e)
 
-            # title_questions only exists on v3+ indexes — fallback to BASE_SELECT
-            if "title_questions" in err:
-                log.warning(
-                    "title_questions_field_not_found",
-                    index=INDEX_NAME,
-                    note="title_questions only exists on v3+ indexes. Retrying without it.",
-                )
+            # Detect any v3-index-specific feature error.
+            # Both title_questions (field) and rl-retrieval-profile
+            # (scoring profile) only exist on v3+ indexes. If EITHER
+            # fails, remove BOTH at once so the single retry is clean.
+            # Root cause: first error may be scoring_profile, retry
+            # succeeds on that but then fails on title_questions —
+            # avoided by stripping all v3 features in one pass.
+            v3_error = (
+                "title_questions"    in err
+                or "UnknownScoringProfile" in err
+                or "scoringProfile"  in err
+            )
+            if v3_error:
                 search_kwargs["select"] = BASE_SELECT
-                retried = True
-
-            # Scoring profile only exists on v3+ indexes — remove and retry
-            if "UnknownScoringProfile" in err or "scoringProfile" in err:
-                log.warning(
-                    "scoring_profile_not_found",
-                    profile="rl-retrieval-profile",
-                    index=INDEX_NAME,
-                    note="Profile only exists on v3+ indexes. Falling back to default scoring.",
-                )
                 search_kwargs.pop("scoring_profile", None)
-                retried = True
-
-            if retried:
-                # Single retry handles both fallbacks in one call
+                log.warning(
+                    "v3_features_not_available",
+                    index=INDEX_NAME,
+                    error=err[:120],
+                    note=(
+                        "title_questions field and rl-retrieval-profile "
+                        "only exist on v3+ indexes. Removed both — "
+                        "retrying with v2-compatible select and default scoring."
+                    ),
+                )
                 results = list(search_client.search(**search_kwargs))
             else:
                 raise
