@@ -346,14 +346,18 @@ def retriever_node(state: AgentState) -> AgentState:
         # keyword-dense but irrelevant chunks (AGM pages,
         # workplace pensions) outscored the correct answer.
         use_semantic = bool(SEMANTIC_CONFIG)
+
+        # v1.3.1: title_questions field only exists on v3+ indexes.
+        # Build base select without it, add conditionally.
+        # The try/except below handles the case where it's not on
+        # the current index — retry without it automatically.
+        BASE_SELECT    = ["chunk_id", "content", "source_url", "section", "title"]
+        V3_SELECT      = BASE_SELECT + ["title_questions"]
+
         search_kwargs = dict(
             search_text=state.query,
             vector_queries=[vector_query],
-            select=[
-                "chunk_id", "content", "source_url",
-                "section", "title",
-                "title_questions",  # v1.3.0 — for observability
-            ],
+            select=V3_SELECT,
             top=TOP_K * 3,
         )
         if use_semantic:
@@ -386,9 +390,21 @@ def retriever_node(state: AgentState) -> AgentState:
         try:
             results = list(search_client.search(**search_kwargs))
         except Exception as e:
-            if "UnknownScoringProfile" in str(e) or "scoringProfile" in str(e):
-                # Scoring profile not found on this index version —
-                # retry without it. Expected on v2/pre-v3 indexes.
+            err     = str(e)
+            retried = False
+
+            # title_questions only exists on v3+ indexes — fallback to BASE_SELECT
+            if "title_questions" in err:
+                log.warning(
+                    "title_questions_field_not_found",
+                    index=INDEX_NAME,
+                    note="title_questions only exists on v3+ indexes. Retrying without it.",
+                )
+                search_kwargs["select"] = BASE_SELECT
+                retried = True
+
+            # Scoring profile only exists on v3+ indexes — remove and retry
+            if "UnknownScoringProfile" in err or "scoringProfile" in err:
                 log.warning(
                     "scoring_profile_not_found",
                     profile="rl-retrieval-profile",
@@ -396,6 +412,10 @@ def retriever_node(state: AgentState) -> AgentState:
                     note="Profile only exists on v3+ indexes. Falling back to default scoring.",
                 )
                 search_kwargs.pop("scoring_profile", None)
+                retried = True
+
+            if retried:
+                # Single retry handles both fallbacks in one call
                 results = list(search_client.search(**search_kwargs))
             else:
                 raise
