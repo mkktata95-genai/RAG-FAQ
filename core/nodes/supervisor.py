@@ -751,9 +751,16 @@ def route_after_input_safety(state: AgentState) -> str:
 
 
 def route_after_retriever(state: AgentState) -> str:
+    """
+    Route after retriever:
+    - No results / refusal triggered → END
+    - Retrieved chunks → prompt_builder (v1.2.0: was generator)
+      prompt_builder_node assembles state.built_prompt from
+      retrieved chunks before generator_node runs.
+    """
     if state.refusal_triggered:
         return "end"
-    return "generator"
+    return "prompt_builder"
 
 
 def route_after_generator(state: AgentState) -> str:
