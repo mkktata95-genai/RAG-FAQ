@@ -366,6 +366,14 @@ def retriever_node(state: AgentState) -> AgentState:
         # entry-point queries. For SPECIFIC queries, the default
         # Azure scoring is better — title_questions boost would
         # distort specific-product results.
+        #
+        # v1.3.1 FIX: scoring profile only exists on rlg-faq-index-v3+
+        # (created by chunk_and_index_hqaV3.py at index build time).
+        # rlg-faq-index-v2 and earlier do not have it. Wrap the search
+        # call in a try/except so testing against v2 works normally —
+        # if Azure returns UnknownScoringProfile, retry without it.
+        # No data loss: v2 retrieval falls back to default BM25+semantic
+        # scoring which is still correct, just without the v3 boost.
         query_type = state.query_type or "SPECIFIC"
         if query_type == "BROAD" and SEMANTIC_CONFIG:
             search_kwargs["scoring_profile"] = "rl-retrieval-profile"
@@ -375,7 +383,22 @@ def retriever_node(state: AgentState) -> AgentState:
                 query_type=query_type,
             )
 
-        results = search_client.search(**search_kwargs)
+        try:
+            results = list(search_client.search(**search_kwargs))
+        except Exception as e:
+            if "UnknownScoringProfile" in str(e) or "scoringProfile" in str(e):
+                # Scoring profile not found on this index version —
+                # retry without it. Expected on v2/pre-v3 indexes.
+                log.warning(
+                    "scoring_profile_not_found",
+                    profile="rl-retrieval-profile",
+                    index=INDEX_NAME,
+                    note="Profile only exists on v3+ indexes. Falling back to default scoring.",
+                )
+                search_kwargs.pop("scoring_profile", None)
+                results = list(search_client.search(**search_kwargs))
+            else:
+                raise
 
         # Deduplicate by URL + collect all candidates
         candidates = []
