@@ -89,6 +89,50 @@ v1.2.0 — June 2026 | Mukesh Kund
            block, so the override query proceeds to generator
            with empty chunks but no refusal flag set.
 
+v1.3.0 — July 2026 | Mukesh Kund
+         Sprint 1 enhancements: rerank_chunks(), title_questions
+         select field, scoring profile, dotenv fix.
+
+         rerank_chunks() [NEW]:
+         - Post-retrieval fuzzy title boost using rapidfuzz.
+         - Only fires when state.query_type == "BROAD" (set by
+           classifier_node). SPECIFIC queries skip it entirely
+           — 5ms overhead only paid when there's a real signal.
+         - Logic: for each chunk, compute fuzz.partial_ratio
+           between the query and the chunk's title. If ratio
+           > 0.7 (70% match), add up to 2.0 to the reranker
+           score. Resort by adjusted score.
+         - WHY this is needed alongside the index-level
+           title_questions boost:
+           Azure AI Search's scoring profile weights affect BM25
+           scoring. The semantic reranker and vector scores are
+           independent. Post-retrieval re-ranking at the Python
+           level applies a uniform title signal across all three
+           retrieval legs, ensuring that an overview page with
+           title "What is a Pension" ranks above a keyword-rich
+           workplace pension page for "What types of pensions
+           does Royal London offer?" even after the Azure ranker
+           has scored them.
+
+         title_questions field added to select:
+         - Retrieved alongside content, source_url, section,
+           title in the Azure AI Search call.
+         - Stored on RetrievedChunk (currently unused at query
+           time — the field is in the index for retrieval
+           ranking, not for display). Kept in select for
+           observability / debugging.
+
+         scoring_profile added to search call:
+         - Passes "rl-retrieval-profile" (created in
+           chunk_and_index_hqaV3.py at index build time) only
+           when state.query_type == "BROAD". Specific queries
+           use Azure's default scoring — the title_questions
+           boost would distort specific-query results.
+
+         dotenv fix:
+         - was: load_dotenv() — no args, no override
+         - now: load_dotenv(find_dotenv(usecwd=False), override=True)
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -98,12 +142,21 @@ import structlog
 from azure.identity import DefaultAzureCredential
 from azure.search.documents import SearchClient
 from azure.search.documents.models import VectorizedQuery
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
 from core.embeddings import get_embedding
 from core.schemas import AgentState, RetrievedChunk
 
-load_dotenv()
+try:
+    from rapidfuzz import fuzz as _fuzz
+    _RAPIDFUZZ_AVAILABLE = True
+except ImportError:
+    _RAPIDFUZZ_AVAILABLE = False
+    # rerank_chunks() will fall back to returning chunks unchanged
+    # if rapidfuzz is not installed. Install with: pip install rapidfuzz
+
+_dotenv_path = find_dotenv(usecwd=False)
+load_dotenv(_dotenv_path, override=True)
 log = structlog.get_logger()
 
 # ── Config ────────────────────────────────────────────────────
@@ -172,6 +225,78 @@ def get_search_client() -> SearchClient:
     return _search_client
 
 
+def rerank_chunks(
+    chunks: list[RetrievedChunk],
+    query: str,
+    query_type: str,
+) -> list[RetrievedChunk]:
+    """
+    v1.3.0 — Post-retrieval fuzzy title boost for BROAD queries.
+
+    Azure AI Search's scoring profile and semantic ranker improve
+    BM25 and cross-field scoring, but the Python-level re-ranking
+    applies a uniform title signal across all three retrieval legs
+    (BM25 + vector + semantic), ensuring overview pages with
+    strongly matching titles rank above keyword-dense product pages
+    even after the Azure ranker has scored them.
+
+    Only fires when query_type == "BROAD" — SPECIFIC queries are
+    not affected. 5ms overhead (no API call, pure Python).
+
+    Logic:
+    - For each chunk, compute rapidfuzz.partial_ratio between the
+      normalised query and the chunk title.
+    - If ratio > 0.70 (70% match threshold), add up to 2.0 boost
+      to the reranker score (proportional to match strength).
+    - Resort by adjusted score descending.
+    - If rapidfuzz is not installed: return chunks unchanged
+      (warning logged — install rapidfuzz to enable this feature).
+
+    The 2.0 boost is calibrated to move a strongly-title-matching
+    chunk from position 3-4 to position 1-2, without completely
+    overriding the Azure ranker's relevance signal. Adjust
+    TITLE_BOOST_WEIGHT if needed after A/B comparison.
+    """
+    TITLE_FUZZY_THRESHOLD = 0.70  # 70% match to trigger boost
+    TITLE_BOOST_WEIGHT    = 2.0   # max boost added to reranker score
+
+    if not _RAPIDFUZZ_AVAILABLE:
+        log.warning(
+            "rerank_chunks_skipped",
+            reason="rapidfuzz not installed",
+            note="pip install rapidfuzz to enable title re-ranking",
+        )
+        return chunks
+
+    query_lower = query.lower().strip()
+    scored      = []
+
+    for chunk in chunks:
+        title      = (chunk.title or "").lower().strip()
+        base_score = chunk.score
+
+        if title:
+            ratio = _fuzz.partial_ratio(query_lower, title) / 100
+            boost = ratio * TITLE_BOOST_WEIGHT if ratio > TITLE_FUZZY_THRESHOLD else 0
+        else:
+            boost = 0
+
+        scored.append((base_score + boost, chunk))
+
+    scored.sort(key=lambda x: -x[0])
+    reranked = [c for _, c in scored]
+
+    if reranked and reranked[0].chunk_id != chunks[0].chunk_id:
+        log.info(
+            "rerank_applied",
+            query_type=query_type,
+            original_top=chunks[0].title[:40] if chunks[0].title else chunks[0].source_url,
+            reranked_top=reranked[0].title[:40] if reranked[0].title else reranked[0].source_url,
+        )
+
+    return reranked
+
+
 # ── Main node ─────────────────────────────────────────────────
 def retriever_node(state: AgentState) -> AgentState:
     """Hybrid search using cached embedding from cache_check node."""
@@ -227,12 +352,28 @@ def retriever_node(state: AgentState) -> AgentState:
             select=[
                 "chunk_id", "content", "source_url",
                 "section", "title",
+                "title_questions",  # v1.3.0 — for observability
             ],
             top=TOP_K * 3,
         )
         if use_semantic:
             search_kwargs["query_type"] = "semantic"
             search_kwargs["semantic_configuration_name"] = SEMANTIC_CONFIG
+
+        # v1.3.0: apply scoring profile only for BROAD queries.
+        # "rl-retrieval-profile" boosts title_questions (weight 5.0)
+        # which were generated specifically to match broad/overview
+        # entry-point queries. For SPECIFIC queries, the default
+        # Azure scoring is better — title_questions boost would
+        # distort specific-product results.
+        query_type = state.query_type or "SPECIFIC"
+        if query_type == "BROAD" and SEMANTIC_CONFIG:
+            search_kwargs["scoring_profile"] = "rl-retrieval-profile"
+            log.info(
+                "scoring_profile_applied",
+                profile="rl-retrieval-profile",
+                query_type=query_type,
+            )
 
         results = search_client.search(**search_kwargs)
 
@@ -296,6 +437,11 @@ def retriever_node(state: AgentState) -> AgentState:
 
         # Take top K from filtered candidates
         chunks = candidates[:TOP_K]
+
+        # v1.3.0: post-retrieval title fuzzy re-ranking.
+        # Only fires for BROAD queries — see rerank_chunks() docstring.
+        if chunks and query_type == "BROAD":
+            chunks = rerank_chunks(chunks, state.query, query_type)
 
         state.retrieved_chunks        = chunks
         latency                       = (time.time() - start) * 1000

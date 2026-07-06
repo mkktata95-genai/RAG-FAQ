@@ -1,5 +1,71 @@
 """
 Pydantic schemas shared across all agents.
+
+═══════════════════════════════════════════════════════════════
+CHANGE LOG
+═══════════════════════════════════════════════════════════════
+
+v1.0.0 — Initial version
+         Core schemas: AgentState, Citation, RetrievedChunk,
+         ChatRequestBody, ChatResponse, CacheEntry.
+
+v1.1.0 — June 2026 | Mukesh Kund
+         title field added to Citation and RetrievedChunk.
+
+         Citation.title (str = ""):
+         - Enables the UI to display the page title alongside
+           the citation URL in the citation chip — previously
+           only URL and section were available.
+
+         RetrievedChunk.title (str = ""):
+         - Required to populate Citation.title — the retriever
+           reads this from the index's title field and stores
+           it on the chunk so extract_citations() can access it.
+
+v1.2.0 — July 2026 | Mukesh Kund
+         Sprint 1 refactor — three new AgentState fields for
+         classifier_node and prompt_builder_node.
+
+         intent: str = ""
+         - Set by classifier_node (NEW — core/nodes/).
+         - Values: "INSURANCE", "GREETING", "CHITCHAT",
+           "THANKS", "FAREWELL", "CAPABILITY", "IRRELEVANT",
+           "SENSITIVE" (future — empathy-flagged queries).
+         - Read by generator_node for model routing
+           (intent signals whether gpt-4o or gpt-4.1 is needed)
+           and by prompt_builder_node for system prompt selection.
+         - Supervisor keeps quick_intent_check() for rule-based
+           GREETING/FAREWELL/THANKS short-circuit (no LLM call).
+           classifier_node handles all LLM-based classification.
+
+         query_type: str = ""
+         - Set by classifier_node (rule-based, no LLM call).
+         - Values: "BROAD" or "SPECIFIC".
+         - BROAD: entry-point queries covering multiple topics
+           ("what types of pensions does Royal London offer?").
+           Signals retriever to apply title_questions boost via
+           scoring_profile="rl-retrieval-profile" and
+           rerank_chunks() fuzzy title matching.
+           Also upgrades simple-query model routing:
+           BROAD queries get gpt-4o (DEPLOYMENT_FAST) minimum,
+           not gpt-4o-mini, because comprehensive multi-type
+           answers need more capable generation.
+         - SPECIFIC: targeted product queries
+           ("what is the MPAA?"). Existing routing unchanged.
+
+         built_prompt: str = ""
+         - Set by prompt_builder_node (NEW — core/nodes/).
+         - Contains the fully assembled user prompt including
+           retrieved context, conversation history, empathy/
+           disclaimer/bereavement/override notes.
+         - Read by generator_node instead of calling
+           build_user_prompt() directly — generator becomes
+           a pure LLM-call node with no prompt construction.
+         - Empty string default is safe: generator_node
+           checks for built_prompt before using it and falls
+           back to a minimal prompt if not set (defensive).
+
+═══════════════════════════════════════════════════════════════
 """
 import re
 from typing import Any
@@ -19,7 +85,7 @@ class Citation(BaseModel):
     index: int
     url: str
     section: str
-    title: str = ""          # ← NEW
+    title: str = ""
 
 # ── Retrieved Chunk ───────────────────────────────────────
 class RetrievedChunk(BaseModel):
@@ -27,7 +93,7 @@ class RetrievedChunk(BaseModel):
     content: str
     source_url: str
     section: str
-    title: str = ""          # ← NEW
+    title: str = ""
     score: float = 0.0
 
 # ── Agent State ───────────────────────────────────────────
@@ -47,9 +113,14 @@ class AgentState(BaseModel):
     retrieved_chunks: list[RetrievedChunk] = Field(
         default_factory=list
     )
+    # Classification (v1.2.0 — set by classifier_node)
+    intent: str = ""
+    query_type: str = ""
     # Generation
     raw_response: str | None = None
     model_used: str | None = None
+    # Prompt (v1.2.0 — set by prompt_builder_node)
+    built_prompt: str = ""
     # Final output
     citations: list[Citation] = Field(default_factory=list)
     final_response: str | None = None

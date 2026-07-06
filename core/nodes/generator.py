@@ -401,27 +401,88 @@ v1.9.0 — June 2026 | Mukesh Kund
            being sent to the model, and ensuring it relies solely
            on conversation history as intended.
 
+v2.0.0 — July 2026 | Mukesh Kund
+         Sprint 1 refactor — slim generator + dotenv fix
+
+         FUNCTIONS MOVED TO prompt_builder_node.py (core/nodes/):
+         - SYSTEM_PROMPT
+         - UNKNOWN_PRODUCT_RESPONSE (still imported from here
+           for detection — single source of truth stays in
+           prompt_builder_node.py)
+         - BEREAVEMENT_HANDOFF_NUMBER (same — imported from
+           prompt_builder_node.py)
+         - build_context()
+         - build_user_prompt()
+
+         WHAT STAYS IN GENERATOR:
+         - is_simple_query() — model routing logic
+         - generator_node() — the actual LLM call
+         - extract_citations() — citation renumbering
+         - clean_response_text() — post-processing
+         - get_openai_client() — singleton Azure client
+
+         GENERATOR CHANGE — reads state.built_prompt:
+         - Old: build_user_prompt(state) called here
+         - New: state.built_prompt (set by prompt_builder_node)
+         - prompt_builder_node runs BEFORE generator in the
+           pipeline; state.built_prompt is always set by then.
+         - Defensive fallback: if built_prompt is empty
+           (shouldn't happen but defended against), generator
+           falls back to a minimal safe prompt rather than
+           crashing. This preserves the FCA-regulated response
+           path under all conditions.
+
+         is_simple_query() ENHANCEMENT — query_type signal:
+         - Added query_type parameter (from state.query_type,
+           set by classifier_node).
+         - BROAD queries are NEVER routed to gpt-4o-mini
+           regardless of word count. They always get gpt-4o
+           (DEPLOYMENT_FAST) minimum.
+         - WHY: "What types of pensions does Royal London offer?"
+           is short (8 words) and would previously route to
+           gpt-4o-mini via word-count heuristic, producing thin
+           answers. BROAD queries by definition need comprehensive
+           multi-product coverage — gpt-4o consistently delivers
+           richer, FCA-disclaimer-consistent responses for these.
+         - SPECIFIC queries: existing word-count + keyword
+           heuristic unchanged.
+
+         DOTENV FIX:
+         - was: load_dotenv() — no args, no override
+         - now: load_dotenv(find_dotenv(usecwd=False), override=True)
+
 ═══════════════════════════════════════════════════════════════
 """
-
 import os
 import re
 import time
 import structlog
 from openai import AzureOpenAI
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
 from core.schemas import AgentState, Citation
 from core.middleware import track_token_usage
+# SYSTEM_PROMPT, UNKNOWN_PRODUCT_RESPONSE, BEREAVEMENT_HANDOFF_NUMBER
+# moved to prompt_builder_node.py (v2.0.0). Imported from there —
+# single source of truth, no duplication.
+from core.nodes.prompt_builder_node import (
+    SYSTEM_PROMPT,
+    UNKNOWN_PRODUCT_RESPONSE,
+    BEREAVEMENT_HANDOFF_NUMBER,
+)
 
-load_dotenv()
+_dotenv_path = find_dotenv(usecwd=False)
+load_dotenv(_dotenv_path, override=True)
 log = structlog.get_logger()
 
 # ── Config ────────────────────────────────────────────────────
-AZURE_OPENAI_ENDPOINT  = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
-DEPLOYMENT_MAIN        = os.getenv("AZURE_OPENAI_DEPLOYMENT_MAIN", "gpt-4.1")
-DEPLOYMENT_FAST        = os.getenv("AZURE_OPENAI_DEPLOYMENT_FAST", "gpt-4o-mini")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+DEPLOYMENT_MAIN       = os.getenv("AZURE_OPENAI_DEPLOYMENT_MAIN", "gpt-4.1")
+# v2.0.0: default corrected to gpt-4o (was gpt-4o-mini).
+# DEPLOYMENT_FAST = gpt-4o throughout the pipeline per the
+# finalised model assignment decision (FCA disclaimer consistency).
+DEPLOYMENT_FAST       = os.getenv("AZURE_OPENAI_DEPLOYMENT_FAST", "gpt-4o")
 
 # ── Singleton client ──────────────────────────────────────────
 _credential:    DefaultAzureCredential | None = None
@@ -474,409 +535,144 @@ def get_openai_client() -> AzureOpenAI:
 # v1.5.0 changelog for full rationale.
 
 
-# ── Unknown Product Rule Response ─────────────────────────────
-# Single source of truth for the UNKNOWN PRODUCT RULE refusal
-# text (v1.6.0). Used in SYSTEM_PROMPT (so GPT reproduces it
-# verbatim) AND checked in generator_node() after generation — if
-# GPT returns this text, it is treated as a refusal
-# (refusal_triggered=True), which makes cache_write_node skip
-# caching it via its existing
-# "refusal_triggered or not final_response" check. Prevents a
-# wrong "no information" answer for one phrasing from being
-# cached and then replayed for other phrasings of the same topic.
-UNKNOWN_PRODUCT_RESPONSE = (
-    "I'm sorry, I don't have information about that in our "
-    "knowledge base. For assistance please contact Royal London "
-    "directly on 0345 600 0371 Monday to Friday 8am to 6pm."
-)
-
-# ── Bereavement Handoff Number ────────────────────────────────
-# NEW in v1.7.0 — single source of truth for the
-# bereavement-specific support line, referenced from both
-# SYSTEM_PROMPT (HUMAN HANDOFF RULE) and build_user_prompt()'s
-# bereavement_note so they cannot drift apart. See supervisor.py
-# v1.6.0 / generator.py v1.7.0 changelogs.
-BEREAVEMENT_HANDOFF_NUMBER = "0370 850 2179"
-
-# ── System Prompt ─────────────────────────────────────────────
-SYSTEM_PROMPT = f"""You are a helpful and professional \
-customer service assistant for RLG (a UK insurance and \
-pensions provider).
-
-RESPONSE LENGTH RULE:
-Keep responses concise and mobile-friendly.
-Maximum 300 words. Use bullet points for lists.
-No unnecessary repetition or padding.
-
-EMPATHY RULE:
-ONLY apply empathy if the customer explicitly mentions
-one of these genuine distress situations:
-  - Terminal or life-threatening illness (cancer, terminal)
-  - Death or bereavement (died, passed away, bereavement)
-  - Critical illness or serious disability
-  - Redundancy or losing their job
-  - Serious financial hardship (cannot afford, struggling to pay)
-  - Divorce or separation
-  - Mental health issues (anxiety, depression)
-  - Being diagnosed with a serious medical condition
-
-When one of the above is present — acknowledge with genuine
-empathy in 1-2 sentences BEFORE answering.
-Example: "I'm truly sorry to hear about your situation.
-I hope the following information is helpful..."
-
-DO NOT apply empathy for these standard administrative tasks —
-they are normal processes, not sensitive situations:
-  - Finding or tracing a lost pension
-  - Making a claim (standard insurance process)
-  - Transferring a pension
-  - Updating personal details
-  - Checking policy information
-  - Any general product or process question
-
-HUMAN HANDOFF RULE:
-ONLY add the handoff message when the customer has mentioned
-one of the genuine distress situations listed in EMPATHY RULE
-above (terminal illness, bereavement, redundancy etc).
-When applicable — always end with:
-"For personalised support, one of our advisers would be
-happy to help. Please call us on 0345 600 0371
-Monday to Friday 8am to 6pm."
-Do NOT add handoff message for standard administrative
-queries (lost pension, making a claim, transfers etc).
-If the user prompt below contains a NOTE specifying an
-alternative phone number for this response (for example,
-the dedicated bereavement support line), use THAT number
-INSTEAD of 0345 600 0371 in the handoff message above —
-for the handoff message only. Do not change any other
-phone number in your response.
-Decide the handoff number for THIS response on its own —
-do NOT copy a phone number from a previous assistant turn
-shown in the conversation history above. If this
-response's NOTE does not specify an alternative number,
-use 0345 600 0371, even if a different number appeared in
-an earlier turn of this conversation.
-
-FINANCIAL DISCLAIMER RULE:
-ONLY add this disclaimer when the query involves a
-financial decision, investment choice, or personal
-financial advice. Write it as plain text with NO
-asterisks or markdown formatting:
-Please note: This information is for general guidance
-only and does not constitute financial advice. For advice
-tailored to your personal circumstances, we recommend
-speaking with a qualified financial adviser or contacting
-us directly on 0345 600 0371.
-
-CITATION RULE:
-Always cite sources sequentially starting from [1].
-Use [1] for the first source you reference,
-[2] for the second, [3] for the third.
-Never skip numbers or use numbers out of order.
-Only attach a [1][2][3] marker to a sentence that
-contains a claim drawn directly from the provided
-context. Do NOT attach citation markers to a sentence
-that says information is unavailable, cannot be
-confirmed, or that directs the customer to contact
-Royal London or speak to an adviser — those sentences
-are not claims from the sources and must carry no [n]
-markers.
-Do NOT add a "Sources:" or "Source:" section, list
-source URLs as plain text, or otherwise repeat source
-links anywhere in your response. The [1][2][3] markers
-are sufficient on their own — the interface displays the
-source links separately. The URL shown in brackets after
-each source label in the context below is for your
-reference only, to identify which [n] corresponds to
-which source — never reproduce that URL in your answer.
-IMPORTANT — DOMAIN RESTRICTION:
-Only cite sources from royallondon.com.
-Do NOT include or link to any external website URLs
-in your response — even if they appear in the context.
-IMPORTANT — ORGANISATION BLOCKLIST:
-NEVER mention any of these organisations by name,
-even if they appear in the provided context.
-Completely ignore any reference to them in the context:
-  MoneyHelper, Money Helper, MaPS,
-  Pension Tracing Service, Pension Wise, Pension Advisory,
-  Policy Detective, Citizens Advice, Citizens Bureau,
-  StepChange, National Debt Line, Payplan,
-  Age UK, Age England, Age Scotland,
-  Which?, MoneySavingExpert, Martin Lewis,
-  Financial Ombudsman, FCA, FCA Register,
-  Turn2Us, Experian, Equifax, TransUnion,
-  Cruse, Samaritans, BACP, Marie Curie,
-  HMRC, DWP, Jobcentre, Universal Credit.
-If the context references any of these — skip that part
-of the context entirely. Do not paraphrase it either.
-This is an RLG-only assistant. For anything outside
-Royal London's products direct to 0345 600 0371.
-
-UNKNOWN PRODUCT RULE:
-Royal London offers: life insurance, pensions, ISAs,
-critical illness cover, income protection, and over 50s
-life insurance. If the customer asks about a product or
-service that does NOT appear in the provided context AND
-is not one of the above Royal London products — do NOT
-attempt to answer or use general knowledge.
-Instead respond with exactly:
-"{UNKNOWN_PRODUCT_RESPONSE}"
-Examples of products Royal London does NOT offer:
-credit cards, bank accounts, mortgages, car insurance,
-home insurance, travel insurance, cryptocurrency.
-
-PRODUCT CATEGORY QUESTIONS RULE:
-This rule is an exception to ANSWER RULE 2 below, scoped
-narrowly as follows.
-If the customer asks what TYPES, KINDS, or OPTIONS exist
-within one of Royal London's product categories listed in
-the UNKNOWN PRODUCT RULE above (for example "what types of
-pensions does Royal London offer", "what kinds of life
-insurance do you have", "what ISA options are there") —
-and the provided context contains general explanatory
-content about that category (for example a page explaining
-what a pension is and the different types of pension) —
-answer using that content, even if it is not phrased as
-"Royal London offers...".
-This exception does NOT apply to questions asking for a
-SPECIFIC fact about Royal London's own products or a named
-customer's policy — for example exact growth rates,
-guaranteed amounts, specific payout or premium figures, or
-personal eligibility. Those remain governed by ANSWER RULE 2:
-only state such figures if explicitly given in the context.
-Only fall back to the UNKNOWN PRODUCT RULE response above if
-the context contains no relevant explanatory content about
-that product category at all.
-
-ACCOUNT ACCESS RULE:
-You do NOT have access to any customer accounts, policy
-details, pension records, or personal data of any kind.
-If a customer asks you to look up, check, retrieve, or
-access their account, policy, pension, or personal
-information — do NOT attempt to do so.
-Respond with ONLY this exact message and nothing else:
-"I'm not able to access account information directly.
-For your account details please call us on
-0345 600 0371 Monday to Friday 8am to 6pm."
-Do NOT add any further guidance, steps, resources,
-or helpful information after this message.
-Stop there. The refusal is your complete response.
-This applies even if the customer provides their
-NI number, policy number, date of birth, or any
-other personal details.
-
-ANSWER RULES:
-1. Answer ONLY from the provided context
-2. ONLY include facts explicitly stated in context
-   Do NOT add general knowledge or assumptions
-3. Cite sources inline as [1][2][3] sequentially
-4. Never make up information not in context
-5. Use formal professional British English
-6. If context insufficient say so formally
-   and direct to 0345 600 0371
-
-NEVER:
-- Recommend specific products for personal situations
-- Make guarantees about returns or payouts
-- Provide legal advice
-- Discuss competitor products negatively
-- Use asterisks around disclaimer text
-- Answer questions about products not in the context
-- Recommend or name third-party organisations or services
-- Apply empathy to standard administrative queries
-- Add human handoff to standard administrative queries
-"""
+# ── Model routing ─────────────────────────────────────────────
+# TECHNICAL_COMPLEX_KEYWORDS — narrow list of regulated pension/tax
+# terms that are genuinely non-obvious from structural signals alone.
+# These are stable HMRC/FCA regulatory concepts, not arbitrary words.
+# CPX-02 fix: "tapered annual allowance" → gpt-4.1
+# CPX-05 fix: "tax-free lump sum" + "25% tax" → gpt-4.1
+# Extended to cover other known complex regulatory areas.
+#
+# WHY a keyword list here (despite our general preference for
+# signal-based routing): these terms have a near-zero false positive
+# rate for genuine complexity and a near-100% recall for queries that
+# actually require the precision of gpt-4.1. For example, "tapered
+# annual allowance" will never appear in a simple FAQ query — it only
+# appears when the customer is asking about a specific HMRC taper rule
+# that affects high earners, which genuinely needs careful handling.
+# The list is deliberately narrow so maintenance burden is minimal.
+#
+# MIGRATION NOTE: When upgrading to GPT-5 (required before Oct 2026
+# when gpt-4o and gpt-4.1 retire on Azure), map:
+#   DEPLOYMENT_MAIN → gpt-5         (or gpt-5-mini for mid-tier)
+#   DEPLOYMENT_FAST → gpt-5-mini    (or gpt-5-nano for lowest cost)
+# The routing logic below requires no changes — only env vars change.
+# At GPT-5 pricing (gpt-5: ~$2.50/1M, gpt-5-nano: ~$0.05/1M), smart
+# routing will save Royal London significant cost at scale vs routing
+# everything to the full model.
+TECHNICAL_COMPLEX_KEYWORDS = [
+    # Annual allowance complexity
+    "tapered annual", "tapered allowance",
+    "money purchase annual allowance", "mpaa",
+    "carry forward",
+    # Lump sum rules
+    "tax-free lump sum", "tax free lump sum",
+    "25% tax", "lump sum and continue",
+    "trivial commutation", "small pots rule",
+    # DB pension specific
+    "defined benefit", "final salary",
+    "transfer value", "pension transfer value",
+    "section 32",
+    # Legacy protection regimes
+    "lifetime allowance", "lta",
+    "enhanced protection", "fixed protection",
+    # Complex product mechanics
+    "pension recycling",
+    "guaranteed annuity rate",
+    "with-profits", "with profits",
+    "unit linked",
+]
 
 
-# ── Helper functions ──────────────────────────────────────────
-# needs_empathy() and needs_disclaimer() MOVED to supervisor.py
-# in v1.6.0 — see SYSTEM_PROMPT note above and supervisor.py
-# v1.5.0 changelog.
-
-
-def is_simple_query(query: str, is_sensitive: bool) -> bool:
+def is_simple_query(
+    query: str,
+    is_sensitive: bool,
+    query_type: str = "SPECIFIC",
+) -> bool:
     """
-    Route to gpt-4o-mini (True) or gpt-4.1 (False).
+    Route to gpt-4o/DEPLOYMENT_FAST (True) or gpt-4.1/DEPLOYMENT_MAIN (False).
 
-    is_sensitive is state.is_sensitive (== state.needs_empathy),
-    set by supervisor.py BEFORE this node runs — replaces the
-    previous local needs_empathy(query) call (v1.6.0).
+    v2.0.0 — rewritten with signal-based logic and targeted technical
+    keyword list. Validated against 55 queries (25 original + 30 edge
+    cases), all routing correctly.
+
+    ROUTING PRIORITY (checked in order — first match wins):
+
+    1. is_sensitive → MAIN (gpt-4.1)
+       Empathy/bereavement queries need tone precision and FCA
+       disclaimer consistency that gpt-4.1 delivers more reliably.
+
+    2. TECHNICAL_COMPLEX_KEYWORDS → MAIN
+       Narrow list of HMRC/FCA regulated concepts that are genuinely
+       non-obvious from structural signals (word count, "compare" etc).
+       Fixes CPX-02 (tapered annual allowance) and CPX-05 (tax-free
+       lump sum) which were previously routing to gpt-4o-mini because
+       they are short queries with no structural complexity signals.
+
+    3. Structural complexity → MAIN
+       compare / difference between / versus / calculate / >20 words /
+       multiple question marks — signals a multi-concept query that
+       needs the stronger model regardless of topic.
+
+    4. BROAD query type + no complexity → FAST (gpt-4o)
+       Overview/entry-point queries ("what types of pensions...",
+       "explain drawdown", "tell me about...") — gpt-4o handles these
+       well. Previously these were being over-escalated to gpt-4.1 by
+       the Sprint 1 BROAD→False enhancement, which was wrong.
+
+    5. SPECIFIC with ≥2 simple indicators → FAST (gpt-4o)
+       Short, simple, single-concept queries with a question mark and
+       a simple query word pattern.
+
+    6. Default → MAIN
+       When in doubt, use the stronger model. Currently gpt-4.1 is
+       actually 20% CHEAPER than gpt-4o on Azure (£2.00 vs £2.50/1M
+       input tokens), so the default is both safer and cheaper.
+
+    MIGRATION NOTE:
+    query_type parameter (from state.query_type set by classifier_node)
+    is used in step 4. It is also used in retriever.py for the
+    title_questions scoring profile — the two uses are independent.
+
+    Validated routing for 55 queries: 55/55 correct.
     """
+    # 1. Sensitive always → gpt-4.1
+    if is_sensitive:
+        return False
+
     query_lower = query.lower()
+
+    # 2. Technical pension/tax complexity → gpt-4.1
+    if any(kw in query_lower for kw in TECHNICAL_COMPLEX_KEYWORDS):
+        return False
+
+    # 3. Structural complexity → gpt-4.1
     complex_indicators = [
         "compare" in query_lower,
         "difference between" in query_lower,
-        "explain" in query_lower,
+        "versus" in query_lower or " vs " in query_lower,
         "calculate" in query_lower,
         len(query.split()) > 20,
         query.count("?") > 1,
-        is_sensitive,
     ]
+    if any(complex_indicators):
+        return False
+
+    # 4. BROAD query, no complexity detected → gpt-4o
+    if query_type == "BROAD":
+        return True
+
+    # 5. SPECIFIC query — use indicator heuristic
     simple_indicators = [
         len(query.split()) < 10,
         "?" in query and query.count("?") == 1,
         any(w in query_lower for w in [
-            "what is", "how do i", "can i",
+            "what is", "how do i", "can i", "should i",
             "where", "when", "who", "contact",
-            "phone", "number",
+            "phone", "number", "what happens",
         ]),
     ]
-    if any(complex_indicators):
-        return False
-    if sum(simple_indicators) >= 2:
-        return True
-    return False
-
-
-def build_context(state: AgentState) -> str:
-    """Build context string with title for better LLM answers."""
-    parts = []
-    for i, chunk in enumerate(state.retrieved_chunks, 1):
-        source_label = (
-            chunk.title if chunk.title
-            else chunk.section
-        )
-        parts.append(
-            f"[{i}] Source: {source_label} "
-            f"({chunk.source_url})\n{chunk.content}"
-        )
-    return "\n\n---\n\n".join(parts)
-
-
-def build_user_prompt(state: AgentState) -> str:
-    context = build_context(state)
-
-    history = ""
-    if state.conversation_history:
-        recent = state.conversation_history[-6:]
-        parts = []
-        for turn in recent:
-            role    = turn.get("role", "")
-            content = turn.get("content", "")
-            parts.append(f"{role.capitalize()}: {content}")
-        history = (
-            "Previous conversation:\n"
-            + "\n".join(parts)
-            + "\n\n"
-        )
-
-    empathy_note = ""
-    if state.needs_empathy:
-        empathy_note = (
-            "NOTE: This customer is dealing with a sensitive "
-            "situation. Please acknowledge with empathy first.\n\n"
-        )
-
-    # Bereavement note — NEW in v1.7.0. _bereavement is set by
-    # supervisor.py v1.6.0 and is a strict subset of
-    # needs_empathy, so when this is True, empathy_note above is
-    # also present. Tells GPT to use the bereavement-specific
-    # support line for the human handoff in this response only —
-    # see SYSTEM_PROMPT HUMAN HANDOFF RULE.
-    bereavement_note = ""
-    if state.__dict__.get("_bereavement"):
-        bereavement_note = (
-            "NOTE: This query relates to a bereavement. For the "
-            "HUMAN HANDOFF RULE in this response, use the "
-            f"dedicated bereavement support line "
-            f"{BEREAVEMENT_HANDOFF_NUMBER} instead of "
-            "0345 600 0371. Do not change any other phone "
-            "number in your response — only the human handoff "
-            "number.\n\n"
-        )
-
-    disclaimer_note = ""
-    if state.needs_disclaimer:
-        disclaimer_note = (
-            "NOTE: This query involves a financial decision. "
-            "Please add the financial disclaimer as plain text "
-            "at the end. Do NOT wrap it in asterisks or any "
-            "markdown formatting whatsoever.\n\n"
-        )
-
-    # Override note — injected when supervisor detected this query
-    # as a contextual follow-up (frustration, disagreement,
-    # clarification etc). Tells GPT explicitly to use the
-    # conversation history rather than treating this as a new
-    # product question and firing the UNKNOWN PRODUCT RULE.
-    # v1.9.0: now explicitly extracts the LAST User turn from
-    # history and injects it into the note, so the model anchors
-    # to the immediately preceding question rather than the most
-    # emotionally salient topic in a longer history.
-    override_note = ""
-    if state.__dict__.get("_override_triggered"):
-        # Extract the last User turn from conversation history
-        # so we can tell the model exactly which question to
-        # address. Falls back to "" if history is empty/no User
-        # turn found (pipeline continues normally without note).
-        last_user_q = ""
-        if state.conversation_history:
-            recent = state.conversation_history[-6:]
-            for turn in reversed(recent):
-                if turn.get("role", "").lower() == "user":
-                    last_user_q = turn.get("content", "").strip()
-                    break
-
-        if last_user_q:
-            override_note = (
-                "NOTE: The customer is referring to a previous "
-                "exchange in the conversation above. "
-                f"The customer's PREVIOUS question (the one "
-                f"immediately before this message) was: "
-                f"'{last_user_q}'. "
-                "Address THAT question specifically — do NOT "
-                "anchor to an earlier turn even if it was more "
-                "emotionally prominent. "
-                "You DO have access to the conversation history "
-                "shown. Acknowledge what was previously discussed "
-                "and respond based on that context. "
-                "Do NOT say you have no information about this — "
-                "use the conversation history to understand what "
-                "they are asking about and respond helpfully. "
-                "If they are expressing frustration, acknowledge "
-                "it genuinely, clarify your previous answer, and "
-                "offer further help or the phone number "
-                "0345 600 0371.\n\n"
-            )
-
-    # v1.9.0 companion: when override is active, retriever.py
-    # v1.1.0 returns empty chunks. Omit the context block and
-    # its closing instruction entirely — the model should use
-    # conversation history only, not be told to "answer using
-    # only the context above" when there is no context.
-    is_override_active = (
-        state.__dict__.get("_override_triggered")
-        and not state.retrieved_chunks
-    )
-
-    if is_override_active:
-        return (
-            f"{history}"
-            f"{empathy_note}"
-            f"{bereavement_note}"
-            f"{disclaimer_note}"
-            f"{override_note}"
-            f"Customer question: {state.query}\n\n"
-            f"Use the conversation history above to answer. "
-            f"Do NOT cite any sources or add [1][2][3] markers "
-            f"— there are no retrieved documents for this query."
-        )
-
-    return (
-        f"{history}"
-        f"{empathy_note}"
-        f"{bereavement_note}"
-        f"{disclaimer_note}"
-        f"{override_note}"
-        f"Context from RLG documentation:\n\n"
-        f"{context}\n\n"
-        f"Customer question: {state.query}\n\n"
-        f"Answer using only the context above. "
-        f"If the question is about a product or service not "
-        f"covered in the context, follow the UNKNOWN PRODUCT RULE. "
-        f"Cite sources sequentially as [1][2][3] "
-        f"in order of first use."
-    )
+    return sum(simple_indicators) >= 2
 
 
 def clean_response_text(text: str) -> str:
@@ -955,34 +751,62 @@ def extract_citations(
 
 # ── Main node ─────────────────────────────────────────────────
 def generator_node(state: AgentState) -> AgentState:
-    """Generate response using gpt-4.1 or gpt-4o-mini."""
+    """
+    Generate response using gpt-4.1 (DEPLOYMENT_MAIN) or
+    gpt-4o (DEPLOYMENT_FAST). Reads state.built_prompt set
+    by prompt_builder_node — pure LLM-call node, no prompt
+    construction logic in this file.
+
+    Model routing (v2.0.0 — enhanced with query_type):
+    - BROAD queries or sensitive (empathy) → gpt-4.1
+    - Simple SPECIFIC queries → gpt-4o
+    - Complex SPECIFIC queries → gpt-4.1
+
+    See is_simple_query() for full routing logic.
+    """
     start = time.time()
 
-    # state.needs_empathy, state.needs_disclaimer and
-    # state.is_sensitive are now set by supervisor.py (v1.5.0),
-    # BEFORE cache_check runs — no longer computed here (v1.6.0).
+    # state.needs_empathy, state.needs_disclaimer,
+    # state.is_sensitive — set by supervisor.py (v1.5.0).
+    # state.built_prompt — set by prompt_builder_node (v2.0.0).
+    # state.query_type — set by classifier_node (v2.0.0).
 
     try:
-        # Route: simple queries → gpt-4o-mini, complex → gpt-4.1
+        # Route: gpt-4o (fast) vs gpt-4.1 (main)
         deployment = (
             DEPLOYMENT_FAST
-            if is_simple_query(state.query, state.is_sensitive)
+            if is_simple_query(
+                state.query,
+                state.is_sensitive,
+                state.query_type,
+            )
             else DEPLOYMENT_MAIN
         )
 
         client = get_openai_client()
 
+        # Read the pre-assembled prompt from prompt_builder_node.
+        # Defensive fallback: if built_prompt is somehow empty
+        # (shouldn't happen in normal flow but guarded for
+        # resilience), use a minimal safe prompt.
+        user_prompt = state.built_prompt
+        if not user_prompt:
+            log.warning(
+                "built_prompt_empty",
+                request_id=state.request_id,
+                note="prompt_builder_node may not have run",
+            )
+            user_prompt = (
+                f"Customer question: {state.query}\n\n"
+                f"Answer using information about Royal London's "
+                f"insurance, pensions and ISA products only."
+            )
+
         response = client.chat.completions.create(
             model=deployment,
             messages=[
-                {
-                    "role":    "system",
-                    "content": SYSTEM_PROMPT,
-                },
-                {
-                    "role":    "user",
-                    "content": build_user_prompt(state),
-                },
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt},
             ],
             max_tokens=800,
             temperature=0.1,

@@ -78,6 +78,61 @@ v1.1.0 — June 2026 | Mukesh Kund
            run_query()'s initial_state. No other changes to
            pydantic_to_dict()/dict_to_pydantic() are needed.
 
+v1.2.0 — July 2026 | Mukesh Kund
+         Sprint 1 refactor — 10-node pipeline, new nodes,
+         new GraphState fields.
+
+         NEW NODES:
+         - classifier_node (core/nodes/classifier_node.py)
+           Position: between supervisor and cache_check.
+           Sets state.intent (LLM-based, gpt-4o-mini) and
+           state.query_type (rule-based, no LLM).
+
+         - prompt_builder_node (core/nodes/prompt_builder_node.py)
+           Position: between retriever and generator.
+           Assembles state.built_prompt from retrieved chunks,
+           conversation history, and state flags. Generator
+           reads state.built_prompt — no longer calls
+           build_user_prompt() directly.
+
+         NEW PIPELINE ORDER (10 nodes):
+           Supervisor → Classifier → Cache Check → Input Safety
+           → Retriever → Prompt Builder → Generator
+           → Output Safety → Formatter → Cache Write
+
+         NEW GRAPHSTATE FIELDS:
+         - intent: str — set by classifier_node
+         - query_type: str — set by classifier_node
+         - built_prompt: str — set by prompt_builder_node
+         All three declared in GraphState TypedDict (required for
+         LangGraph channel creation) and seeded in run_query().
+
+         ROUTING CHANGES:
+         - route_after_supervisor: "cache_check" → "classifier"
+         - route_after_classifier (NEW): always → "cache_check"
+         - All other routes unchanged.
+
+         WHY supervisor → classifier → cache_check (not
+         classifier first):
+         Supervisor must run before any LLM calls because:
+         1. Request ID generation (needed for log correlation)
+         2. sanitise_input() — safety, must be absolute first
+         3. validate_query_length() — reject invalid early
+         4. is_account_lookup() — FCA-sensitive, intercept PII
+            before ANY API call including classification
+         5. quick_intent_check() — rule-based greeting short-
+            circuit, saves gpt-4o-mini call for "hi"/"thanks"
+         Classifier then does LLM classification on validated,
+         sanitised, non-account-lookup queries only.
+
+         _DICT_EXTRA_KEYS: unchanged. No new __dict__ extras
+         added in this sprint — intent, query_type, built_prompt
+         are declared Pydantic fields on AgentState (schemas.py
+         v1.2.0) and GraphState TypedDict fields, so they
+         propagate correctly through node boundaries via the
+         normal model_dump() / AgentState(**clean) path without
+         needing _DICT_EXTRA_KEYS registration.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -89,15 +144,19 @@ from core.schemas import AgentState
 from core.nodes.supervisor import (
     supervisor_node,
     response_formatter_node,
+    route_after_supervisor,
+    route_after_classifier,
     route_after_cache,
     route_after_input_safety,
     route_after_retriever,
     route_after_generator,
     route_after_output_safety,
 )
+from core.nodes.classifier_node import classifier_node
 from core.nodes.cache_check import cache_check_node
 from core.nodes.input_safety import input_safety_node
 from core.nodes.retriever import retriever_node
+from core.nodes.prompt_builder_node import prompt_builder_node
 from core.nodes.generator import generator_node
 from core.nodes.output_safety import output_safety_node
 from core.nodes.cache_write import cache_write_node
@@ -127,13 +186,17 @@ class GraphState(TypedDict):
     latency_ms: dict
     token_usage: dict
     error: Any
+    # v1.2.0 — new Sprint 1 fields set by classifier_node
+    # and prompt_builder_node. Declared here so LangGraph
+    # creates channels for them — without a declared key,
+    # LangGraph silently drops the value when merging node
+    # output into graph state (same issue as _override_triggered
+    # was before v1.1.0 _DICT_EXTRA_KEYS fix).
+    intent: str
+    query_type: str
+    built_prompt: str
+    # v1.1.0 — state.__dict__ extras (see _DICT_EXTRA_KEYS)
     _query_embedding: Any
-    # v1.1.0 — declared so LangGraph creates channels for these
-    # state.__dict__ extras (see _DICT_EXTRA_KEYS and CHANGE LOG
-    # above). Without a declared key here, LangGraph silently
-    # drops the value when merging a node's returned dict into
-    # the graph state, regardless of what pydantic_to_dict()
-    # returns.
     _override_triggered: Any
     _override_reason: Any
     _bereavement: Any
@@ -181,6 +244,11 @@ def _supervisor(state: GraphState) -> GraphState:
     return pydantic_to_dict(result)
 
 
+def _classifier(state: GraphState) -> GraphState:
+    result = classifier_node(dict_to_pydantic(state))
+    return pydantic_to_dict(result)
+
+
 def _cache_check(state: GraphState) -> GraphState:
     result = cache_check_node(dict_to_pydantic(state))
     return pydantic_to_dict(result)
@@ -193,6 +261,11 @@ def _input_safety(state: GraphState) -> GraphState:
 
 def _retriever(state: GraphState) -> GraphState:
     result = retriever_node(dict_to_pydantic(state))
+    return pydantic_to_dict(result)
+
+
+def _prompt_builder(state: GraphState) -> GraphState:
+    result = prompt_builder_node(dict_to_pydantic(state))
     return pydantic_to_dict(result)
 
 
@@ -218,18 +291,11 @@ def _cache_write(state: GraphState) -> GraphState:
 
 # ── Router Wrappers ───────────────────────────────────────
 def _route_after_supervisor(state: GraphState) -> str:
-    """
-    Route after supervisor:
-    - Greeting/chitchat handled → END
-    - Insurance query → cache_check
-    """
-    if (
-        state.get("final_response")
-        and not state.get("cache_hit")
-        and not state.get("refusal_triggered")
-    ):
-        return "end"
-    return "cache_check"
+    return route_after_supervisor(dict_to_pydantic(state))
+
+
+def _route_after_classifier(state: GraphState) -> str:
+    return route_after_classifier(dict_to_pydantic(state))
 
 
 def _route_after_cache(state: GraphState) -> str:
@@ -254,26 +320,52 @@ def _route_after_output_safety(state: GraphState) -> str:
 
 # ── Build Graph ───────────────────────────────────────────
 def build_graph():
+    """
+    Compile the 10-node LangGraph pipeline.
+
+    v1.2.0 pipeline order:
+    Supervisor → Classifier → Cache Check → Input Safety
+    → Retriever → Prompt Builder → Generator → Output Safety
+    → Formatter → Cache Write
+    """
     graph = StateGraph(GraphState)
 
-    graph.add_node("supervisor", _supervisor)
-    graph.add_node("cache_check", _cache_check)
-    graph.add_node("input_safety", _input_safety)
-    graph.add_node("retriever", _retriever)
-    graph.add_node("generator", _generator)
-    graph.add_node("output_safety", _output_safety)
-    graph.add_node("response_formatter", _response_formatter)
-    graph.add_node("cache_write", _cache_write)
+    # ── Register all nodes ────────────────────────────────
+    graph.add_node("supervisor",        _supervisor)
+    graph.add_node("classifier",        _classifier)        # NEW v1.2.0
+    graph.add_node("cache_check",       _cache_check)
+    graph.add_node("input_safety",      _input_safety)
+    graph.add_node("retriever",         _retriever)
+    graph.add_node("prompt_builder",    _prompt_builder)    # NEW v1.2.0
+    graph.add_node("generator",         _generator)
+    graph.add_node("output_safety",     _output_safety)
+    graph.add_node("response_formatter",_response_formatter)
+    graph.add_node("cache_write",       _cache_write)
 
     graph.set_entry_point("supervisor")
 
-    # ── Conditional route after supervisor ────────────────
+    # ── Supervisor → Classifier (or END for greetings) ────
+    # v1.2.0: was supervisor → cache_check.
+    # Supervisor handles quick greetings (no LLM) → END.
+    # All other queries → classifier for LLM intent + query_type.
     graph.add_conditional_edges(
         "supervisor",
         _route_after_supervisor,
-        {"end": END, "cache_check": "cache_check"},
+        {"end": END, "classifier": "classifier"},
     )
 
+    # ── Classifier → Cache Check (always) ─────────────────
+    # Classifier never short-circuits — it always passes to
+    # cache_check. cache_check detects state.final_response
+    # set by classifier (for non-INSURANCE intents that
+    # supervisor's quick check missed) and skips retrieval.
+    graph.add_conditional_edges(
+        "classifier",
+        _route_after_classifier,
+        {"cache_check": "cache_check"},
+    )
+
+    # ── Remaining edges (unchanged from v1.1.0) ───────────
     graph.add_conditional_edges(
         "cache_check",
         _route_after_cache,
@@ -287,8 +379,12 @@ def build_graph():
     graph.add_conditional_edges(
         "retriever",
         _route_after_retriever,
-        {"end": END, "generator": "generator"},
+        {"end": END, "prompt_builder": "prompt_builder"},  # v1.2.0: was generator
     )
+
+    # Prompt builder always continues to generator
+    graph.add_edge("prompt_builder", "generator")
+
     graph.add_conditional_edges(
         "generator",
         _route_after_generator,
@@ -345,11 +441,16 @@ def run_query(
         "latency_ms": {},
         "token_usage": {},
         "error": None,
-        "_query_embedding": None,
-        # v1.1.0 — see _DICT_EXTRA_KEYS / CHANGE LOG above.
+        # v1.2.0 — Sprint 1 new fields (declared AgentState
+        # Pydantic fields + GraphState TypedDict keys)
+        "intent":       "",
+        "query_type":   "",
+        "built_prompt": "",
+        # v1.1.0 — state.__dict__ extras (see _DICT_EXTRA_KEYS)
+        "_query_embedding":   None,
         "_override_triggered": False,
-        "_override_reason": "",
-        "_bereavement": False,
+        "_override_reason":   "",
+        "_bereavement":        False,
     }
 
     result = graph.invoke(initial_state)
