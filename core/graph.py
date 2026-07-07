@@ -200,6 +200,7 @@ class GraphState(TypedDict):
     _override_triggered: Any
     _override_reason: Any
     _bereavement: Any
+    _skip_cache: Any      # v1.2.0 — set by supervisor for recommendation queries
 
 
 # v1.1.0 — single-underscore state.__dict__ extras that must
@@ -214,6 +215,7 @@ _DICT_EXTRA_KEYS = (
     "_override_triggered",
     "_override_reason",
     "_bereavement",
+    "_skip_cache",       # v1.2.0 — recommendation query cache bypass
 )
 
 
@@ -451,6 +453,7 @@ def run_query(
         "_override_triggered": False,
         "_override_reason":   "",
         "_bereavement":        False,
+        "_skip_cache":         False,   # v1.2.0 — recommendation cache bypass
     }
 
     result = graph.invoke(initial_state)

@@ -487,6 +487,24 @@ def cache_check_node(state: AgentState) -> AgentState:
             )
             return state
 
+        # v1.6.0: skip cache for recommendation queries.
+        # supervisor.py sets _skip_cache=True when the query
+        # matches RECOMMENDATION_TRIGGERS. Without this, a cached
+        # factual response (e.g. pension types) could be served
+        # instead of the RECOMMENDATION_RESPONSE refusal — an FCA
+        # Consumer Duty compliance failure. All cache stages
+        # (direct lookup + canonical rewrite) are bypassed.
+        if state.__dict__.get("_skip_cache", False):
+            latency = (time.time() - start) * 1000
+            state.latency_ms["cache_check"] = latency
+            state.cache_hit = False
+            log.info(
+                "cache_check_skipped",
+                reason="recommendation_query_fca_bypass",
+                query=state.query[:50],
+            )
+            return state
+
         # ── Step 2: First cache check ─────────────────────
         cached = cache.get(embedding)
 

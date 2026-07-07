@@ -383,14 +383,50 @@ BEREAVEMENT_TRIGGERS = [
 
 def is_bereavement(query: str) -> bool:
     """
-    NEW in v1.6.0. Detects genuine bereavement language so
-    generator.py can inject the bereavement-specific handoff
-    number (0370 850 2179) instead of the general number
-    (0345 600 0371). See BEREAVEMENT_TRIGGERS comment above for
-    why this is a strict subset of EMPATHY_TRIGGERS.
+    Detects genuine bereavement language.
+    Used in build_user_prompt() to direct customer to the
+    bereavement page URL (v1.8.0: changed from phone number
+    to URL — bereavement numbers vary by policy type).
     """
     query_lower = query.lower()
     return any(t in query_lower for t in BEREAVEMENT_TRIGGERS)
+
+
+# ── Recommendation Detection ──────────────────────────────────
+# Queries asking for personal financial recommendations MUST
+# bypass the semantic cache. Without this, the cache may serve
+# a cached factual response (e.g. pension types) instead of the
+# required RECOMMENDATION_RESPONSE refusal — an FCA Consumer
+# Duty compliance failure.
+# _skip_cache=True is read by cache_check_node v1.6.0 which
+# skips all cache stages (direct lookup + canonical rewrite).
+RECOMMENDATION_TRIGGERS = [
+    "recommend", "recommendation", "recommendations",
+    "suggest", "suggestion",
+    "what should i", "which should i",
+    "which is better for me", "what would you",
+    "which one should", "what do you think i should",
+    "advise me", "best for me", "best option for me",
+    "what do you recommend", "which do you recommend",
+    "should i choose", "help me decide", "help me choose",
+    "which is best", "what is best for me",
+]
+
+
+def is_recommendation_query(query: str) -> bool:
+    """
+    v1.8.0 — Detects queries asking for personal financial
+    recommendations. Sets state.__dict__['_skip_cache'] = True
+    so cache_check_node bypasses the semantic cache entirely.
+
+    FCA Consumer Duty: Aria must never make personal financial
+    recommendations. Cache contamination where a semantically
+    similar factual query hits the cache and returns pension
+    information instead of the RECOMMENDATION_RESPONSE refusal
+    is an FCA compliance breach.
+    """
+    q = query.lower()
+    return any(trigger in q for trigger in RECOMMENDATION_TRIGGERS)
 
 
 # ── Account Lookup Detection ──────────────────────────────────
@@ -695,6 +731,11 @@ def supervisor_node(state: AgentState) -> AgentState:
     _bereavement = is_bereavement(state.query)
     state.__dict__["_bereavement"] = _bereavement
 
+    # v1.8.0: recommendation queries must bypass the semantic
+    # cache entirely — see is_recommendation_query() above.
+    _skip_cache = is_recommendation_query(state.query)
+    state.__dict__["_skip_cache"] = _skip_cache
+
     masked_query = mask_pii_for_logging(state.query)
     log.info(
         "supervisor_complete",
@@ -751,16 +792,9 @@ def route_after_input_safety(state: AgentState) -> str:
 
 
 def route_after_retriever(state: AgentState) -> str:
-    """
-    Route after retriever:
-    - No results / refusal triggered → END
-    - Retrieved chunks → prompt_builder (v1.2.0: was generator)
-      prompt_builder_node assembles state.built_prompt from
-      retrieved chunks before generator_node runs.
-    """
     if state.refusal_triggered:
         return "end"
-    return "prompt_builder"
+    return "generator"
 
 
 def route_after_generator(state: AgentState) -> str:

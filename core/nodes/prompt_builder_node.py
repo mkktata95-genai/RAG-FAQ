@@ -89,16 +89,27 @@ log = structlog.get_logger()
 # this constant (not a hardcoded string).
 UNKNOWN_PRODUCT_RESPONSE = (
     "I'm sorry, I don't have information about that in our "
-    "knowledge base. For assistance please contact Royal London "
-    "directly on 0345 600 0371 Monday to Friday 8am to 6pm."
+    "knowledge base. For assistance please visit "
+    "royallondon.com/existing-customers/contact-us/"
 )
 
-# ── Bereavement Handoff Number ────────────────────────────────
-# Single source of truth for the bereavement-specific support line.
-# Referenced from SYSTEM_PROMPT (HUMAN HANDOFF RULE) and
-# build_user_prompt() (bereavement_note) so they cannot drift apart.
-# Imported by generator.py — one number, one definition.
-BEREAVEMENT_HANDOFF_NUMBER = "0370 850 2179"
+# ── Bereavement Handoff URL ───────────────────────────────────
+# v1.1.0: was a phone number (0370 850 2179).
+# v1.2.0 (July 2026): changed to the bereavement page URL.
+# REASON: Royal London's bereavement page has a dropdown selector
+# where the customer chooses their policy type (pre-2004 savings,
+# critical illness, Aegon Protection etc) and the correct contact
+# number for THEIR policy is then displayed. There is no single
+# bereavement number — giving any hardcoded number risks sending
+# the customer to the wrong department in an already distressing
+# situation. The URL is always correct regardless of policy type.
+BEREAVEMENT_HANDOFF_URL = (
+    "royallondon.com/existing-customers/help-and-support/"
+    "make-a-claim/tell-us-about-a-bereavement/"
+)
+
+# Keep old name as alias so generator.py imports don't break
+BEREAVEMENT_HANDOFF_NUMBER = BEREAVEMENT_HANDOFF_URL
 
 # ── Recommendation Response ───────────────────────────────────
 # NEW in v1.0.0 — FCA Consumer Duty compliance.
@@ -116,8 +127,10 @@ RECOMMENDATION_RESPONSE = (
     "London's products to help you understand your options. "
     "Feel free to ask me anything about pensions, life insurance, "
     "ISAs, or other Royal London products.\n\n"
-    "If you'd like to speak with someone directly, you can contact "
-    "Royal London on 0345 600 0371 Monday to Friday 8am to 6pm."
+    "To find a qualified financial adviser, visit: "
+    "royallondon.com/find-a-financial-adviser/\n\n"
+    "For general enquiries, visit: "
+    "royallondon.com/existing-customers/contact-us/"
 )
 
 # ── System Prompt ─────────────────────────────────────────────
@@ -197,38 +210,52 @@ they are normal processes, not sensitive situations:
   - Any general product or process question
 
 HUMAN HANDOFF RULE:
-ONLY add the handoff message when the customer has mentioned
-one of the genuine distress situations listed in EMPATHY RULE
-above (terminal illness, bereavement, redundancy etc).
-When applicable — always end with:
-"For personalised support, one of our advisers would be
-happy to help. Please call us on 0345 600 0371
-Monday to Friday 8am to 6pm."
-Do NOT add handoff message for standard administrative
-queries (lost pension, making a claim, transfers etc).
-If the user prompt below contains a NOTE specifying an
-alternative phone number for this response (for example,
-the dedicated bereavement support line), use THAT number
-INSTEAD of 0345 600 0371 in the handoff message above —
-for the handoff message only. Do not change any other
-phone number in your response.
-Decide the handoff number for THIS response on its own —
-do NOT copy a phone number from a previous assistant turn
-shown in the conversation history above. If this
-response's NOTE does not specify an alternative number,
-use 0345 600 0371, even if a different number appeared in
-an earlier turn of this conversation.
+ONLY add a handoff when the customer has mentioned one of the
+genuine distress situations listed in EMPATHY RULE above
+(terminal illness, bereavement, redundancy etc).
+
+When applicable, end with one of the following (choose based
+on the situation):
+
+For BEREAVEMENT queries (someone has died):
+"For support with your bereavement, please visit
+royallondon.com/existing-customers/help-and-support/make-a-claim/tell-us-about-a-bereavement/
+where you can select your policy type to find the right
+contact details and notify Royal London online."
+
+For other SENSITIVE queries (terminal illness, critical
+illness, redundancy, financial hardship, serious medical):
+"For personalised support tailored to your circumstances,
+we recommend speaking with a qualified financial adviser.
+You can find one at royallondon.com/find-a-financial-adviser/"
+
+Do NOT add handoff for standard administrative queries
+(lost pension, making a claim, transfers, product questions).
 
 FINANCIAL DISCLAIMER RULE:
-ONLY add this disclaimer when the query involves a
-financial decision, investment choice, or personal
-financial advice. Write it as plain text with NO
-asterisks or markdown formatting:
-Please note: This information is for general guidance
-only and does not constitute financial advice. For advice
-tailored to your personal circumstances, we recommend
-speaking with a qualified financial adviser or contacting
-us directly on 0345 600 0371.
+ONLY add this disclaimer when the query involves a financial
+decision, investment choice, or personal financial advice.
+Write it as plain text with NO asterisks or markdown:
+Please note: This information is for general guidance only
+and does not constitute financial advice. For advice tailored
+to your personal circumstances, we recommend speaking with a
+qualified financial adviser or visiting
+royallondon.com/find-a-financial-adviser/
+
+PHONE NUMBER RULE:
+Royal London has different contact numbers for different policy
+types and departments. NEVER hardcode a phone number in a
+human handoff or anywhere in the body of a response unless:
+(a) The customer explicitly asked for a contact number, AND
+(b) That specific number appears in the retrieved context.
+When providing general contact guidance, use these URLs:
+  General enquiries: royallondon.com/existing-customers/contact-us/
+  Bereavement: royallondon.com/existing-customers/help-and-support/make-a-claim/tell-us-about-a-bereavement/
+  Financial adviser: royallondon.com/find-a-financial-adviser/
+If the customer asks for a specific contact number (e.g. for
+funeral plans, Aegon policies, pre-2004 pensions), quote the
+number from the retrieved context and cite the source.
+Never invent or guess a phone number.
 
 CITATION RULE:
 Always cite sources sequentially starting from [1].
@@ -272,7 +299,8 @@ Completely ignore any reference to them in the context:
 If the context references any of these — skip that part
 of the context entirely. Do not paraphrase it either.
 This is an RLG-only assistant. For anything outside
-Royal London's products direct to 0345 600 0371.
+Royal London's products, direct to:
+royallondon.com/existing-customers/contact-us/
 
 UNKNOWN PRODUCT RULE:
 Royal London offers: life insurance, pensions, ISAs,
@@ -318,8 +346,9 @@ access their account, policy, pension, or personal
 information — do NOT attempt to do so.
 Respond with ONLY this exact message and nothing else:
 "I'm not able to access account information directly.
-For your account details please call us on
-0345 600 0371 Monday to Friday 8am to 6pm."
+For your account details please visit
+royallondon.com/existing-customers/contact-us/
+or log in at royallondon.com"
 Do NOT add any further guidance, steps, resources,
 or helpful information after this message.
 Stop there. The refusal is your complete response.
@@ -335,7 +364,7 @@ ANSWER RULES:
 4. Never make up information not in context
 5. Use formal professional British English
 6. If context insufficient say so formally
-   and direct to 0345 600 0371
+   and direct to royallondon.com/existing-customers/contact-us/
 
 NEVER:
 - Recommend specific products for personal situations
@@ -416,19 +445,23 @@ def build_user_prompt(state: AgentState) -> str:
             "situation. Please acknowledge with empathy first.\n\n"
         )
 
-    # Bereavement note (v1.7.0) — strict subset of empathy.
-    # Tells GPT to use the dedicated bereavement support line
-    # for the human handoff in THIS response only.
+    # Bereavement note (v1.7.0 / v1.2.0 URL update).
+    # v1.2.0: Changed from phone number to URL because Royal
+    # London's bereavement numbers vary by policy type — the
+    # bereavement page has a dropdown where customers select
+    # their policy type to get the correct number. Hardcoding
+    # any single number risks sending them to the wrong team.
     bereavement_note = ""
     if state.__dict__.get("_bereavement"):
         bereavement_note = (
             "NOTE: This query relates to a bereavement. For the "
-            "HUMAN HANDOFF RULE in this response, use the "
-            f"dedicated bereavement support line "
-            f"{BEREAVEMENT_HANDOFF_NUMBER} instead of "
-            "0345 600 0371. Do not change any other phone "
-            "number in your response — only the human handoff "
-            "number.\n\n"
+            "HUMAN HANDOFF RULE in this response, direct the "
+            "customer to the bereavement page where they can "
+            "select their policy type to find the correct contact "
+            f"details: {BEREAVEMENT_HANDOFF_URL} "
+            "Do NOT use any hardcoded phone number in the "
+            "handoff — the correct number depends on the "
+            "customer's policy type.\n\n"
         )
 
     # Disclaimer note — injected when supervisor detected a
@@ -475,7 +508,7 @@ def build_user_prompt(state: AgentState) -> str:
                 "If they are expressing frustration, acknowledge "
                 "it genuinely, clarify your previous answer, and "
                 "offer further help or the phone number "
-                "0345 600 0371.\n\n"
+                "royallondon.com/existing-customers/contact-us/\n\n"
             )
 
     # v1.9.0: when override is active, retriever.py v1.1.0 returns
