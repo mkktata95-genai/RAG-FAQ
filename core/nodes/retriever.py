@@ -383,11 +383,29 @@ def retriever_node(state: AgentState) -> AgentState:
         # title_questions field and rl-retrieval-profile only
         # exist on v3+ indexes. On v2, remove both and retry once.
         # Both are removed in the same catch to avoid a second fail.
-        def _run_search(kwargs: dict) -> list:
-            return list(search_client.search(**kwargs))
+        # ── Execute search with v3 feature fallback ───────────
+        # get_answers() MUST be called on the SearchItemPaged object
+        # BEFORE converting to list() — the Azure SDK iterator is
+        # exhausted by list() and answers are no longer accessible
+        # afterward. This was the root cause of semantic answer
+        # extraction never working: list() was called first.
+        def _execute_search(kwargs: dict) -> tuple[list, list]:
+            """
+            Execute search and extract answers in one call.
+            Returns (results_list, raw_answers).
+            Must get answers before list() exhausts the iterator.
+            """
+            paged   = search_client.search(**kwargs)
+            answers = []
+            if kwargs.get("query_answer"):
+                try:
+                    answers = paged.get_answers() or []
+                except Exception:
+                    answers = []
+            return list(paged), answers
 
         try:
-            results = _run_search(search_kwargs)
+            results, raw_answers = _execute_search(search_kwargs)
         except Exception as e:
             err      = str(e)
             v3_error = (
@@ -408,13 +426,11 @@ def retriever_node(state: AgentState) -> AgentState:
                         "retrying with v2-compatible select and default scoring."
                     ),
                 )
-                results = _run_search(search_kwargs)
+                results, raw_answers = _execute_search(search_kwargs)
             else:
                 raise
 
         # ── Build chunk_id lookup for semantic answer matching ─
-        # Option 1: match @search.answers back to source chunk
-        # by chunk_id to get correct source_url for citations.
         chunk_by_key: dict[str, RetrievedChunk] = {}
         for r in results:
             cid = r.get("chunk_id", "")
@@ -432,13 +448,10 @@ def retriever_node(state: AgentState) -> AgentState:
                     score=s,
                 )
 
-        # ── Extract @search.answers ───────────────────────────
+        # ── Process @search.answers ───────────────────────────
+        # raw_answers already retrieved BEFORE list() above.
         semantic_answer_chunks: list[RetrievedChunk] = []
-        if use_semantic and results:
-            try:
-                raw_answers = results[0].get("@search.answers", []) or []
-            except Exception:
-                raw_answers = []
+        if use_semantic and raw_answers:
 
             for answer in raw_answers:
                 try:
