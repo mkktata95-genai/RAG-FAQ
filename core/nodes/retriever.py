@@ -337,36 +337,31 @@ def retriever_node(state: AgentState) -> AgentState:
             fields="embedding",
         )
 
-        # v1.2.0 — Use semantic ranker if configured.
-        # Semantic ranking is a two-stage process:
-        #   Stage 1: hybrid BM25+vector retrieves top-50
-        #   Stage 2: L2 transformer reranks those 50 by
-        #            actual query-answer relevance
-        # This fixes the "wrong chunk wins" problem where
-        # keyword-dense but irrelevant chunks (AGM pages,
-        # workplace pensions) outscored the correct answer.
         use_semantic = bool(SEMANTIC_CONFIG)
+        query_type   = state.query_type or "SPECIFIC"
+
+        # ── Select fields ─────────────────────────────────────
+        # BASE_SELECT works on v2 and v3 indexes.
+        # V3_SELECT adds title_questions (v3+ only).
+        # The except block falls back to BASE_SELECT if v3
+        # fields cause an InvalidRequestParameter error.
+        BASE_SELECT = [
+            "chunk_id", "content", "source_url", "section", "title",
+        ]
+        V3_SELECT = BASE_SELECT + ["title_questions"]
+
         search_kwargs = dict(
             search_text=state.query,
             vector_queries=[vector_query],
-            select=[
-                "chunk_id", "content", "source_url",
-                "section", "title",
-                "title_questions",  # v1.3.0 — for observability
-            ],
+            select=V3_SELECT,
             top=TOP_K * 3,
         )
         if use_semantic:
             search_kwargs["query_type"] = "semantic"
             search_kwargs["semantic_configuration_name"] = SEMANTIC_CONFIG
 
-        # v1.3.0: apply scoring profile only for BROAD queries.
-        # "rl-retrieval-profile" boosts title_questions (weight 5.0)
-        # which were generated specifically to match broad/overview
-        # entry-point queries. For SPECIFIC queries, the default
-        # Azure scoring is better — title_questions boost would
-        # distort specific-product results.
-        query_type = state.query_type or "SPECIFIC"
+        # v1.3.0: scoring profile for BROAD queries only.
+        # rl-retrieval-profile boosts title_questions on v3+.
         if query_type == "BROAD" and SEMANTIC_CONFIG:
             search_kwargs["scoring_profile"] = "rl-retrieval-profile"
             log.info(
@@ -375,23 +370,19 @@ def retriever_node(state: AgentState) -> AgentState:
                 query_type=query_type,
             )
 
-        # v1.4.0: Enable semantic answer extraction.
+        # v1.4.0: semantic answer extraction.
         # Azure extracts the best answer passage independently of
-        # chunk ranking — this is what Search Explorer shows as
-        # @search.answers with a confidence score (e.g. 0.97).
-        # We were ignoring these and relying on chunk ranking,
-        # which can be BM25-dominated by keyword-dense chunks.
-        # Using extracted answers as priority context means the
-        # generator sees the best passage FIRST — before any
-        # keyword-dense but lower-relevance chunks.
+        # chunk ranking — same as @search.answers in Search Explorer.
+        # Only fires with semantic ranker enabled.
         if use_semantic:
             search_kwargs["query_answer"]           = "extractive"
             search_kwargs["query_answer_count"]     = 3
             search_kwargs["query_answer_threshold"] = 0.7
 
-        # v1.3.1: graceful fallback for v3-only features.
+        # ── Execute search with v3 feature fallback ───────────
         # title_questions field and rl-retrieval-profile only
-        # exist on v3+ indexes. On v2, remove both and retry.
+        # exist on v3+ indexes. On v2, remove both and retry once.
+        # Both are removed in the same catch to avoid a second fail.
         def _run_search(kwargs: dict) -> list:
             return list(search_client.search(**kwargs))
 
@@ -400,7 +391,7 @@ def retriever_node(state: AgentState) -> AgentState:
         except Exception as e:
             err      = str(e)
             v3_error = (
-                "title_questions"         in err
+                "title_questions"          in err
                 or "UnknownScoringProfile" in err
                 or "scoringProfile"        in err
             )
@@ -421,9 +412,9 @@ def retriever_node(state: AgentState) -> AgentState:
             else:
                 raise
 
-        # ── Build chunk_id lookup for answer matching ─────────
-        # Option 1: match @search.answers back to their source
-        # chunk by chunk_id to get correct source_url for citations.
+        # ── Build chunk_id lookup for semantic answer matching ─
+        # Option 1: match @search.answers back to source chunk
+        # by chunk_id to get correct source_url for citations.
         chunk_by_key: dict[str, RetrievedChunk] = {}
         for r in results:
             cid = r.get("chunk_id", "")
@@ -444,12 +435,8 @@ def retriever_node(state: AgentState) -> AgentState:
         # ── Extract @search.answers ───────────────────────────
         semantic_answer_chunks: list[RetrievedChunk] = []
         if use_semantic and results:
-            # Answers are on the first result's attributes in
-            # the Azure SDK when using list() conversion.
-            raw_answers = []
             try:
-                first = results[0] if results else {}
-                raw_answers = first.get("@search.answers", []) or []
+                raw_answers = results[0].get("@search.answers", []) or []
             except Exception:
                 raw_answers = []
 
@@ -458,22 +445,17 @@ def retriever_node(state: AgentState) -> AgentState:
                     key   = getattr(answer, "key", None)
                     score = float(getattr(answer, "score", 0.0))
                     text  = getattr(answer, "text", "")
-
                     if not key or not text or score < 0.7:
                         continue
-
                     if key in chunk_by_key:
                         base = chunk_by_key[key]
-                        # Boost score so answer chunks sort before
-                        # regular chunks. Score * 10 ensures a
-                        # 0.97 answer outranks any 0-4 reranker score.
                         semantic_answer_chunks.append(RetrievedChunk(
                             chunk_id=key,
                             content=text,
                             source_url=base.source_url,
                             section=base.section,
                             title=base.title,
-                            score=score * 10,
+                            score=score * 10,  # ensure answers rank first
                         ))
                         log.info(
                             "semantic_answer_matched",
@@ -487,10 +469,9 @@ def retriever_node(state: AgentState) -> AgentState:
                         error=str(ae)[:60],
                     )
 
-        # ── Build candidate chunks from results ───────────────
-        # Deduplicate by URL. semantic_answer_chunks are prepended
-        # so they appear as positions 1-N before BM25/reranker chunks.
-        # Seed seen_urls with answer URLs first to prevent duplicates.
+        # ── Deduplicate and build candidate chunks ────────────
+        # Seed seen_urls with answer chunk URLs first to prevent
+        # duplicates when regular chunks overlap with answers.
         candidates = []
         seen_urls  = set()
         for ac in semantic_answer_chunks:
@@ -500,8 +481,6 @@ def retriever_node(state: AgentState) -> AgentState:
             if len(candidates) >= TOP_K * 3:
                 break
             url   = result["source_url"]
-            # v1.2.0 — prefer @search.rerankerScore (semantic)
-            # over @search.score (hybrid) when available.
             score = (
                 result.get("@search.rerankerScore")
                 or result.get("@search.score", 0.0)
@@ -518,16 +497,10 @@ def retriever_node(state: AgentState) -> AgentState:
                 seen_urls.add(url)
 
         # ── Relevance score filter ────────────────────────────
-        # v1.2.0: Use SEMANTIC_MIN_SCORE when semantic ranker
-        # is active (scores 0-4 scale), otherwise fall back to
-        # MIN_RELEVANCE_SCORE for hybrid scores (0-35 scale).
-        # This prevents hallucination when no relevant content
-        # exists for the query in our index.
         if candidates:
-            best_score     = max(c.score for c in candidates)
-            threshold      = (
-                SEMANTIC_MIN_SCORE
-                if use_semantic
+            best_score = max(c.score for c in candidates)
+            threshold  = (
+                SEMANTIC_MIN_SCORE if use_semantic
                 else MIN_RELEVANCE_SCORE
             )
             log.info(
@@ -537,7 +510,6 @@ def retriever_node(state: AgentState) -> AgentState:
                 candidates=len(candidates),
                 semantic=use_semantic,
             )
-
             if best_score < threshold:
                 log.warning(
                     "low_relevance_scores",
@@ -548,19 +520,15 @@ def retriever_node(state: AgentState) -> AgentState:
                 )
                 candidates = []
 
-        # Take top K from filtered candidates.
-        # Prepend semantic answer chunks (score*10, so always rank
-        # first) then fill remaining slots with regular chunks.
-        # Cap total at TOP_K so generator doesn't get too much context.
+        # ── Merge semantic answers + regular chunks ───────────
+        # Answers (score*10) always rank before regular chunks.
+        # Cap answers at 2 to leave room for supporting context.
         regular_chunks = candidates[:TOP_K]
-        if chunks and query_type == "BROAD":
+        if regular_chunks and query_type == "BROAD":
             regular_chunks = rerank_chunks(
                 regular_chunks, state.query, query_type
             )
 
-        # Merge: answers first, then regular (deduplicated by URL
-        # already — seen_urls was seeded with answer URLs above).
-        # Limit answer chunks to 2 max to leave room for context.
         answer_slots  = semantic_answer_chunks[:2]
         context_slots = regular_chunks[: max(1, TOP_K - len(answer_slots))]
         chunks        = answer_slots + context_slots
