@@ -106,11 +106,7 @@ CHANGE LOG
 v1.0.0 — Initial version
          crawl4ai scraping from customer Excel file.
          Saves output JSON to scraper/data/ locally.
-
-v2.0.0 — June 2026 | Mukesh Kund
-         Production readiness: Blob Storage + entry point
-
-         PRODUCTION GAP (pre v2.0.0):
+v2.0.0):
          - Scraper saved output JSON to local disk only.
          - Azure Function App has no persistent local disk.
          - Output JSON must go to Azure Blob Storage so
@@ -139,74 +135,6 @@ v2.0.0 — June 2026 | Mukesh Kund
          - Clean entry point for DevOps / Function App.
          - Returns structured result dict with stats.
          - TODO (DevOps): wrap in Function App trigger.
-
-v4.0.0 — July 2026 | Mukesh Kund
-         Production hardening: dotenv import fix, URL normalisation,
-         content_hash field.
-
-         CRITICAL BUG FIX — dotenv import missing:
-         find_dotenv() and load_dotenv() were called at module level
-         but neither was imported — NameError on startup.
-         Fixed: added from dotenv import load_dotenv, find_dotenv.
-         Also added override=True so .env always beats shell vars.
-
-         URL NORMALISATION — normalize_url() helper:
-         load_approved_pages() only stripped trailing slash + query.
-         No path lowercasing meant should-I vs should-i survived
-         deduplication as two separate URLs — double-indexing same
-         content. normalize_url() lowercases path only (domain kept).
-         Applied in load_approved_pages() (dedup key + stored URL)
-         and in scrape_page() output (defence-in-depth for redirects).
-
-         CONTENT HASH:
-         SHA-256 hash of page content added to scrape output.
-         Used by content_freshness.py (Sprint 2) to detect changed
-         pages without re-scraping all 350 URLs.
-
-v4.1.0 — July 2026 | Mukesh Kund
-         Live HTTP status check at scrape time.
-
-         ROOT CAUSE:
-         The Excel "status" column reflects verification-time status —
-         recorded when the Excel was last built, potentially weeks
-         before a scrape run. scrape_page() only checked
-         result.success from crawl4ai — but success=True just means
-         the browser loaded a page; a 404 error page still
-         "successfully" loads. result.status_code was never checked.
-
-         FIX:
-         scrape_page() now reads result.status_code after the
-         crawl4ai fetch. status_code >= 400 → page dropped and
-         logged as scrape_http_error with the actual code.
-         status_code is None (crawl4ai occasionally doesn't
-         populate it) → fails open, does not reject, so working
-         pages are never dropped over a missing field.
-
-v4.2.0 — July 2026 | Mukesh Kund
-         Header-based column detection — no hardcoded positions.
-
-         ROOT CAUSE:
-         load_approved_pages() assumed fixed column layout
-         (title=col B, url=col C, status=col E) from the internal
-         verification file. A customer-supplied Excel is not
-         guaranteed to match that layout. A URL-only file (2 columns)
-         would skip EVERY row due to `len(row) < 5` guard —
-         silently returning zero pages with no error.
-
-         FIX — detect columns by HEADER NAME (row 1):
-         URL_HEADERS    = {"url", "page url", "link", ...}
-         TITLE_HEADERS  = {"title", "page title", "name"}
-         STATUS_HEADERS = {"status", "status code", "http status"}
-         All matched case-insensitively. URL column REQUIRED —
-         raises ValueError with actual headers if not found.
-         Title and status are optional.
-
-         STATUS HANDLING:
-         Only skips on unambiguous dead signals (HTTP >= 400,
-         or words like dead/broken/removed). Blank, "200", "OK",
-         "Live", or unrecognised values are KEPT — ambiguity
-         defers to "keep it, let the live scrape decide".
-
 v3.0.0 — June 2026 | Mukesh Kund
          Rich metadata extraction — video detection, content type,
          product category, audience, publish date, thumbnail
@@ -262,7 +190,93 @@ v3.0.0 — June 2026 | Mukesh Kund
          - Now derived from URL: adviser.royallondon.com → "adviser",
            employer.royallondon.com → "employer", else → "customer".
          - Matches the audience derivation in extract_page_metadata().
+v4.0.0 — July 2026 | Mukesh Kund
+         Production hardening: dotenv import fix, URL normalisation,
+         content_hash field.
 
+         CRITICAL BUG FIX — dotenv import missing:
+         find_dotenv() and load_dotenv() were called at module level
+         but neither was imported — NameError on startup.
+         Fixed: added from dotenv import load_dotenv, find_dotenv.
+         Also added override=True so .env always beats shell vars.
+
+         URL NORMALISATION — normalize_url() helper:
+         load_approved_pages() only stripped trailing slash + query.
+         No path lowercasing meant should-I vs should-i survived
+         deduplication as two separate URLs — double-indexing same
+         content. normalize_url() lowercases path only (domain kept).
+         Applied in load_approved_pages() (dedup key + stored URL)
+         and in scrape_page() output (defence-in-depth for redirects).
+
+         CONTENT HASH:
+         SHA-256 hash of page content added to scrape output.
+         Used by content_freshness.py (Sprint 2) to detect changed
+         pages without re-scraping all 350 URLs.
+v4.1.0 — July 2026 | Mukesh Kund
+         Live HTTP status check at scrape time.
+
+         ROOT CAUSE:
+         The Excel "status" column reflects verification-time status —
+         recorded when the Excel was last built, potentially weeks
+         before a scrape run. scrape_page() only checked
+         result.success from crawl4ai — but success=True just means
+         the browser loaded a page; a 404 error page still
+         "successfully" loads. result.status_code was never checked.
+
+         FIX:
+         scrape_page() now reads result.status_code after the
+         crawl4ai fetch. status_code >= 400 → page dropped and
+         logged as scrape_http_error with the actual code.
+         status_code is None (crawl4ai occasionally doesn't
+         populate it) → fails open, does not reject, so working
+         pages are never dropped over a missing field.
+v4.2.0 — July 2026 | Mukesh Kund
+         Header-based column detection — no hardcoded positions.
+
+         ROOT CAUSE:
+         load_approved_pages() assumed fixed column layout
+         (title=col B, url=col C, status=col E) from the internal
+         verification file. A customer-supplied Excel is not
+         guaranteed to match that layout. A URL-only file (2 columns)
+         would skip EVERY row due to `len(row) < 5` guard —
+         silently returning zero pages with no error.
+
+         FIX — detect columns by HEADER NAME (row 1):
+         URL_HEADERS    = {"url", "page url", "link", ...}
+         TITLE_HEADERS  = {"title", "page title", "name"}
+         STATUS_HEADERS = {"status", "status code", "http status"}
+         All matched case-insensitively. URL column REQUIRED —
+         raises ValueError with actual headers if not found.
+         Title and status are optional.
+
+         STATUS HANDLING:
+         Only skips on unambiguous dead signals (HTTP >= 400,
+         or words like dead/broken/removed). Blank, "200", "OK",
+         "Live", or unrecognised values are KEPT — ambiguity
+         defers to "keep it, let the live scrape decide".
+v4.3.0 — July 2026 | Mukesh Kund
+         Excel Category column used as primary content_type source.
+
+         WHY:
+         - Customer supplies Category per URL (Brand/Guidance/Other/
+           Product/Tool) — more authoritative than URL-pattern inference.
+         - Previous code ignored the Category column entirely.
+
+         CHANGES:
+         - CATEGORY_HEADERS set added to column detection.
+         - map_excel_category_to_content_type() maps Excel values:
+             Brand    → article
+             Guidance → guide
+             Other    → article
+             Product  → article
+             Tool     → tool
+         - URL-pattern still wins for high-signal types (webinar,
+           video, faq, news) — a "Product" page on /webinars/ is
+           still correctly typed as "webinar".
+         - Fallback: if Category column absent or value unrecognised,
+           derive_content_type() (URL-pattern) used as before.
+         - No changes to chunk_and_index_hqaV3.py required —
+           content_type field already exists in the index schema.
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -485,42 +499,6 @@ def derive_audience_from_url(url: str) -> str:
     if "employer.royallondon.com" in url_lower or "/employer/" in url_lower:
         return "employer"
     return "customer"
-
-
-def derive_section(url: str) -> str:
-    """
-    Derive the top-level section from the URL path.
-
-    Extracts the first meaningful path segment after the domain,
-    skipping empty segments and known locale/language prefixes.
-
-    Examples:
-        royallondon.com/pensions/workplace-pensions/  → "pensions"
-        royallondon.com/existing-customers/contact-us/ → "existing-customers"
-        royallondon.com/life-insurance/               → "life-insurance"
-        royallondon.com/                              → "general"
-        adviser.royallondon.com/products/             → "products"
-
-    Falls back to "general" if no path segment is found.
-    """
-    try:
-        # Strip scheme
-        path = url.split("://", 1)[-1]
-        # Strip domain (everything up to first /)
-        if "/" in path:
-            path = path.split("/", 1)[1]
-        else:
-            return "general"
-        # Split into segments, skip empty strings
-        segments = [s for s in path.split("/") if s]
-        # Skip locale prefixes like "en", "en-gb"
-        locale_prefixes = {"en", "en-gb", "cy", "cy-gb"}
-        for seg in segments:
-            if seg.lower() not in locale_prefixes:
-                return seg.lower()
-        return "general"
-    except Exception:
-        return "general"
 
 
 def detect_video_from_html(html: str, url: str) -> bool:
@@ -820,9 +798,10 @@ def load_approved_pages(excel_path: str) -> list[dict]:
     # Sets of recognised header names (case-insensitive).
     # Adding new synonyms here is all that's needed if the
     # customer changes their column heading in future.
-    URL_HEADERS    = {"url", "page url", "link", "webpage", "web page", "web url"}
-    TITLE_HEADERS  = {"title", "page title", "name"}
-    STATUS_HEADERS = {"status", "status code", "http status"}
+    URL_HEADERS      = {"url", "page url", "link", "webpage", "web page", "web url"}
+    TITLE_HEADERS    = {"title", "page title", "name"}
+    STATUS_HEADERS   = {"status", "status code", "http status"}
+    CATEGORY_HEADERS = {"category", "content category", "page category", "type"}
 
     header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
     headers    = [
@@ -836,9 +815,10 @@ def load_approved_pages(excel_path: str) -> list[dict]:
                 return idx
         return None
 
-    url_idx    = find_col(URL_HEADERS)
-    title_idx  = find_col(TITLE_HEADERS)
-    status_idx = find_col(STATUS_HEADERS)
+    url_idx      = find_col(URL_HEADERS)
+    title_idx    = find_col(TITLE_HEADERS)
+    status_idx   = find_col(STATUS_HEADERS)
+    category_idx = find_col(CATEGORY_HEADERS)
 
     if url_idx is None:
         wb.close()
@@ -854,7 +834,9 @@ def load_approved_pages(excel_path: str) -> list[dict]:
         url_column=headers[url_idx],
         title_column=headers[title_idx] if title_idx is not None else None,
         status_column=headers[status_idx] if status_idx is not None else None,
+        category_column=headers[category_idx] if category_idx is not None else None,
         has_status_column=status_idx is not None,
+        has_category_column=category_idx is not None,
     )
 
     def _is_dead_status(value) -> bool:
@@ -902,6 +884,11 @@ def load_approved_pages(excel_path: str) -> list[dict]:
             if status_idx is not None and len(row) > status_idx
             else None
         )
+        excel_category = (
+            str(row[category_idx]).strip().lower()
+            if category_idx is not None and len(row) > category_idx and row[category_idx]
+            else ""
+        )
 
         total_rows += 1
 
@@ -937,7 +924,7 @@ def load_approved_pages(excel_path: str) -> list[dict]:
                 title = title[: -len(suffix)].strip()
                 break
 
-        pages.append({"url": normalized, "title": title})
+        pages.append({"url": normalized, "title": title, "excel_category": excel_category})
 
     wb.close()
 
@@ -950,6 +937,7 @@ def load_approved_pages(excel_path: str) -> list[dict]:
         unique_pages=len(pages),
         had_status_column=status_idx is not None,
         had_title_column=title_idx is not None,
+        had_category_column=category_idx is not None,
     )
     if duplicates:
         log.warning(
@@ -1120,6 +1108,47 @@ def clean_content(content: str) -> str:
     return content.strip()
 
 
+# ── Excel category → content_type mapping (v4.3.0) ────
+# Maps customer-supplied Category values to content_type.
+# Excel wins over URL-pattern detection when present.
+# URL-pattern detection is the fallback when Excel category
+# is blank or unrecognised.
+_EXCEL_CATEGORY_MAP = {
+    "brand":    "article",    # brand/marketing pages → article
+    "guidance": "guide",      # guidance content → guide
+    "other":    "article",    # catch-all → article
+    "product":  "article",    # product pages → article
+    "tool":     "tool",       # tools/calculators → tool
+}
+
+def map_excel_category_to_content_type(excel_category: str, url: str) -> str:
+    """
+    v4.3.0 — Map customer Excel Category to content_type.
+
+    Priority: Excel category (primary) → URL-pattern (fallback).
+
+    Args:
+        excel_category: lowercased value from Excel Category column
+                        (e.g. "brand", "guidance", "product", "tool", "other")
+        url:            page URL — used as fallback via derive_content_type()
+
+    Returns:
+        content_type string: guide / tool / webinar / video /
+                             faq / news / corporate / article
+    """
+    if excel_category:
+        mapped = _EXCEL_CATEGORY_MAP.get(excel_category)
+        if mapped:
+            # URL-pattern can still upgrade: a "product" page
+            # on /webinars/ should still be "webinar".
+            url_type = derive_content_type(url)
+            if url_type in ("webinar", "video", "tool", "faq", "news"):
+                return url_type
+            return mapped
+    # Fallback: URL-pattern only
+    return derive_content_type(url)
+
+
 # ── Step 3: Scrape a single page ───────────────────────
 async def scrape_page(
     crawler: AsyncWebCrawler,
@@ -1128,8 +1157,9 @@ async def scrape_page(
     total: int,
 ) -> dict | None:
     """Scrape a single page and return cleaned page data."""
-    url   = page_info["url"]
-    title = page_info["title"]
+    url            = page_info["url"]
+    title          = page_info["title"]
+    excel_category = page_info.get("excel_category", "")
 
     log.info("scraping_page", url=url, index=index, total=total)
 
@@ -1213,7 +1243,9 @@ async def scrape_page(
             # Zero extra HTTP calls. Safe defaults if extraction fails.
             "audience":         metadata["audience"],
             "has_video":        metadata["has_video"],
-            "content_type":     metadata["content_type"],
+            # v4.3.0: Excel Category takes priority; URL-pattern is fallback.
+            # metadata["content_type"] (URL-pattern only) is overridden here.
+            "content_type":     map_excel_category_to_content_type(excel_category, url),
             "product_category": metadata["product_category"],
             "description":      metadata["description"],
             "thumbnail_url":    metadata["thumbnail_url"],
@@ -1229,8 +1261,9 @@ async def scrape_page(
             total=total,
             content_length=page_data["content_length"],
             has_video=metadata["has_video"],
-            content_type=metadata["content_type"],
+            content_type=page_data["content_type"],
             product_category=metadata["product_category"],
+            excel_category=excel_category or "none",
         )
         return page_data
 
