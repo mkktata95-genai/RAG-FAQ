@@ -487,6 +487,42 @@ def derive_audience_from_url(url: str) -> str:
     return "customer"
 
 
+def derive_section(url: str) -> str:
+    """
+    Derive the top-level section from the URL path.
+
+    Extracts the first meaningful path segment after the domain,
+    skipping empty segments and known locale/language prefixes.
+
+    Examples:
+        royallondon.com/pensions/workplace-pensions/  → "pensions"
+        royallondon.com/existing-customers/contact-us/ → "existing-customers"
+        royallondon.com/life-insurance/               → "life-insurance"
+        royallondon.com/                              → "general"
+        adviser.royallondon.com/products/             → "products"
+
+    Falls back to "general" if no path segment is found.
+    """
+    try:
+        # Strip scheme
+        path = url.split("://", 1)[-1]
+        # Strip domain (everything up to first /)
+        if "/" in path:
+            path = path.split("/", 1)[1]
+        else:
+            return "general"
+        # Split into segments, skip empty strings
+        segments = [s for s in path.split("/") if s]
+        # Skip locale prefixes like "en", "en-gb"
+        locale_prefixes = {"en", "en-gb", "cy", "cy-gb"}
+        for seg in segments:
+            if seg.lower() not in locale_prefixes:
+                return seg.lower()
+        return "general"
+    except Exception:
+        return "general"
+
+
 def detect_video_from_html(html: str, url: str) -> bool:
     """
     Detect whether a page contains video content.
