@@ -106,7 +106,11 @@ CHANGE LOG
 v1.0.0 — Initial version
          crawl4ai scraping from customer Excel file.
          Saves output JSON to scraper/data/ locally.
-v2.0.0):
+
+v2.0.0 — June 2026 | Mukesh Kund
+         Production readiness: Blob Storage + entry point
+
+         PRODUCTION GAP (pre v2.0.0):
          - Scraper saved output JSON to local disk only.
          - Azure Function App has no persistent local disk.
          - Output JSON must go to Azure Blob Storage so
@@ -135,6 +139,7 @@ v2.0.0):
          - Clean entry point for DevOps / Function App.
          - Returns structured result dict with stats.
          - TODO (DevOps): wrap in Function App trigger.
+
 v3.0.0 — June 2026 | Mukesh Kund
          Rich metadata extraction — video detection, content type,
          product category, audience, publish date, thumbnail
@@ -190,6 +195,7 @@ v3.0.0 — June 2026 | Mukesh Kund
          - Now derived from URL: adviser.royallondon.com → "adviser",
            employer.royallondon.com → "employer", else → "customer".
          - Matches the audience derivation in extract_page_metadata().
+
 v4.0.0 — July 2026 | Mukesh Kund
          Production hardening: dotenv import fix, URL normalisation,
          content_hash field.
@@ -212,6 +218,7 @@ v4.0.0 — July 2026 | Mukesh Kund
          SHA-256 hash of page content added to scrape output.
          Used by content_freshness.py (Sprint 2) to detect changed
          pages without re-scraping all 350 URLs.
+
 v4.1.0 — July 2026 | Mukesh Kund
          Live HTTP status check at scrape time.
 
@@ -230,6 +237,7 @@ v4.1.0 — July 2026 | Mukesh Kund
          status_code is None (crawl4ai occasionally doesn't
          populate it) → fails open, does not reject, so working
          pages are never dropped over a missing field.
+
 v4.2.0 — July 2026 | Mukesh Kund
          Header-based column detection — no hardcoded positions.
 
@@ -254,29 +262,28 @@ v4.2.0 — July 2026 | Mukesh Kund
          or words like dead/broken/removed). Blank, "200", "OK",
          "Live", or unrecognised values are KEPT — ambiguity
          defers to "keep it, let the live scrape decide".
+
 v4.3.0 — July 2026 | Mukesh Kund
          Excel Category column used as primary content_type source.
+         derive_section() function added (was missing — NameError).
 
-         WHY:
+         BUG FIX — derive_section() never defined:
+         scrape_page() called derive_section(url) but the function
+         was missing from the codebase — would crash with NameError
+         on every scrape. Added derive_section() using SECTION_MAP.
+
+         Excel Category as primary content_type:
          - Customer supplies Category per URL (Brand/Guidance/Other/
-           Product/Tool) — more authoritative than URL-pattern inference.
-         - Previous code ignored the Category column entirely.
-
-         CHANGES:
+           Product/Tool) — more authoritative than URL-pattern.
          - CATEGORY_HEADERS set added to column detection.
-         - map_excel_category_to_content_type() maps Excel values:
-             Brand    → article
-             Guidance → guide
-             Other    → article
-             Product  → article
-             Tool     → tool
+         - _EXCEL_CATEGORY_MAP: Brand/Other/Product → article,
+           Guidance → guide, Tool → tool.
          - URL-pattern still wins for high-signal types (webinar,
            video, faq, news) — a "Product" page on /webinars/ is
            still correctly typed as "webinar".
-         - Fallback: if Category column absent or value unrecognised,
-           derive_content_type() (URL-pattern) used as before.
-         - No changes to chunk_and_index_hqaV3.py required —
-           content_type field already exists in the index schema.
+         - Fallback: Category absent or unrecognised → derive_content_type().
+         - No changes to chunk_and_index_hqaV3.py required.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -356,6 +363,27 @@ SECTION_MAP = {
     "informational-pages":      "Information",
 }
 
+
+def derive_section(url: str) -> str:
+    """
+    Derive section label from first URL path segment.
+
+    Uses SECTION_MAP — first segment of the path after the domain.
+    Falls back to "General" if no segment matches.
+
+    Examples:
+        .../pensions/...            → "Pensions"
+        .../existing-customers/...  → "Existing Customers"
+        .../isa/...                 → "ISA"
+        .../unknown/...             → "General"
+    """
+    try:
+        path = url.split("://", 1)[-1]          # strip scheme
+        path = path.split("/", 1)[-1]            # strip domain
+        first_segment = path.split("/")[0].lower()
+        return SECTION_MAP.get(first_segment, "General")
+    except Exception:
+        return "General"
 
 
 # ── Step 0: Metadata extraction (v3.0.0) ────────────────────
@@ -1244,7 +1272,6 @@ async def scrape_page(
             "audience":         metadata["audience"],
             "has_video":        metadata["has_video"],
             # v4.3.0: Excel Category takes priority; URL-pattern is fallback.
-            # metadata["content_type"] (URL-pattern only) is overridden here.
             "content_type":     map_excel_category_to_content_type(excel_category, url),
             "product_category": metadata["product_category"],
             "description":      metadata["description"],
