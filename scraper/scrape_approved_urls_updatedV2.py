@@ -1,48 +1,103 @@
 """
-Royal London FAQ — Full Scrape (Customer Approved URLs Only)
-================================================================
-Builds the knowledge base from scratch using ONLY the customer's
-approved URLs (status=200 in their verification Excel).
+Royal London FAQ — Web Scraper (Customer Approved URLs Only)
+════════════════════════════════════════════════════════════
+Scrapes customer-approved Royal London pages and saves structured
+JSON for chunk_and_index_hqaV3.py to index into Azure AI Search.
 
-Customer shared 389 URLs total — 3 are dead (404), so this
-scrapes the 384 unique approved URLs.
-
-Pipeline (single pass, no dependency on previous JSON files):
-  1. Read approved URLs + titles directly from customer Excel
-     (status == 200 only, deduplicated)
-  2. Scrape each URL with crawl4ai (main content only,
-     nav/header/footer excluded via CSS selector)
-  3. Clean content:
-       - remove duplicate article copies (crawl4ai sometimes
-         scrapes the same page twice)
-       - remove breadcrumb navigation
-       - remove social share buttons + Twitter links
-       - remove Previous/Next Item labels
-       - remove footer boilerplate (copyright, "Connect with
-         us", "Products and services", etc.)
-     NOTE: external (non-royallondon) URL stripping is handled
-     separately by chunk_and_index.py's clean_content() at
-     chunk time — not duplicated here.
-  4. Attach title (from Excel) + section (from URL path)
-  5. Save JSON ready for chunk_and_index.py
-
-Output fields per page (matches chunk_and_index.py input format):
-  url, title, section, audience, content, scraped_at, content_length,
-  has_video, content_type, product_category, description,
-  thumbnail_url, publish_date, collection_name, read_time_mins
+Pipeline:
+  1. Load approved URLs from Excel (header-based column detection —
+     no hardcoded positions, works with any column layout)
+  2. Scrape each URL with crawl4ai (main content only)
+  3. Clean content (deduplicate, strip nav/footer boilerplate)
+  4. Extract rich metadata (video, content type, product category,
+     description, thumbnail, publish date — from HTML, zero extra calls)
+  5. Save JSON → local file or Azure Blob Storage (production)
 
 Input:
-  scraper/data/royal_london_verification_retried.xlsx
+  Any Excel file with a "URL" column (header-based detection).
+  Title and status columns optional — detected automatically.
 
 Output:
   scraper/data/royal_london_faq_approved_<timestamp>.json
+  (or Azure Blob Storage when AZURE_STORAGE_CONNECTION is set)
 
-Usage (local):
-    uv run python scraper/scrape_approved_urls.py
+Output fields per page:
+  url, title, section, audience, content, scraped_at,
+  content_length, content_hash, has_video, content_type,
+  product_category, description, thumbnail_url, publish_date,
+  collection_name, read_time_mins
 
-Usage (programmatic — DevOps / Function App):
-    from scraper.scrape_approved_urls import run_scraper
-    result = run_scraper()
+═══════════════════════════════════════════════════════════════
+LOCAL USAGE
+═══════════════════════════════════════════════════════════════
+
+    # Standard scrape (reads APPROVED_EXCEL from .env / constant)
+    python scraper/scrape_approved_urls_updatedV2.py
+
+    # Custom Excel file
+    python scraper/scrape_approved_urls_updatedV2.py \
+        --file scraper/data/your_approved_urls.xlsx
+
+    # Dry run — validate Excel + URL detection, no scraping
+    python scraper/scrape_approved_urls_updatedV2.py --dry-run
+
+    # Dry run on custom file
+    python scraper/scrape_approved_urls_updatedV2.py \
+        --file scraper/data/your_approved_urls.xlsx --dry-run
+
+═══════════════════════════════════════════════════════════════
+PRODUCTION — AZURE CONTAINER APPS JOB
+═══════════════════════════════════════════════════════════════
+Andy: Container Apps Job (aria-scraper-job) runs this script.
+      Required env vars (set in Key Vault, not in code):
+
+    AZURE_STORAGE_CONNECTION   — Blob Storage connection string.
+                                  Not set = local mode (local dev).
+                                  Set = uploads JSON to Blob Storage.
+    BLOB_CONTAINER_NAME        — Blob container (default: scraper-data)
+    BLOB_SCRAPED_FILENAME      — Output blob filename. Must match
+                                  BLOB_SCRAPED_FILENAME in
+                                  chunk_and_index_hqaV3.py so the
+                                  indexer reads the correct file.
+                                  Default: royal_london_faq_latest.json
+    APPROVED_EXCEL_PATH        — Override the default Excel path
+                                  (optional — for production URL list)
+
+    # ADO pipeline / manual trigger:
+    az containerapp job start \
+        --name aria-scraper-job \
+        --resource-group <rg> \
+        --env-vars AZURE_STORAGE_CONNECTION=<conn> DRY_RUN=false
+
+    # In the Container Apps Job entrypoint script:
+    dry_run     = os.getenv("DRY_RUN", "false").lower() == "true"
+    excel_path  = os.getenv("APPROVED_EXCEL_PATH", None)
+    result      = run_scraper(excel_path=excel_path, dry_run=dry_run)
+
+    # Run order (both jobs must be in same resource group):
+    # Job 1: aria-scraper-job     → produces Blob JSON
+    # Job 2: aria-indexer-job     → reads Blob JSON, indexes to AI Search
+    # Both triggered by ADO pipeline in sequence after URL list update.
+
+═══════════════════════════════════════════════════════════════
+PROGRAMMATIC (DEVOPS / TESTING)
+═══════════════════════════════════════════════════════════════
+
+    from scraper.scrape_approved_urls_updatedV2 import run_scraper
+
+    result = run_scraper()                          # default Excel
+    result = run_scraper(excel_path="custom.xlsx") # custom file
+    result = run_scraper(dry_run=True)             # dry run
+
+    # Result dict:
+    # {
+    #   "success":       bool,
+    #   "pages_scraped": int,
+    #   "pages_failed":  int,
+    #   "output_path":   str,  # local path or blob filename
+    #   "dry_run":       bool,
+    #   "error":         str,  # empty if success
+    # }
 
 ═══════════════════════════════════════════════════════════════
 CHANGE LOG
@@ -84,6 +139,73 @@ v2.0.0 — June 2026 | Mukesh Kund
          - Clean entry point for DevOps / Function App.
          - Returns structured result dict with stats.
          - TODO (DevOps): wrap in Function App trigger.
+
+v4.0.0 — July 2026 | Mukesh Kund
+         Production hardening: dotenv import fix, URL normalisation,
+         content_hash field.
+
+         CRITICAL BUG FIX — dotenv import missing:
+         find_dotenv() and load_dotenv() were called at module level
+         but neither was imported — NameError on startup.
+         Fixed: added from dotenv import load_dotenv, find_dotenv.
+         Also added override=True so .env always beats shell vars.
+
+         URL NORMALISATION — normalize_url() helper:
+         load_approved_pages() only stripped trailing slash + query.
+         No path lowercasing meant should-I vs should-i survived
+         deduplication as two separate URLs — double-indexing same
+         content. normalize_url() lowercases path only (domain kept).
+         Applied in load_approved_pages() (dedup key + stored URL)
+         and in scrape_page() output (defence-in-depth for redirects).
+
+         CONTENT HASH:
+         SHA-256 hash of page content added to scrape output.
+         Used by content_freshness.py (Sprint 2) to detect changed
+         pages without re-scraping all 350 URLs.
+
+v4.1.0 — July 2026 | Mukesh Kund
+         Live HTTP status check at scrape time.
+
+         ROOT CAUSE:
+         The Excel "status" column reflects verification-time status —
+         recorded when the Excel was last built, potentially weeks
+         before a scrape run. scrape_page() only checked
+         result.success from crawl4ai — but success=True just means
+         the browser loaded a page; a 404 error page still
+         "successfully" loads. result.status_code was never checked.
+
+         FIX:
+         scrape_page() now reads result.status_code after the
+         crawl4ai fetch. status_code >= 400 → page dropped and
+         logged as scrape_http_error with the actual code.
+         status_code is None (crawl4ai occasionally doesn't
+         populate it) → fails open, does not reject, so working
+         pages are never dropped over a missing field.
+
+v4.2.0 — July 2026 | Mukesh Kund
+         Header-based column detection — no hardcoded positions.
+
+         ROOT CAUSE:
+         load_approved_pages() assumed fixed column layout
+         (title=col B, url=col C, status=col E) from the internal
+         verification file. A customer-supplied Excel is not
+         guaranteed to match that layout. A URL-only file (2 columns)
+         would skip EVERY row due to `len(row) < 5` guard —
+         silently returning zero pages with no error.
+
+         FIX — detect columns by HEADER NAME (row 1):
+         URL_HEADERS    = {"url", "page url", "link", ...}
+         TITLE_HEADERS  = {"title", "page title", "name"}
+         STATUS_HEADERS = {"status", "status code", "http status"}
+         All matched case-insensitively. URL column REQUIRED —
+         raises ValueError with actual headers if not found.
+         Title and status are optional.
+
+         STATUS HANDLING:
+         Only skips on unambiguous dead signals (HTTP >= 400,
+         or words like dead/broken/removed). Blank, "200", "OK",
+         "Live", or unrecognised values are KEPT — ambiguity
+         defers to "keep it, let the live scrape decide".
 
 v3.0.0 — June 2026 | Mukesh Kund
          Rich metadata extraction — video detection, content type,
@@ -141,77 +263,17 @@ v3.0.0 — June 2026 | Mukesh Kund
            employer.royallondon.com → "employer", else → "customer".
          - Matches the audience derivation in extract_page_metadata().
 
-
-v3.1.0 — June 2026 | Mukesh Kund
-         Attempted find_dotenv(usecwd=False) fix (INCOMPLETE)
-
-         - Replaced plain load_dotenv() with
-           find_dotenv(usecwd=False) + load_dotenv(_dotenv_path)
-           so .env loads correctly when the script is run from
-           a subdirectory (e.g. scraper/) rather than repo root.
-         - NOT DOCUMENTED in this CHANGE LOG at the time — only
-           a one-line inline comment was left above the call.
-         - INCOMPLETE: the required
-           `from dotenv import load_dotenv, find_dotenv` import
-           was never added alongside this change. The script
-           has been unable to run at all since this change
-           landed (NameError on import) until fixed in v4.0.0
-           below.
-
-v4.0.0 — July 2026 | Mukesh Kund
-         URL path lowercase normalisation + dotenv import fix
-
-         BUG FOUND (carried over from v3.1.0, undocumented then):
-         - This file already called find_dotenv(usecwd=False)
-           and load_dotenv(_dotenv_path) at module level, but
-           NEITHER find_dotenv NOR load_dotenv was imported from
-           the dotenv package anywhere in this file. This raised
-           NameError: name 'find_dotenv' is not defined the
-           moment the module was imported — the script could not
-           run at all in this state.
-         - FIX: added `from dotenv import load_dotenv, find_dotenv`
-           to the import block.
-         - Also added override=True to load_dotenv() so a real
-           .env value always wins over any stale environment
-           variable already set in the shell/process.
-
-         DUPLICATE URL BUG (case sensitivity):
-         - load_approved_pages() normalised URLs by stripping
-           trailing slash + query string only:
-             normalized = url.rstrip("/").split("?")[0].rstrip("/")
-           This does NOT lowercase the path, so
-           .../should-I-consolidate-my-pensions and
-           .../should-i-consolidate-my-pensions survived
-           deduplication as two separate "approved" URLs even
-           though they are the same page — confirmed live via a
-           real duplicate found in the customer's approved-URL
-           Excel (case difference only).
-         - FIX: new normalize_url() helper lowercases the URL
-           PATH only (scheme + domain are already consistently
-           lowercase in the source Excel; query strings are
-           already stripped before this point). Used in
-           load_approved_pages() for the dedup key AND for the
-           stored "url" value, so downstream scraping,
-           section/audience/product-category derivation, and
-           chunk_and_index.py's HQA indexing all see one
-           canonical casing per page.
-         - Also re-applied in scrape_page() to page_data["url"]
-           (the field chunk_and_index.py / the search index
-           treats as source_url) as defence-in-depth — in case a
-           redirect ever resolves to a differently-cased final
-           URL that didn't go through load_approved_pages().
-
 ═══════════════════════════════════════════════════════════════
 """
 
 import asyncio
+import hashlib
 import os
 import json
 import re
 import sys
 from pathlib import Path
 from datetime import datetime, timezone
-from urllib.parse import urlparse, urlunparse
 
 import structlog
 from bs4 import BeautifulSoup       # v3.0.0: meta tag + video detection
@@ -219,19 +281,13 @@ from openpyxl import load_workbook
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 from crawl4ai.content_filter_strategy import PruningContentFilter
-# v4.0.0 FIX: find_dotenv/load_dotenv were called below but never
-# imported — this raised NameError on module import, so the
-# script could not run at all. See CHANGE LOG v4.0.0.
+
+# v4.0.0 FIX: find_dotenv / load_dotenv were called but never imported
+# — caused NameError on startup. Added the import.
+# override=True ensures .env always wins over shell environment
+# variables — prevents silent misconfiguration in DevOps pipelines.
 from dotenv import load_dotenv, find_dotenv
 
-# v3.1.0 fix: load_dotenv() with no args loads from CWD.
-# If script is run from scraper/ subfolder, .env is not found
-# and all os.getenv() calls silently return hardcoded defaults.
-# find_dotenv() walks UP the directory tree until it finds .env
-# — works correctly regardless of which directory you run from.
-# v4.0.0: override=True added — ensures a real .env value always
-# wins over any stale environment variable already set in the
-# shell/process. See CHANGE LOG v3.1.0 / v4.0.0 above.
 _dotenv_path = find_dotenv(usecwd=False)
 load_dotenv(_dotenv_path, override=True)
 log = structlog.get_logger()
@@ -638,106 +694,188 @@ def extract_page_metadata(html: str, url: str) -> dict:
     return metadata
 
 
-# ── Step 1: Load approved URLs from customer Excel ────
-
-
-
+# ── URL normalisation helper ──────────────────────────────────
 def normalize_url(url: str) -> str:
     """
-    Canonicalise a URL for deduplication and index storage.
+    Canonical URL form for deduplication and index consistency.
 
-    v4.0.0 — uses urllib.parse for component-level handling.
-    Replaces fragile string manipulation (.split("?")[0] etc)
-    with explicit per-component processing.
+    Strips trailing slash, query string, fragment, and lowercases
+    the path. Domain is left as-is (already lowercase in practice).
 
-    WHAT THIS DOES (in order):
-    1. Lowercases scheme    — HTTPS:// -> https://
-    2. Lowercases netloc    — WWW.RoyalLondon.COM -> www.royallondon.com
-    3. Lowercases path      — /Should-I-... -> /should-i-...
-    4. Strips trailing slash from path
-    5. Drops query string   — ?utm_source=email discarded entirely
-    6. Drops fragment       — #section discarded entirely
-
-    WHY query strings are stripped (not kept):
-    - All URLs in the approved Excel are canonical content pages.
-      Query strings on Royal London URLs are tracking params only
-      (utm_source, utm_medium etc) — never meaningful page selectors.
-    - Keeping them would treat /pensions and /pensions?utm_source=email
-      as two different approved pages: duplicate scrapes, duplicate
-      chunks, duplicate HQA questions in the index.
-    - Customers must never see tracking-tagged URLs in citation chips.
-
-    WHY urllib.parse instead of .split("?")[0]:
-    - .split("?")[0] on "https://example.com/page#section?query"
-      returns "https://example.com/page#section" — fragment survives.
-      urlparse handles all six components independently and correctly
-      regardless of order or edge cases.
-
-    Examples — all normalise to the same value:
-        https://www.royallondon.com/Should-I-Consolidate/
-        https://www.royallondon.com/should-i-consolidate
-        HTTPS://WWW.ROYALLONDON.COM/should-i-consolidate
-        https://www.royallondon.com/should-i-consolidate?utm_source=x#top
-        -> https://www.royallondon.com/should-i-consolidate
+    WHY lowercase the path:
+    Customer Excel contained both:
+        .../should-I-consolidate-my-pensions
+        .../should-i-consolidate-my-pensions
+    Without path lowercasing these survive deduplication as two
+    separate entries and are scraped + indexed twice — duplicate
+    content with different chunk_ids causing retrieval noise.
     """
-    if not url:
-        return url
-
-    try:
-        parsed = urlparse(url.strip())
-        return urlunparse((
-            parsed.scheme.lower(),           # https
-            parsed.netloc.lower(),           # www.royallondon.com
-            parsed.path.lower().rstrip("/"), # /path/to/page
-            "",                              # params  — always empty for RL
-            "",                              # query   — stripped (see WHY above)
-            "",                              # fragment — stripped
-        ))
-    except Exception:
-        # Fallback for any malformed URL — lowercase everything
-        # rather than risk leaving case variants undeduplicated.
-        return url.strip().lower()
+    url = url.strip()
+    url = url.split("?")[0].split("#")[0]   # strip query + fragment
+    url = url.rstrip("/")                    # strip trailing slash
+    if "://" in url:
+        scheme_host, _, path = url.partition("://")
+        domain_end = path.find("/")
+        if domain_end == -1:
+            return f"{scheme_host}://{path}"
+        domain = path[:domain_end]
+        rest   = path[domain_end:].lower()  # lowercase path only
+        return f"{scheme_host}://{domain}{rest}"
+    return url.lower()
 
 
+# ── Excel column detection + URL loading ─────────────────────
 def load_approved_pages(excel_path: str) -> list[dict]:
     """
     Reads customer Excel, returns list of dicts:
     [{"url": "...", "title": "..."}]
 
-    Only rows with status == 200. Deduplicates by
-    normalized URL (keeps first occurrence's title).
+    Deduplicates by normalized URL (keeps first occurrence's title).
 
-    v4.0.0:
-    - normalize_url() now handles scheme + domain + path
-      lowercasing, query-string stripping, and fragment
-      stripping via urllib.parse (production-safe).
-    - Logs exact count of duplicates removed — audit trail
-      for QA and canary for Excel data quality issues.
+    v4.2.0 — COLUMN DETECTION BY HEADER NAME, NOT FIXED POSITION:
+    Previous versions assumed a fixed column layout (title at
+    column B, url at column C, status at column E) copied from
+    the internal verification file
+    (royal_london_verification_retried.xlsx), which included a
+    status column from an earlier internal check pass. A real
+    customer-supplied Excel is NOT guaranteed to have that
+    layout, or even a status column at all — the customer
+    typically supplies ONLY a URL column, sometimes with a title
+    column, and no status information whatsoever.
+
+    Previous behaviour on a URL-only or URL+title file:
+    `if not row or len(row) < 5: continue` would skip EVERY row
+    (fewer than 5 columns), silently producing zero pages with
+    no error — the worst possible failure mode.
+
+    Column detection (case-insensitive, header = row 1):
+      URL column    (REQUIRED): "url", "page url", "link",
+                                 "webpage", "web page", "web url"
+      Title column  (optional): "title", "page title", "name"
+      Status column (optional): "status", "status code",
+                                 "http status"
+
+    If no URL column is found, raises ValueError listing the
+    headers actually present — an immediate, clear failure
+    instead of a silent empty result.
+
+    STATUS HANDLING — Excel status is a pre-filter hint, NEVER
+    the final authority:
+    - If a status column exists: rows are skipped ONLY when the
+      value is an unambiguous dead signal — a numeric HTTP code
+      >= 400, or a word like "dead"/"broken"/"404"/"removed"/
+      "gone"/"not found". Anything else (a plain "200", "OK",
+      "Live", blank, or unrecognised text) is KEPT — customer
+      status notation isn't guaranteed to be a numeric HTTP code,
+      so being lenient avoids wrongly discarding a working URL
+      over an ambiguous cell value.
+    - If NO status column exists at all: every row with a valid
+      URL is kept as a candidate.
+    - Either way, the LIVE HTTP status_code check in scrape_page()
+      (v4.1.0) is what actually determines whether a URL is live
+      at scrape time — this function only avoids wasting scrape
+      effort on links already known-dead when that information
+      happens to be available in the Excel.
     """
     wb = load_workbook(excel_path, read_only=True)
     ws = wb.active
 
-    seen          = set()
-    pages         = []
-    total_rows    = 0
+    # ── Detect columns by header name (row 1) ──────────────────
+    # Sets of recognised header names (case-insensitive).
+    # Adding new synonyms here is all that's needed if the
+    # customer changes their column heading in future.
+    URL_HEADERS    = {"url", "page url", "link", "webpage", "web page", "web url"}
+    TITLE_HEADERS  = {"title", "page title", "name"}
+    STATUS_HEADERS = {"status", "status code", "http status"}
+
+    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+    headers    = [
+        str(h).strip().lower() if h is not None else ""
+        for h in header_row
+    ]
+
+    def find_col(candidates: set) -> int | None:
+        for idx, h in enumerate(headers):
+            if h in candidates:
+                return idx
+        return None
+
+    url_idx    = find_col(URL_HEADERS)
+    title_idx  = find_col(TITLE_HEADERS)
+    status_idx = find_col(STATUS_HEADERS)
+
+    if url_idx is None:
+        wb.close()
+        raise ValueError(
+            f"load_approved_pages: no URL column found in "
+            f"{excel_path!r}. Expected a header matching one of "
+            f"{sorted(URL_HEADERS)} (case-insensitive). "
+            f"Headers actually found: {header_row!r}"
+        )
+
+    log.info(
+        "approved_pages_columns_detected",
+        url_column=headers[url_idx],
+        title_column=headers[title_idx] if title_idx is not None else None,
+        status_column=headers[status_idx] if status_idx is not None else None,
+        has_status_column=status_idx is not None,
+    )
+
+    def _is_dead_status(value) -> bool:
+        """
+        Lenient dead-link detector for an OPTIONAL status column.
+        Only returns True for unambiguous dead signals — see
+        load_approved_pages() docstring for rationale.
+        Never used to REQUIRE a "200" — absence or ambiguity
+        always means "keep it, let the live scrape decide".
+        """
+        if value is None:
+            return False
+        s = str(value).strip().lower()
+        if not s:
+            return False
+        try:
+            code = int(s)
+            return code >= 400
+        except ValueError:
+            pass
+        dead_words = {"dead", "broken", "404", "removed", "gone", "not found"}
+        return any(w in s for w in dead_words)
+
+    seen           = set()
+    pages          = []
+    total_rows     = 0
     skipped_status = 0
-    duplicates    = []   # track for audit log
+    duplicates     = []
 
     for row in ws.iter_rows(min_row=2, values_only=True):
-        if not row or len(row) < 5:
+        if not row or len(row) <= url_idx:
             continue
 
-        raw_title = str(row[1]).strip() if row[1] else ""
-        url       = str(row[2]).strip() if row[2] else ""
-        status    = str(row[4]).strip() if row[4] else ""
-
+        url = str(row[url_idx]).strip() if row[url_idx] else ""
         if not url.startswith("http"):
             continue
 
+        raw_title = (
+            str(row[title_idx]).strip()
+            if title_idx is not None and len(row) > title_idx and row[title_idx]
+            else ""
+        )
+        status_value = (
+            row[status_idx]
+            if status_idx is not None and len(row) > status_idx
+            else None
+        )
+
         total_rows += 1
 
-        if status != "200":
+        if _is_dead_status(status_value):
             skipped_status += 1
+            log.debug(
+                "url_skipped_dead_status",
+                url=url,
+                status_value=status_value,
+            )
             continue
 
         normalized = normalize_url(url)
@@ -771,30 +909,29 @@ def load_approved_pages(excel_path: str) -> list[dict]:
     log.info(
         "approved_pages_loaded",
         total_rows=total_rows,
-        skipped_non_200=skipped_status,
+        skipped_dead_status=skipped_status,
         duplicates_removed=len(duplicates),
         unique_pages=len(pages),
+        had_status_column=status_idx is not None,
+        had_title_column=title_idx is not None,
     )
     if duplicates:
         log.warning(
             "duplicate_urls_in_excel",
             count=len(duplicates),
-            examples=duplicates[:5],  # first 5 only to keep log readable
+            examples=duplicates[:5],
+        )
+    if not pages:
+        log.warning(
+            "approved_pages_empty",
+            note=(
+                "No pages loaded — check that the URL column was "
+                "detected correctly and rows contain http(s) URLs."
+            ),
         )
 
     return pages
 
-
-def derive_section(url: str) -> str:
-    """Derive section name from first URL path segment."""
-    path = url.replace("https://www.royallondon.com", "").strip("/")
-    if not path:
-        return "General"
-    first_segment = path.split("/")[0]
-    return SECTION_MAP.get(
-        first_segment,
-        first_segment.replace("-", " ").title(),
-    )
 
 
 # ── Step 2: Content cleaning ───────────────────────────
@@ -1019,21 +1156,21 @@ async def scrape_page(
         raw_html = getattr(result, "html", "") or ""
         metadata = extract_page_metadata(raw_html, url)
 
+        # v4.0.0: re-normalise at output — defence for redirects
+        url = normalize_url(url)
+
         page_data = {
-            # ── Core fields (unchanged from v1/v2) ────────────
-            # v4.0.0: normalize_url() applied here too as
-            # defence-in-depth. If a redirect resolves to a
-            # differently-cased or tracking-tagged final URL,
-            # scheme + domain + path are still canonicalised
-            # and query strings stripped before the record
-            # reaches chunk_and_index.py / the search index.
-            # See CHANGE LOG v4.0.0.
-            "url":            normalize_url(url),
+            # ── Core fields ────────────────────────────────────
+            "url":            url,
             "title":          title,
             "section":        derive_section(url),
             "content":        page_content.strip(),
             "scraped_at":     datetime.now(timezone.utc).isoformat(),
             "content_length": len(page_content.strip()),
+            # v4.0.0: SHA-256 for freshness detection (content_freshness.py)
+            "content_hash":   hashlib.sha256(
+                page_content.strip().encode("utf-8")
+            ).hexdigest(),
 
             # ── Enrichment fields (v3.0.0) ────────────────────
             # All extracted from HTML already fetched by crawl4ai.
@@ -1066,8 +1203,6 @@ async def scrape_page(
         return None
 
 
-
-# ── Production helpers (v2.0.0) ──────────────────────────────
 
 def load_url_source(excel_path: str) -> list[dict]:
     """
@@ -1176,53 +1311,54 @@ def save_scraped_pages(
 
 def run_scraper(
     excel_path: str | None = None,
+    dry_run: bool = False,
 ) -> dict:
     """
     Programmatic entry point for the scraping pipeline.
-    Called by DevOps / Azure Function App trigger.
-
-    Runs the full scraping pipeline synchronously by wrapping
-    the async main() logic. Returns structured result dict.
+    Called by DevOps / Azure Container Apps Job.
 
     Args:
         excel_path: Path to approved URLs Excel file.
                     If None, uses APPROVED_EXCEL constant.
+                    Production: override via APPROVED_EXCEL_PATH env var.
+        dry_run:    If True, detect columns + count URLs but do NOT
+                    scrape or save anything. Use to validate the Excel
+                    file is correctly parsed before a production run.
 
     Returns:
         dict with keys:
             success        (bool) — True if completed without error
-            pages_scraped  (int)  — number of pages scraped
-            pages_failed   (int)  — number of pages that failed
-            output_path    (str)  — local path or blob filename
+            pages_scraped  (int)  — pages scraped (0 if dry_run)
+            pages_failed   (int)  — pages that failed to scrape
+            output_path    (str)  — local file path or blob filename
+            dry_run        (bool) — whether this was a dry run
             error          (str)  — error message if success=False
 
-    TODO (DevOps): Wrap in Azure Function App trigger:
+    TODO (DevOps — Sprint 2):
+    Wrap in Azure Container Apps Job entrypoint script.
+    Container Apps Job: aria-scraper-job
 
-        import azure.functions as func
-        from scraper.scrape_approved_urls import run_scraper
+        # In job entrypoint (e.g. entrypoint.py):
+        import os
+        from scraper.scrape_approved_urls_updatedV2 import run_scraper
 
-        app = func.FunctionApp()
+        dry_run    = os.getenv("DRY_RUN", "false").lower() == "true"
+        excel_path = os.getenv("APPROVED_EXCEL_PATH", None)
+        result     = run_scraper(excel_path=excel_path, dry_run=dry_run)
 
-        # Monthly scheduled scrape (1st of month, 11pm —
-        # runs before chunk_and_index at midnight)
-        @app.timer_trigger(
-            schedule="0 23 1 * *",
-            arg_name="timer",
-        )
-        def monthly_scrape(timer: func.TimerRequest):
-            result = run_scraper()
-            logging.info(f"Scrape complete: {result}")
-            # chunk_and_index Function App triggered separately
-            # or chained here via Service Bus / Event Grid
+        if not result["success"]:
+            raise RuntimeError(f"Scrape failed: {result['error']}")
 
-        # On-demand HTTP trigger
-        @app.route(route="scrape", methods=["POST"])
-        def on_demand_scrape(req: func.HttpRequest):
-            result = run_scraper()
-            return func.HttpResponse(
-                json.dumps(result),
-                mimetype="application/json",
-            )
+        print(f"Scraped {result['pages_scraped']} pages → {result['output_path']}")
+
+    ADO pipeline trigger (runs aria-scraper-job, then aria-indexer-job):
+
+        az containerapp job start \
+            --name aria-scraper-job \
+            --resource-group <rg> \
+            --env-vars DRY_RUN=false
+
+    Required env vars in Key Vault (see production section in module docstring).
     """
     import traceback
 
@@ -1231,13 +1367,26 @@ def run_scraper(
         "pages_scraped": 0,
         "pages_failed":  0,
         "output_path":   "",
+        "dry_run":       dry_run,
         "error":         "",
     }
 
     try:
         import asyncio
 
-        excel = excel_path or APPROVED_EXCEL
+        excel = excel_path or os.getenv("APPROVED_EXCEL_PATH") or APPROVED_EXCEL
+
+        if dry_run:
+            # Dry run: detect columns + count URLs, no scraping
+            pages = load_url_source(excel)
+            print(f"\n✅ DRY RUN COMPLETE — no scraping performed.")
+            print(f"   Excel file:       {excel}")
+            print(f"   URLs detected:    {len(pages)}")
+            print(f"\n   Remove --dry-run or set DRY_RUN=false to scrape for real.")
+            result["success"]       = True
+            result["pages_scraped"] = 0
+            result["output_path"]   = ""
+            return result
 
         async def _run():
             pages_to_scrape = load_url_source(excel)
@@ -1249,6 +1398,13 @@ def run_scraper(
             scraped      = []
             failed_urls  = []
             total        = len(pages_to_scrape)
+
+            log.info(
+                "scraper_pipeline_started",
+                total_urls=total,
+                excel=excel,
+                blob_storage=bool(BLOB_STORAGE_CONNECTION),
+            )
 
             async with AsyncWebCrawler(config=browser_config) as crawler:
                 for batch_start in range(0, total, BATCH_SIZE):
@@ -1275,15 +1431,19 @@ def run_scraper(
 
         scraped, failed = asyncio.run(_run())
 
-        # Save output
-        timestamp   = datetime.now(timezone.utc).strftime(
-            "%Y%m%d_%H%M%S"
-        )
+        timestamp   = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         output_file = (
             Path("scraper/data") /
             f"royal_london_faq_approved_{timestamp}.json"
         )
         output_path = save_scraped_pages(scraped, output_file)
+
+        log.info(
+            "scraper_pipeline_complete",
+            pages_scraped=len(scraped),
+            pages_failed=len(failed),
+            output_path=output_path,
+        )
 
         result["success"]       = True
         result["pages_scraped"] = len(scraped)
@@ -1302,21 +1462,43 @@ def run_scraper(
 
 # ── Main ────────────────────────────────────────────────
 async def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="RLG FAQ Scraper — scrapes customer-approved URLs"
+    )
+    parser.add_argument(
+        "--file", default=None,
+        help="Path to approved URLs Excel file. "
+             "Default: APPROVED_EXCEL constant.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Detect Excel columns + count URLs, do NOT scrape. "
+             "Validates the Excel file is parsed correctly.",
+    )
+    args = parser.parse_args()
+
     print("\n" + "=" * 60)
     print("RLG FAQ SCRAPER — Customer Approved URLs Only")
     print("=" * 60)
 
-    # ── Load approved URLs from Excel ──────────────────
-    excel_path = Path(APPROVED_EXCEL)
+    excel_path = Path(
+        args.file
+        or os.getenv("APPROVED_EXCEL_PATH")
+        or APPROVED_EXCEL
+    )
     if not excel_path.exists():
-        print(f"\nERROR: Customer Excel not found: {excel_path}")
+        print(f"\nERROR: Excel file not found: {excel_path}")
         sys.exit(1)
 
-    # v2.0.0: load_url_source() abstracts local Excel vs
-    # Blob Storage. Local: reads Excel as before. Production:
-    # reads JSON from Blob Storage when AZURE_STORAGE_CONNECTION set.
     pages_to_scrape = load_url_source(str(excel_path))
-    print(f"\nApproved URLs to scrape: {len(pages_to_scrape)}")
+    print(f"\nExcel file:       {excel_path}")
+    print(f"Approved URLs:    {len(pages_to_scrape)}")
+
+    if args.dry_run:
+        print("\n✅ DRY RUN COMPLETE — no scraping performed.")
+        print("   Run without --dry-run to scrape for real.")
+        return
 
     # ── Scrape in batches ───────────────────────────────
     browser_config = BrowserConfig(
@@ -1405,8 +1587,9 @@ async def main():
 
     print(f"\nSaved to: {output_path}")
     print("=" * 60)
-    print(f"\nNext: uv run python scraper/chunk_and_indexV3.py --full "
-          f"--file {output_path}")
+    print(f"\n👉 Next step: index the scraped content:")
+    print(f"   python scraper/chunk_and_index_hqaV3.py --full --file {output_path}")
+    print(f"   python scraper/chunk_and_index_hqaV3.py --full --no-hqa --file {output_path}  # baseline")
 
 
 if __name__ == "__main__":

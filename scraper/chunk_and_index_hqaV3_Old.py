@@ -10,35 +10,17 @@ Supports:
   --new-only: Only index pages not already indexed (default)
   --pilot:    HQA pilot mode — process first 100 chunks only
               to validate question quality before full re-index
-  --no-hqa:   Baseline mode — skip ALL LLM calls (no HQA
-              questions, no title_questions). Uses page title
-              as the only implicit retrieval signal. Targets
-              rlg-faq-index-v3-baseline for clean A/B comparison
-              against the full HQA index (rlg-faq-index-v3).
-  --dry-run:  Validate config, load pages, chunk — but do NOT
-              create/update the index or upload anything.
-              Useful for testing without touching Azure Search.
 
 Usage:
-    # Full HQA run (v3 index)
     python scraper/chunk_and_index_hqaV3.py --full
-
-    # Baseline run — no LLM calls (v3-baseline index)
-    python scraper/chunk_and_index_hqaV3.py --full --no-hqa
-
-    # Pilot — validate HQA quality on first 100 chunks only
+    python scraper/chunk_and_index_hqaV3.py --new-only
     python scraper/chunk_and_index_hqaV3.py --full --pilot
-
-    # Dry run — validate config + chunking, no index changes
-    python scraper/chunk_and_index_hqaV3.py --full --dry-run
-
-    # Custom file
     python scraper/chunk_and_index_hqaV3.py --full --file path/to/file.json
 
-Programmatic (DevOps / Container Apps Job):
+Programmatic (DevOps / Function App):
     from scraper.chunk_and_index_hqaV3 import run_pipeline
     result = run_pipeline(mode="full")
-    result = run_pipeline(mode="full", no_hqa=True)   # baseline
+    result = run_pipeline(mode="new-only")
 
 ═══════════════════════════════════════════════════════════════
 CHANGE LOG
@@ -444,63 +426,6 @@ v5.0.0 — July 2026 | Mukesh Kund
          rlg-faq-index and rlg-faq-index-v2 are NOT touched by
          this script and remain live for comparison.
 
-v5.1.0 — July 2026 | Mukesh Kund
-         --no-hqa baseline mode + --dry-run flag
-
-         MOTIVATION:
-         Before committing to production infrastructure (Azure
-         Container Apps Job, Blob Storage, ADO pipeline), we
-         need to validate that HQA + title_questions actually
-         improves retrieval quality over a simpler baseline.
-         Without a controlled comparison, the improvement is
-         an assumption not a measurement.
-
-         --no-hqa (BASELINE MODE):
-         Skips ALL LLM calls — no HQA question generation,
-         no title_questions generation. The page title is the
-         only implicit retrieval signal (it is already prepended
-         to content before chunking, so it contributes to both
-         BM25 and the embedding naturally).
-
-         This creates a clean A/B experiment:
-           rlg-faq-index-v3          — full HQA + title_questions
-           rlg-faq-index-v3-baseline — title as implicit signal only
-
-         Run compare_indexes.py against both with the same 25
-         queries used for v1 vs v2 comparison. This proves
-         definitively whether HQA is worth the ~3.5hr / ~$0.91
-         cost before building production infrastructure around it.
-
-         Baseline differences from full HQA run:
-         - augmented_questions = "" for all chunks
-         - title_questions = "" for all chunks
-         - build_embedding_texts() falls back to content-only
-           (title already in content via chunk_pages() prepend)
-         - No LLM API calls — run completes in ~15-20 minutes
-         - INDEX_NAME defaults to rlg-faq-index-v3-baseline
-           (set via AZURE_SEARCH_INDEX_NAME env var to override)
-         - All other settings identical: same chunking, same
-           embeddings, same schema, same scoring profile
-           (fair comparison — only the data differs)
-
-         PRODUCTION NOTE:
-         This flag is for LOCAL VALIDATION only at this stage.
-         Production infrastructure (Container Apps Job, Blob
-         Storage, ADO pipeline, Terraform) will be designed
-         AFTER the comparison validates the approach.
-         See TODO list for the full production roadmap.
-
-         --dry-run:
-         Validates .env config, loads the scraped file, runs
-         chunking, and reports what WOULD be indexed — without
-         creating or modifying the index or uploading anything.
-         Useful for:
-         - Verifying a new scraped file is well-formed
-         - Checking chunk counts before a full run
-         - Testing in CI without Azure Search credentials
-         - Confirming --no-hqa or --pilot settings look right
-           before committing to a long run
-
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -562,14 +487,6 @@ CHUNK_OVERLAP         = 200
 # rlg-faq-index-v2 are NOT touched by this script — both remain
 # live. Set AZURE_SEARCH_INDEX_NAME explicitly to override.
 INDEX_NAME            = os.getenv("AZURE_SEARCH_INDEX_NAME", "rlg-faq-index-v3")
-
-# v5.1.0: baseline index name used when --no-hqa flag is set.
-# Separate from INDEX_NAME so both indexes can coexist for A/B
-# comparison. Override via AZURE_SEARCH_BASELINE_INDEX_NAME env var.
-BASELINE_INDEX_NAME   = os.getenv(
-    "AZURE_SEARCH_BASELINE_INDEX_NAME",
-    "rlg-faq-index-v3-baseline",
-)
 EMBEDDING_DIMS        = int(os.getenv("AZURE_OPENAI_EMBEDDING_DIMENSIONS", "1024"))
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
 SEARCH_ENDPOINT       = os.getenv("AZURE_SEARCH_ENDPOINT", "").rstrip("/")
@@ -1823,7 +1740,6 @@ def deduplicate_questions_across_chunks(
 def augment_chunks_with_hqa(
     chunks: list[dict],
     pilot: bool = False,
-    no_hqa: bool = False,
 ) -> list[dict]:
     """
     Generate HQA questions for all chunks (stored in
@@ -1836,17 +1752,6 @@ def augment_chunks_with_hqa(
     - chunk_index > 0:  HQA_QUESTIONS_OTHER_CHUNKS (5) HQA
       questions, title_questions = "" (not generated).
 
-    v5.1.0 — no_hqa=True (baseline mode):
-    - Skips ALL LLM calls entirely.
-    - Sets augmented_questions = "" and title_questions = ""
-      for every chunk.
-    - The page title is the only retrieval signal — it is
-      already prepended to content in chunk_pages(), so it
-      contributes to both BM25 and the embedding naturally.
-    - Run completes in seconds instead of ~3.5 hours.
-    - Used to build rlg-faq-index-v3-baseline for A/B
-      comparison against the full HQA index.
-
     pilot=True: process only first PILOT_CHUNK_LIMIT chunks.
     Used to validate question quality before full re-index.
 
@@ -1855,24 +1760,6 @@ def augment_chunks_with_hqa(
     string fields). The pipeline is non-blocking — generation
     failure never stops indexing.
     """
-    # ── Baseline mode — skip all LLM calls ────────────────────
-    if no_hqa:
-        for chunk in chunks:
-            chunk["augmented_questions"] = ""
-            chunk["title_questions"]     = ""
-        print(
-            f"\n⏭️  Baseline mode (--no-hqa): skipping all LLM "
-            f"calls for {len(chunks):,} chunks."
-        )
-        print(
-            f"   augmented_questions = '' | "
-            f"title_questions = '' for all chunks."
-        )
-        print(
-            f"   Page title is the only implicit retrieval "
-            f"signal (already in content via chunk_pages())."
-        )
-        return chunks
     chunks_to_augment = chunks[:PILOT_CHUNK_LIMIT] if pilot else chunks
     total             = len(chunks_to_augment)
     first_chunk_count = sum(
@@ -2916,12 +2803,13 @@ def run_pipeline(
     mode: str = "new-only",
     scraped_file: str | None = None,
     pilot: bool = False,
-    no_hqa: bool = False,
-    dry_run: bool = False,
 ) -> dict:
     """
     Programmatic entry point for the indexing pipeline.
-    Called by DevOps / Azure Container Apps Job trigger.
+    Called by DevOps / Azure Function App trigger.
+
+    This function wraps the full pipeline — scrape file loading,
+    chunking, HQA augmentation, embedding, indexing, cache clear.
 
     Args:
         mode:         "full"     — delete and recreate index
@@ -2931,53 +2819,47 @@ def run_pipeline(
         pilot:        If True, process first 100 chunks only
                       for HQA quality validation. Use before
                       running a full re-index for the first time.
-        no_hqa:       v5.1.0 — If True, skip all LLM calls.
-                      Builds rlg-faq-index-v3-baseline for A/B
-                      comparison. ~15-20 minutes vs ~3.5 hours.
-        dry_run:      v5.1.0 — If True, validate + chunk but do
-                      NOT create/update index or upload anything.
-                      Returns result with dry_run=True in dict.
 
     Returns:
         dict with keys:
             success         (bool)  — True if completed without error
             pages_indexed   (int)   — number of pages processed
             chunks_created  (int)   — number of chunks created
-            chunks_uploaded (int)   — 0 if dry_run=True
-            hqa_questions   (int)   — 0 if no_hqa=True
-            title_questions (int)   — 0 if no_hqa=True
-            cache_cleared   (bool)  — False if dry_run=True
-            no_hqa          (bool)  — whether baseline mode was used
-            dry_run         (bool)  — whether dry run was performed
-            index_name      (str)   — actual index name used
+            chunks_uploaded (int)   — number of chunks uploaded
+            hqa_questions   (int)   — total HQA questions generated
+            title_questions (int)   — v5.0.0 NEW — total title
+                                      questions generated (chunk_index
+                                      == 0 chunks only)
+            cache_cleared   (bool)  — whether cache was cleared
             error           (str)   — error message if success=False
 
-    TODO (DevOps — Sprint 2):
-    Wrap in Azure Container Apps Job trigger:
+    TODO (DevOps): Wrap this in an Azure Function App trigger:
 
-        # ADO pipeline invocation:
-        az containerapp job start \
-            --name aria-indexer-job \
-            --resource-group <rg> \
-            --env-vars MODE=full NO_HQA=false DRY_RUN=false
+        import azure.functions as func
+        from scraper.chunk_and_index import run_pipeline
 
-        # In script entrypoint (reads env vars):
-        no_hqa  = os.getenv("NO_HQA", "false").lower() == "true"
-        dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
-        result  = run_pipeline(
-            mode=os.getenv("MODE", "new-only"),
-            no_hqa=no_hqa,
-            dry_run=dry_run,
+        app = func.FunctionApp()
+
+        # Monthly scheduled re-index (1st of each month, midnight)
+        @app.timer_trigger(
+            schedule="0 0 1 * *",
+            arg_name="timer",
         )
+        def monthly_reindex(timer: func.TimerRequest):
+            result = run_pipeline(mode="full")
+            logging.info(f"Reindex complete: {result}")
 
-    See TODO list for full production infrastructure roadmap:
-    Container Apps Job, Blob Storage, Checkpoint/Resume,
-    ADO Pipeline YAML, Terraform, Application Insights.
+        # On-demand HTTP trigger (content team can call this)
+        @app.route(route="reindex", methods=["POST"])
+        def on_demand_reindex(req: func.HttpRequest):
+            mode = req.params.get("mode", "new-only")
+            result = run_pipeline(mode=mode)
+            return func.HttpResponse(
+                json.dumps(result),
+                mimetype="application/json",
+            )
     """
     import traceback
-
-    # Resolve index name based on mode
-    active_index = BASELINE_INDEX_NAME if no_hqa else INDEX_NAME
 
     result = {
         "success":         False,
@@ -2987,9 +2869,6 @@ def run_pipeline(
         "hqa_questions":   0,
         "title_questions": 0,
         "cache_cleared":   False,
-        "no_hqa":          no_hqa,
-        "dry_run":         dry_run,
-        "index_name":      active_index,
         "error":           "",
     }
 
@@ -3002,7 +2881,11 @@ def run_pipeline(
         if not SEARCH_ENDPOINT:
             raise ValueError("AZURE_SEARCH_ENDPOINT not set in .env")
 
-        # ── Load pages ─────────────────────────────────────────
+        # ── Load pages ─────────────────────────────────────────────────────
+        # load_pages() handles local file vs Blob Storage.
+        # Local: reads scraped_file or auto-detects latest JSON.
+        # Production: downloads from Blob Storage when
+        # AZURE_STORAGE_CONNECTION env var is set.
         pages = load_pages(scraped_file)
         log.info("pages_loaded", total=len(pages))
 
@@ -3027,33 +2910,18 @@ def run_pipeline(
         chunks = chunk_pages(pages_to_index)
         result["chunks_created"] = len(chunks)
 
-        # ── Step 2: HQA augmentation (or baseline skip) ───────
-        chunks = augment_chunks_with_hqa(
-            chunks, pilot=pilot, no_hqa=no_hqa
+        # ── Step 2: HQA augmentation ──────────────────────────
+        chunks = augment_chunks_with_hqa(chunks, pilot=pilot)
+        result["hqa_questions"] = sum(
+            len(c.get("augmented_questions", "").split("\n"))
+            for c in chunks
+            if c.get("augmented_questions", "").strip()
         )
-        if not no_hqa:
-            result["hqa_questions"] = sum(
-                len(c.get("augmented_questions", "").split("\n"))
-                for c in chunks
-                if c.get("augmented_questions", "").strip()
-            )
-            result["title_questions"] = sum(
-                len(c.get("title_questions", "").split("\n"))
-                for c in chunks
-                if c.get("title_questions", "").strip()
-            )
-
-        # ── Dry run — stop here, don't touch the index ────────
-        if dry_run:
-            log.info(
-                "dry_run_complete",
-                pages=result["pages_indexed"],
-                chunks=result["chunks_created"],
-                no_hqa=no_hqa,
-                index_name=active_index,
-            )
-            result["success"] = True
-            return result
+        result["title_questions"] = sum(
+            len(c.get("title_questions", "").split("\n"))
+            for c in chunks
+            if c.get("title_questions", "").strip()
+        )
 
         # ── Step 3: Create/update index ───────────────────────
         create_or_update_index(fresh=fresh)
@@ -3071,6 +2939,8 @@ def run_pipeline(
         # ── Step 7: Auto-clear cache on full re-index ─────────
         if fresh:
             try:
+                # v3.1.0 fix: add project root to sys.path so
+                # 'core' module is importable regardless of CWD
                 import sys as _sys
                 from pathlib import Path as _Path
                 _project_root = str(
@@ -3109,10 +2979,7 @@ def run_pipeline(
 # ── Main (CLI entry point) ────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description=(
-            "Chunk and index RLG FAQ pages with HQA.\n"
-            "Use --no-hqa to build the baseline index for A/B comparison."
-        )
+        description="Chunk and index RLG FAQ pages with HQA"
     )
     parser.add_argument(
         "--full",
@@ -3133,25 +3000,6 @@ def main():
         ),
     )
     parser.add_argument(
-        "--no-hqa",
-        action="store_true",
-        help=(
-            "Baseline mode: skip ALL LLM calls (no HQA questions, "
-            "no title_questions). Targets rlg-faq-index-v3-baseline "
-            "for A/B comparison against the full HQA index. "
-            "Completes in ~15-20 minutes (vs ~3.5 hours for full HQA)."
-        ),
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help=(
-            "Validate config, load pages, chunk — but do NOT "
-            "create/update the index or upload anything. "
-            "Shows what WOULD be indexed without touching Azure Search."
-        ),
-    )
-    parser.add_argument(
         "--file",
         type=str,
         default=None,
@@ -3164,46 +3012,23 @@ def main():
     args         = parser.parse_args()
     fresh        = args.full
     pilot        = args.pilot
-    no_hqa       = args.no_hqa
-    dry_run      = args.dry_run
     scraped_file = args.file or find_latest_scraped_file()
 
-    # ── Resolve index name ────────────────────────────────────
-    # --no-hqa targets the baseline index automatically.
-    # AZURE_SEARCH_INDEX_NAME env var overrides both defaults.
-    active_index = BASELINE_INDEX_NAME if no_hqa else INDEX_NAME
-
-    # Patch module-level INDEX_NAME so all downstream functions
-    # (create_or_update_index, upload_chunks, verify_index etc)
-    # use the correct index without needing to pass it everywhere.
-    import scraper.chunk_and_index_hqaV3 as _self
-    _self.INDEX_NAME = active_index
-
-    print(f"\n🚀 RLG Chunk and Index Pipeline v5.1.0")
-    print("=" * 60)
-    print(f"   Mode:      {'FULL (fresh index)' if fresh else 'NEW ONLY (append)'}")
-    print(f"   Strategy:  {'⏭️  BASELINE — no HQA, title only' if no_hqa else '🧠 FULL HQA + title_questions'}")
-    print(f"   Dry run:   {'✅ YES — index will NOT be modified' if dry_run else 'No'}")
-    print(f"   HQA:       {'SKIPPED (--no-hqa)' if no_hqa else ('PILOT (100 chunks)' if pilot else 'FULL')}")
-    print(f"   File:      {scraped_file}")
-    print(f"   Index:     {active_index}")
-    print(f"   Embed:     {EMBEDDING_DEPLOYMENT} ({EMBEDDING_DIMS}d)")
-    if not no_hqa:
-        print(f"   HQA mdl:   {HQA_DEPLOYMENT}")
-        print(f"   HQA cnt:   {HQA_QUESTIONS_FIRST_CHUNK} (chunk_index=0) / {HQA_QUESTIONS_OTHER_CHUNKS} (other)")
-        print(f"   Title Qs:  {TITLE_QUESTIONS_COUNT} (chunk_index=0 only)")
-    print(f"   Semantic:  {SEMANTIC_CONFIG_NAME}")
-    print(f"   Scoring:   rl-retrieval-profile")
-    print(f"   Search:    {SEARCH_ENDPOINT}")
-    print(f"   OpenAI:    {AZURE_OPENAI_ENDPOINT}")
-    if no_hqa:
-        print(f"\n   ℹ️  Baseline mode: augmented_questions and title_questions")
-        print(f"      will be empty for all chunks. Page title is the only")
-        print(f"      retrieval signal (already in content via chunking).")
-        print(f"      Compare with {INDEX_NAME} using compare_indexes.py.")
-    if dry_run:
-        print(f"\n   ⚠️  DRY RUN: no index creation or upload will occur.")
-    print("=" * 60)
+    print("\n🚀 RLG Chunk and Index Pipeline v5.0.0")
+    print("=" * 55)
+    print(f"   Mode:     {'FULL (fresh index)' if fresh else 'NEW ONLY (append)'}")
+    print(f"   HQA:      {'PILOT (100 chunks)' if pilot else 'FULL' if fresh else 'NEW PAGES ONLY'}")
+    print(f"   File:     {scraped_file}")
+    print(f"   Index:    {INDEX_NAME}")
+    print(f"   Embed:    {EMBEDDING_DEPLOYMENT} ({EMBEDDING_DIMS}d)")
+    print(f"   HQA mdl:  {HQA_DEPLOYMENT}")
+    print(f"   HQA cnt:  {HQA_QUESTIONS_FIRST_CHUNK} (chunk_index=0) / {HQA_QUESTIONS_OTHER_CHUNKS} (other)")
+    print(f"   Title Qs: {TITLE_QUESTIONS_COUNT} (chunk_index=0 only)")
+    print(f"   Semantic: {SEMANTIC_CONFIG_NAME}")
+    print(f"   Scoring:  rl-retrieval-profile")
+    print(f"   Search:   {SEARCH_ENDPOINT}")
+    print(f"   OpenAI:   {AZURE_OPENAI_ENDPOINT}")
+    print("=" * 55)
 
     # ── Validate config ───────────────────────────────────────
     if not AZURE_OPENAI_ENDPOINT:
@@ -3217,6 +3042,8 @@ def main():
         sys.exit(1)
 
     # ── Load pages ────────────────────────────────────────────
+    # load_pages() abstracts local file vs Blob Storage.
+    # See load_pages() docstring for production setup details.
     pages = load_pages(scraped_file)
     log.info("pages_loaded", total=len(pages))
     print(f"\n📄 Loaded {len(pages):,} pages")
@@ -3245,37 +3072,16 @@ def main():
     chunks = chunk_pages(pages_to_index)
     print(f"   Created {len(chunks):,} chunks")
 
-    # ── Step 2: HQA augmentation (or baseline skip) ───────────
-    if no_hqa:
-        print(f"\n⏭️  Step 2/6: Skipping HQA (--no-hqa baseline mode)...")
-    else:
-        print(f"\n🧠 Step 2/6: HQA question augmentation...")
-    chunks = augment_chunks_with_hqa(chunks, pilot=pilot, no_hqa=no_hqa)
+    # ── Step 2: HQA augmentation ──────────────────────────────
+    print(f"\n🧠 Step 2/6: HQA question augmentation...")
+    chunks = augment_chunks_with_hqa(chunks, pilot=pilot)
 
-    if pilot and not no_hqa:
+    if pilot:
         print(
             "\n⏸️  PILOT MODE: Review question quality above."
-            f"\n   If satisfied, run:"
-            f"\n     python scraper/chunk_and_index_hqaV3.py --full"
-            f"\n   Exiting pilot run now (index not updated)."
+            "\n   If satisfied, run: python scraper/chunk_and_index.py --full"
+            "\n   Exiting pilot run now (index not updated)."
         )
-        return
-
-    # ── Dry run — stop here ───────────────────────────────────
-    if dry_run:
-        hqa_count = sum(
-            1 for c in chunks if c.get("augmented_questions", "").strip()
-        )
-        tq_count = sum(
-            1 for c in chunks if c.get("title_questions", "").strip()
-        )
-        print(f"\n✅ DRY RUN COMPLETE — nothing was uploaded or indexed.")
-        print(f"   Pages that would be indexed:  {len(pages_to_index):,}")
-        print(f"   Chunks that would be created: {len(chunks):,}")
-        print(f"   Chunks with HQA questions:    {hqa_count:,}")
-        print(f"   Chunks with title_questions:  {tq_count:,}")
-        print(f"   Target index:                 {active_index}")
-        print(f"\n   Remove --dry-run to run for real.")
         return
 
     # ── Step 3: Create/update index ───────────────────────────
@@ -3284,37 +3090,49 @@ def main():
         f"{'Recreating' if fresh else 'Ensuring'} index..."
     )
     create_or_update_index(fresh=fresh)
-    print(f"   Index '{active_index}' ready")
+    print(f"   Index '{INDEX_NAME}' ready")
     print(f"   Semantic config '{SEMANTIC_CONFIG_NAME}' created")
 
     # ── Step 4: Build embedding texts ─────────────────────────
-    label = "content only (baseline)" if no_hqa else "content + HQA"
-    print(f"\n📝 Step 4/6: Building embedding texts ({label})...")
+    print(f"\n📝 Step 4/6: Building embedding texts (content + HQA)...")
     embedding_texts = build_embedding_texts(chunks)
     hqa_count = sum(
         1 for c in chunks
         if c.get("augmented_questions", "").strip()
     )
-    print(f"   {len(embedding_texts):,} texts built")
-    if not no_hqa:
-        print(f"   {hqa_count:,} chunks include HQA questions in embedding")
+    print(f"   {hqa_count:,}/{len(chunks):,} chunks have HQA questions")
 
-    # ── Step 5: Generate embeddings ───────────────────────────
-    print(f"\n🔢 Step 5/6: Generating embeddings...")
+    # ── Step 5: Embeddings ────────────────────────────────────
+    print(
+        f"\n🔢 Step 5/6: Generating embeddings "
+        f"for {len(chunks):,} chunks..."
+    )
+    print("   (This will take several minutes...)")
     embeddings = get_embeddings(embedding_texts)
-    print(f"   {len(embeddings):,} embeddings generated ({EMBEDDING_DIMS}d)")
+    print(f"   Generated {len(embeddings):,} embeddings")
 
     # ── Step 6: Upload ────────────────────────────────────────
-    print(f"\n📤 Step 6/6: Uploading to '{active_index}'...")
+    print(f"\n📤 Step 6/6: Uploading to Azure AI Search...")
     total = upload_chunks(chunks, embeddings)
+    print(f"   Uploaded {total:,} chunks")
 
-    # ── Cache clear ───────────────────────────────────────────
+    # ── Verify ────────────────────────────────────────────────
+    print("\n🔍 Verifying index with test semantic query...")
+    verify_index()
+
+    # ── Auto-clear semantic cache (--full only) ───────────────
+    # WHY: full re-index refreshes ALL page content.
+    # Stale cached responses from the old index may contain
+    # outdated information and must not be served.
+    # WHY NOT on --new-only: only new pages added, existing
+    # cached responses are still valid.
     if fresh:
+        print("\n🗑️  Clearing semantic cache (--full mode)...")
         try:
+            # v3.1.0 fix: add project root to sys.path
             import sys as _sys
-            from pathlib import Path as _Path
             _project_root = str(
-                _Path(__file__).resolve().parent.parent
+                Path(__file__).resolve().parent.parent
             )
             if _project_root not in _sys.path:
                 _sys.path.insert(0, _project_root)
@@ -3324,15 +3142,17 @@ def main():
             log.info(
                 "cache_cleared_post_reindex",
                 reason="full_reindex_completed",
+                index=INDEX_NAME,
             )
-            print("\n🗑️  Semantic cache cleared (full re-index)")
+            print("   ✅ Semantic cache cleared")
         except Exception as e:
             log.warning(
                 "cache_clear_failed_post_reindex",
                 error=str(e),
-                note="Index valid. Cache expires via TTL.",
+                note="Index is valid. Cache will expire via TTL.",
             )
-            print(f"\n⚠️  Cache clear failed (non-fatal): {e}")
+            print(f"   ⚠️  Cache clear failed: {e}")
+            print("      Index is still valid. Cache expires via TTL.")
 
     # ── Summary ───────────────────────────────────────────────
     hqa_questions_total = sum(
@@ -3348,33 +3168,24 @@ def main():
     first_chunk_total = sum(
         1 for c in chunks if c.get("chunk_index", -1) == 0
     )
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 55)
     print("✅ INDEXING COMPLETE!")
-    print("=" * 60)
-    print(f"   Strategy:           {'Baseline (title only)' if no_hqa else 'Full HQA + title_questions'}")
+    print("=" * 55)
     print(f"   Pages indexed:      {len(pages_to_index):,}")
     print(f"   Chunks created:     {len(chunks):,}")
     print(f"   Chunks uploaded:    {total:,}")
-    print(f"   HQA questions:      {hqa_questions_total:,}{' (skipped)' if no_hqa else ''}")
-    print(f"   Title questions:    {title_questions_total:,} ({first_chunk_total:,} first-chunks){' (skipped)' if no_hqa else ''}")
-    print(f"   Index name:         {active_index}")
+    print(f"   HQA questions:      {hqa_questions_total:,}")
+    print(f"   Title questions:    {title_questions_total:,} ({first_chunk_total:,} first-chunks)")
+    print(f"   Index name:         {INDEX_NAME}")
     print(f"   Semantic config:    {SEMANTIC_CONFIG_NAME}")
     print(f"   Scoring profile:    rl-retrieval-profile")
     print(f"   Embedding model:    {EMBEDDING_DEPLOYMENT}")
-    if not no_hqa:
-        print(f"   HQA model:          {HQA_DEPLOYMENT}")
+    print(f"   HQA model:          {HQA_DEPLOYMENT}")
     if fresh:
         print(f"   Cache cleared:      ✅ Yes (--full mode)")
     else:
         print(f"   Cache cleared:      ⏭️  Skipped (--new-only mode)")
-    if no_hqa:
-        print(
-            f"\n   👉 Now run compare_indexes.py against"
-            f"\n      {INDEX_NAME} (HQA) vs"
-            f"\n      {active_index} (baseline)"
-            f"\n      to measure whether HQA improves retrieval."
-        )
-    print("=" * 60 + "\n")
+    print("=" * 55 + "\n")
 
 
 if __name__ == "__main__":
