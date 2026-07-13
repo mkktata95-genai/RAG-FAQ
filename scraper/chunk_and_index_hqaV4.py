@@ -580,6 +580,56 @@ v5.3.0 — July 2026 | Mukesh Kund
          6. Enable nightly freshness job (Container Apps Job)
          7. Keep v3 live until v4 validated in production
 
+v5.4.0 — July 2026 | Mukesh Kund
+         Atomic chunking for dropdown state pages.
+
+         PROBLEM:
+         chunk_pages() used RecursiveCharacterTextSplitter blindly
+         on every page regardless of type. For standard pages this
+         is correct. For dropdown state pages (one entry per policy
+         option, scraped via Playwright) this is structurally wrong:
+
+         If a dropdown page's per-option content grows large enough
+         to split (>1600 chars), the splitter could place the policy
+         context (in the title, prepended to chunk 0) in one chunk
+         and the phone number / contact details in another. The LLM
+         retrieves chunk 1 — gets a number with no policy name —
+         and cannot correctly answer "what number for policy X?"
+
+         The current data (20-100 words per option) avoids this by
+         accident of size. Building on accidental safety is wrong
+         for production. Future pages may have larger per-option
+         content (T&Cs, eligibility criteria, full address blocks).
+
+         FIX — Atomic chunking via dropdown_state field:
+         Before splitting, chunk_pages() checks page.get("dropdown_state").
+         If non-empty → this is a dropdown state page → produce
+         exactly ONE chunk containing title + full content.
+         No splitting, no overlap, no risk of separating policy
+         context from contact details regardless of content size.
+
+         WHY dropdown_state NOT URL pattern (#policy=):
+         URL patterns are implementation details — they can change
+         (today #policy=, tomorrow #tab= or #section= or no fragment
+         at all). dropdown_state is set by the scraper at capture time
+         and is the authoritative signal that this page entry represents
+         a specific dropdown selection. URL-independent, scraper-version-
+         independent, future-proof.
+
+         EDGE CASES HANDLED:
+         - Empty dropdown_state ("") → standard pages → normal chunking
+         - dropdown_state set but content < 50 chars → skipped (existing guard)
+         - dropdown_state set, very large content (future) → still 1 chunk
+           (LLM context window handles individual chunks up to 8k tokens;
+            a single option's content will never approach that limit)
+         - HQA: atomic chunks still get augmented_questions generated
+           (chunk_index=0, total_chunks=1 — HQA pipeline unchanged)
+
+         SAME FIX applied to chunk_page() in content_freshness.py
+         (delta indexing path) — both chunking functions must behave
+         identically or freshness re-indexing produces different chunk
+         structure than the full index run.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -968,6 +1018,19 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
     Prepends title to each chunk for better embeddings.
     Respects markdown structure via separator hierarchy.
     Adds content_hash per chunk for freshness detection.
+
+    v5.4.0 — ATOMIC CHUNKING FOR DROPDOWN STATE PAGES:
+    Pages with a non-empty dropdown_state field are produced by the
+    scraper's Playwright dropdown handler — one entry per policy option,
+    containing ONLY that option's content (phone number, address, hours).
+    These pages are NEVER split — they produce exactly 1 chunk regardless
+    of content length. This guarantees the policy context (in title) and
+    the contact details (in content) are always in the same chunk.
+
+    Signal: page.get("dropdown_state") — non-empty string means this
+    page is a dropdown state entry. Empty string = standard page.
+    URL pattern (#policy=) is NOT used — it is an implementation detail
+    that can change across scraper versions.
     """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
@@ -1002,6 +1065,46 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
             f"{title}\n\n{content}" if title else content
         )
 
+        # v5.4.0 — ATOMIC CHUNKING: dropdown state pages get exactly
+        # 1 chunk. The splitter is bypassed entirely for these pages.
+        # dropdown_state is the authoritative signal — URL-independent.
+        is_dropdown_state = bool(page.get("dropdown_state", ""))
+
+        if is_dropdown_state:
+            # Single atomic chunk — no splitting
+            # chunk_index=0, total_chunks=1 so HQA pipeline is unaffected
+            if len(content_with_title.strip()) >= 50:
+                chunks.append({
+                    "chunk_id":             str(uuid.uuid4()),
+                    "content":              content_with_title.strip(),
+                    "source_url":           url,
+                    "title":                title,
+                    "section":              section,
+                    "audience":             audience,
+                    "scraped_at":           page.get("scraped_at", ""),
+                    "chunk_index":          0,
+                    "total_chunks":         1,
+                    "content_hash":         page_hash,
+                    "augmented_questions":  "",
+                    "title_questions":      "",
+                    "has_video":        page.get("has_video", False),
+                    "content_type":     page.get("content_type", "article"),
+                    "product_category": page.get("product_category", "general"),
+                    "description":      page.get("description", ""),
+                    "thumbnail_url":    page.get("thumbnail_url", ""),
+                    "publish_date":     page.get("publish_date", ""),
+                    "collection_name":  page.get("collection_name", ""),
+                    "read_time_mins":   page.get("read_time_mins", "5"),
+                })
+                log.info(
+                    "dropdown_atomic_chunk",
+                    url=url,
+                    dropdown_state=page.get("dropdown_state"),
+                    chars=len(content_with_title),
+                )
+            continue  # Skip splitter for this page
+
+        # Standard page — normal splitting
         splits = splitter.split_text(content_with_title)
 
         for i, split in enumerate(splits):
