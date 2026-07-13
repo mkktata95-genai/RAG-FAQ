@@ -233,6 +233,45 @@ v1.7.0 — July 2026 | Mukesh Kund
            "cache_check" — same downstream behaviour.
 
          DOTENV FIX:
+
+v1.8.0 — July 2026 | Mukesh Kund
+         Expanded OBVIOUS_GREETINGS / FAREWELLS / THANKS sets
+
+         PROBLEM: "How are you?" and other common chitchat
+         phrases were falling through quick_intent_check() (no
+         match) → reaching classifier_node → burning a
+         gpt-4o-mini LLM call just to return CHITCHAT → 30-second
+         latency for a phrase that needs zero intelligence.
+
+         FIX — OBVIOUS_GREETINGS expanded from 8 to 26 phrases:
+         - Added chitchat openers: "how are you", "how are you
+           doing", "how are you today", "how r u", "how r you",
+           "hru", "how is it going", "how's it going",
+           "hows it going", "how are things", "how are things
+           going", "what's up", "whats up", "wassup", "wazzup",
+           "how do you do", "how have you been", "you alright",
+           "you ok", "you okay", "are you there",
+           "is anyone there", "anyone there"
+         - Added single-word variations: "heya", "yo", "sup",
+           "greetings", "salutations", "alright"
+         - OBVIOUS_FAREWELLS expanded: added "ciao", "cheerio",
+           "toodles", "ttyl", "talk later", "see you later",
+           "night", "nite", "all done", "that's all",
+           "no more questions", "nothing else", "i'm done" etc.
+         - OBVIOUS_THANKS expanded: added "ta", "thanks so much",
+           "much appreciated", "thanks for your help",
+           "that's helpful", "that helped", "brilliant" etc.
+
+         DESIGN NOTE: Hardcoding is intentional for this set.
+         These are sub-5-word, unambiguous social phrases that
+         carry no insurance intent under any interpretation.
+         The LLM classifier is reserved for ambiguous cases
+         where intent is genuinely unclear. Any phrase NOT in
+         these sets still falls through to the classifier — the
+         rule is exact-match only (after lowercase + strip punct).
+
+         Sets kept in sync between supervisor.py (quick path)
+         and classifier_node.py (secondary check) — both updated.
          - was: load_dotenv() — no args, no override
          - now: load_dotenv(find_dotenv(usecwd=False), override=True)
            find_dotenv: works regardless of CWD
@@ -262,18 +301,44 @@ AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
 # runs, saving an unnecessary gpt-4o-mini call.
 # Classifier_node handles all LLM-based classification.
 OBVIOUS_GREETINGS = {
-    "hi", "hello", "hey", "hiya", "howdy",
-    "good morning", "good afternoon",
-    "good evening", "good night",
+    # One-word
+    "hi", "hello", "hey", "hiya", "howdy", "heya", "yo",
+    "sup", "greetings", "salutations",
+    # Time-of-day
+    "good morning", "good afternoon", "good evening",
+    "good night", "good day",
+    # Chitchat openers (no LLM needed — standard deflect)
+    "how are you", "how are you doing", "how are you today",
+    "how r u", "how r you", "hru",
+    "how is it going", "how's it going", "hows it going",
+    "how are things", "how are things going",
+    "what's up", "whats up", "wassup", "wazzup",
+    "how do you do", "how have you been",
+    "you alright", "you ok", "you okay",
+    "alright", "alright then",
+    "are you there", "is anyone there", "is there anyone",
+    "anyone there",
 }
 OBVIOUS_FAREWELLS = {
-    "bye", "goodbye", "good bye", "see you",
-    "see ya", "take care", "farewell",
+    "bye", "goodbye", "good bye", "see you", "see ya",
+    "take care", "farewell", "ciao", "cheerio", "toodles",
+    "ttyl", "talk later", "talk to you later",
+    "see you later", "see you soon", "later", "later on",
+    "have a good day", "have a great day", "have a nice day",
+    "good night", "night", "nite",
+    "all done", "that's all", "thats all", "that will be all",
+    "no more questions", "nothing else", "nothing more",
+    "i'm done", "im done", "done for now",
 }
 OBVIOUS_THANKS = {
-    "thanks", "thank you", "cheers",
-    "thank you so much", "thanks a lot",
-    "many thanks", "appreciated",
+    "thanks", "thank you", "cheers", "ta",
+    "thank you so much", "thanks a lot", "thanks so much",
+    "many thanks", "appreciated", "much appreciated",
+    "thank you very much", "thanks very much",
+    "thanks for your help", "thank you for your help",
+    "that's helpful", "thats helpful", "very helpful",
+    "that helped", "that was helpful",
+    "great help", "brilliant", "perfect", "lovely",
 }
 
 # ── Empathy & Financial Disclaimer Detection ─────────────────

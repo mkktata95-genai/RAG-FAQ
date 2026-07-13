@@ -67,6 +67,31 @@ v1.0.0 — July 2026 | Mukesh Kund
          - generator_node() now reads state.built_prompt set by
            this node rather than calling build_user_prompt().
 
+v1.1.0 — July 2026 | Mukesh Kund
+         URL-in-body rule added to SYSTEM_PROMPT
+
+         PROBLEM (observed in sprint 1 testing):
+         - LLM was writing full royallondon.com URLs inline in
+           response body text (e.g. "please visit royallondon.com/
+           existing-customers/contact-us/"). These appeared as
+           plain text in the chat bubble — ugly and duplicating
+           what the citation pills already render.
+         - Root cause: CITATION RULE said "do not repeat source
+           URLs" but did not explicitly prohibit URLs in the
+           response body text. The LLM interpreted handoff URLs
+           (from HUMAN HANDOFF RULE and PHONE NUMBER RULE) as
+           license to write any URL inline.
+
+         FIX — URL IN BODY RULE added to SYSTEM_PROMPT:
+         - Explicitly prohibits any URL or web address in the
+           response body text.
+         - Exception: handoff URLs at the END of the response
+           (required by HUMAN HANDOFF RULE and PHONE NUMBER RULE)
+           — these are the only legitimate inline URLs.
+         - Rationale: demo.html citation pills already display
+           clickable links from the citations array. Writing URLs
+           in text is redundant and makes mobile display messy.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -278,6 +303,16 @@ source links separately. The URL shown in brackets after
 each source label in the context below is for your
 reference only, to identify which [n] corresponds to
 which source — never reproduce that URL in your answer.
+URL IN BODY RULE:
+NEVER write any URL or web address in the body of your
+response text. This includes royallondon.com URLs,
+contact page links, adviser finder links, or any other
+web address. URLs are rendered automatically by the
+interface as citation pills attached to [1][2][3] markers.
+The ONLY exceptions are the exact URLs listed in the
+PHONE NUMBER RULE below for handoff situations — and
+even those must appear only in the handoff sentence at
+the end of the response, never mid-text.
 IMPORTANT — DOMAIN RESTRICTION:
 Only cite sources from royallondon.com.
 Do NOT include or link to any external website URLs

@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Aria — RLG AI Assistant</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.development.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.development.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #f3f4f6;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .header {
+      background: white;
+      border-bottom: 1px solid #e5e7eb;
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    .header-left { display: flex; align-items: center; gap: 10px; }
+    .avatar {
+      width: 36px; height: 36px; border-radius: 50%;
+      background: #4f46e5; color: white;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 700; font-size: 14px; flex-shrink: 0;
+    }
+    .avatar.user { background: #6b7280; }
+    .header-name { font-weight: 600; font-size: 14px; color: #111827; }
+    .header-status { font-size: 11px; color: #22c55e; display: flex; align-items: center; gap: 4px; }
+    .status-dot { width: 6px; height: 6px; border-radius: 50%; background: #22c55e; display: inline-block; }
+    .settings-btn {
+      font-size: 11px; padding: 4px 10px;
+      border: 1px solid #e5e7eb; border-radius: 6px;
+      background: white; cursor: pointer; color: #6b7280;
+    }
+    .settings-btn:hover { border-color: #d1d5db; color: #374151; }
+
+    .settings-bar {
+      background: #fffbeb; border-bottom: 1px solid #fde68a;
+      padding: 8px 16px; display: flex; align-items: center; gap: 8px;
+    }
+    .settings-bar label { font-size: 12px; font-weight: 600; color: #92400e; }
+    .settings-bar input {
+      flex: 1; border: 1px solid #fcd34d; border-radius: 6px;
+      padding: 4px 8px; font-size: 11px; font-family: monospace;
+      background: white; color: #374151;
+    }
+    .settings-bar button { font-size: 12px; font-weight: 600; color: #92400e; background: none; border: none; cursor: pointer; }
+
+    .messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; }
+    .messages-inner { max-width: 680px; margin: 0 auto; width: 100%; }
+
+    .message-row { display: flex; align-items: flex-end; gap: 10px; margin-bottom: 16px; }
+    .message-row.user { flex-direction: row-reverse; }
+
+    .bubble {
+      max-width: 520px; padding: 10px 14px;
+      border-radius: 18px; font-size: 14px;
+      line-height: 1.6;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+    }
+    .bubble.assistant {
+      background: white; border: 1px solid #e5e7eb;
+      color: #1f2937; border-bottom-left-radius: 4px;
+    }
+    .bubble.user {
+      background: #4f46e5; color: white;
+      border-bottom-right-radius: 4px;
+      white-space: pre-wrap;
+    }
+
+    /* Markdown rendered content */
+    .md-content p { margin-bottom: 8px; }
+    .md-content p:last-child { margin-bottom: 0; }
+    .md-content strong { font-weight: 600; color: #111827; }
+    .md-content ul { padding-left: 18px; margin-bottom: 8px; }
+    .md-content ul li { margin-bottom: 4px; }
+    .md-content ol { padding-left: 18px; margin-bottom: 8px; }
+    .md-content ol li { margin-bottom: 4px; }
+    .md-content h1, .md-content h2, .md-content h3 {
+      font-weight: 600; margin-bottom: 6px; margin-top: 10px; color: #111827;
+    }
+    .md-content h1 { font-size: 16px; }
+    .md-content h2 { font-size: 15px; }
+    .md-content h3 { font-size: 14px; }
+    .md-content h1:first-child,
+    .md-content h2:first-child,
+    .md-content h3:first-child { margin-top: 0; }
+
+    .cursor {
+      display: inline-block; width: 2px; height: 16px;
+      background: #4f46e5; margin-left: 2px;
+      animation: blink 1s infinite; vertical-align: middle;
+    }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
+    .citations { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+    .citation-badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 2px 8px; background: #eef2ff;
+      border: 1px solid #c7d2fe; border-radius: 20px;
+      font-size: 11px; color: #4338ca; text-decoration: none;
+    }
+    .citation-badge:hover { background: #e0e7ff; }
+    .citation-num { font-weight: 700; }
+    .citation-title { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .meta { margin-top: 4px; font-size: 11px; color: #9ca3af; display: flex; gap: 8px; align-items: center; }
+    .meta-cached { color: #f59e0b; }
+
+    .typing-row { display: flex; align-items: flex-end; gap: 10px; margin-bottom: 16px; }
+    .typing-bubble {
+      background: white; border: 1px solid #e5e7eb;
+      border-radius: 18px; border-bottom-left-radius: 4px;
+      padding: 12px 16px; display: flex; gap: 4px; align-items: center;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #a5b4fc; animation: bounce 1.2s infinite; }
+    .dot:nth-child(2) { animation-delay: 0.2s; }
+    .dot:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes bounce { 0%,60%,100%{ transform: translateY(0); } 30%{ transform: translateY(-6px); } }
+
+    .suggestions { padding: 0 16px 8px; }
+    .suggestions-inner { max-width: 680px; margin: 0 auto; display: flex; flex-wrap: wrap; gap: 8px; }
+    .suggestion-btn {
+      font-size: 12px; padding: 6px 14px;
+      background: white; border: 1px solid #e5e7eb;
+      border-radius: 20px; color: #4b5563;
+      cursor: pointer; transition: all 0.15s;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    }
+    .suggestion-btn:hover { border-color: #a5b4fc; color: #4f46e5; }
+
+    .error-bar { text-align: center; margin-bottom: 12px; }
+    .error-msg {
+      font-size: 11px; color: #ef4444;
+      background: #fef2f2; padding: 4px 12px;
+      border-radius: 20px; border: 1px solid #fecaca;
+    }
+
+    .input-area { background: white; border-top: 1px solid #e5e7eb; padding: 12px 16px; }
+    .input-inner { max-width: 680px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+    textarea {
+      flex: 1; border: 1px solid #e5e7eb; border-radius: 12px;
+      padding: 10px 14px; font-size: 14px; font-family: inherit;
+      resize: none; outline: none; color: #1f2937;
+      transition: border-color 0.15s;
+      min-height: 42px; max-height: 120px;
+    }
+    textarea:focus { border-color: #6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,0.1); }
+    textarea:disabled { background: #f9fafb; color: #9ca3af; }
+    .send-btn {
+      width: 42px; height: 42px; border-radius: 12px;
+      background: #4f46e5; border: none; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      transition: background 0.15s; flex-shrink: 0;
+    }
+    .send-btn:hover:not(:disabled) { background: #4338ca; }
+    .send-btn:disabled { background: #e5e7eb; cursor: not-allowed; }
+    .spinner {
+      width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.4);
+      border-top-color: white; border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .disclaimer { max-width: 680px; margin: 6px auto 0; text-align: center; font-size: 11px; color: #9ca3af; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useRef, useEffect } = React;
+
+    const SUGGESTED = [
+      "How do I make a claim?",
+      "How do I contact Royal London?",
+      "What is income protection?",
+      "How do I find a lost pension?",
+    ];
+
+    // ── Simple Markdown Renderer ──────────────────────────────
+    function renderMarkdown(text) {
+      if (!text) return [];
+      const lines = text.split("\n");
+      const elements = [];
+      let i = 0;
+      let key = 0;
+
+      while (i < lines.length) {
+        const line = lines[i];
+
+        // Blank line
+        if (line.trim() === "") { i++; continue; }
+
+        // Heading
+        if (line.startsWith("### ")) {
+          elements.push(<h3 key={key++}>{parseInline(line.slice(4))}</h3>);
+          i++; continue;
+        }
+        if (line.startsWith("## ")) {
+          elements.push(<h2 key={key++}>{parseInline(line.slice(3))}</h2>);
+          i++; continue;
+        }
+        if (line.startsWith("# ")) {
+          elements.push(<h1 key={key++}>{parseInline(line.slice(2))}</h1>);
+          i++; continue;
+        }
+
+        // Unordered list
+        if (line.match(/^(\s*[-*+])\s/)) {
+          const items = [];
+          while (i < lines.length && lines[i].match(/^(\s*[-*+])\s/)) {
+            const content = lines[i].replace(/^\s*[-*+]\s/, "");
+            items.push(<li key={i}>{parseInline(content)}</li>);
+            i++;
+          }
+          elements.push(<ul key={key++}>{items}</ul>);
+          continue;
+        }
+
+        // Ordered list
+        // Uses a running counter so numbering is continuous
+        // even when GPT intersperses bullet points between
+        // numbered sections (e.g. 1. Header: • item • item 2. Header)
+        if (line.match(/^\d+\.\s/)) {
+          const items = [];
+          let olCounter = 1;
+          while (i < lines.length) {
+            const l = lines[i];
+            if (l.match(/^\d+\.\s/)) {
+              // Numbered heading line
+              const content = l.replace(/^\d+\.\s/, "");
+              items.push(<li key={i} value={olCounter}>{parseInline(content)}</li>);
+              olCounter++;
+              i++;
+            } else if (l.match(/^\s*[-*+]\s/)) {
+              // Bullet point nested under the current numbered section
+              // Render as a sub-list item so it stays visually grouped
+              const content = l.replace(/^\s*[-*+]\s/, "");
+              items.push(
+                <li key={i} style={{listStyleType:"disc", marginLeft:"16px", fontWeight:"normal"}}>
+                  {parseInline(content)}
+                </li>
+              );
+              i++;
+            } else if (l.trim() === "") {
+              // Blank line — keep going in case more numbered items follow
+              i++;
+            } else {
+              // Non-list line — end the ordered list
+              break;
+            }
+          }
+          elements.push(<ol key={key++}>{items}</ol>);
+          continue;
+        }
+
+        // Normal paragraph
+        elements.push(<p key={key++}>{parseInline(line)}</p>);
+        i++;
+      }
+
+      return elements;
+    }
+
+    // Parse inline: **bold**, *italic*, [text](url), [1]
+    function parseInline(text) {
+      const parts = [];
+      const regex = /(\*\*(.+?)\*\*|\*(.+?)\*|\[([^\]]+)\]\(([^)]+)\)|\[(\d+)\])/g;
+      let last = 0;
+      let match;
+      let key = 0;
+
+      while ((match = regex.exec(text)) !== null) {
+        if (match.index > last) {
+          parts.push(text.slice(last, match.index));
+        }
+        if (match[2]) {
+          // **bold**
+          parts.push(<strong key={key++}>{match[2]}</strong>);
+        } else if (match[3]) {
+          // *italic*
+          parts.push(<em key={key++}>{match[3]}</em>);
+        } else if (match[4] && match[5]) {
+          // [text](url)
+          parts.push(
+            <a key={key++} href={match[5]} target="_blank" rel="noopener noreferrer"
+               style={{color:"#4f46e5", textDecoration:"underline"}}>
+              {match[4]}
+            </a>
+          );
+        } else if (match[6]) {
+          // [1] citation marker — keep as-is styled
+          parts.push(
+            <sup key={key++} style={{color:"#6366f1", fontWeight:600, fontSize:"11px"}}>
+              [{match[6]}]
+            </sup>
+          );
+        }
+        last = match.index + match[0].length;
+      }
+
+      if (last < text.length) parts.push(text.slice(last));
+      return parts;
+    }
+
+    function MarkdownContent({ text, streaming }) {
+      const elements = renderMarkdown(text);
+      return (
+        <div className="md-content">
+          {elements}
+          {streaming && text && <span className="cursor" />}
+        </div>
+      );
+    }
+
+    function CitationBadge({ c }) {
+      return (
+        <a href={c.url} target="_blank" rel="noopener noreferrer" className="citation-badge">
+          <span className="citation-num">[{c.index}]</span>
+          <span className="citation-title">{c.title || c.section}</span>
+        </a>
+      );
+    }
+
+    function Message({ msg }) {
+      const isUser = msg.role === "user";
+      return (
+        <div className={`message-row ${isUser ? "user" : ""}`}>
+          <div className={`avatar ${isUser ? "user" : ""}`}>{isUser ? "Y" : "A"}</div>
+          <div>
+            <div className={`bubble ${isUser ? "user" : "assistant"}`}>
+              {isUser
+                ? msg.content
+                : <MarkdownContent text={msg.content} streaming={msg.streaming} />
+              }
+            </div>
+            {msg.citations && msg.citations.length > 0 && (
+              <div className="citations">
+                {msg.citations.map((c, i) => <CitationBadge key={i} c={c} />)}
+              </div>
+            )}
+            {msg.meta && (
+              <div className="meta">
+                {msg.meta.cached && <span className="meta-cached">⚡ Cached</span>}
+                {msg.meta.model_used && <span>{msg.meta.model_used}</span>}
+                {msg.meta.latency_ms && (
+                  <span>
+                    {Math.round(Object.values(msg.meta.latency_ms).reduce((a,b)=>a+b,0))}ms
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    function TypingIndicator() {
+      return (
+        <div className="typing-row">
+          <div className="avatar">A</div>
+          <div className="typing-bubble">
+            <div className="dot" /><div className="dot" /><div className="dot" />
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [messages, setMessages] = useState([{
+        id: 0, role: "assistant",
+        content: "Hello! I'm Aria, RLG's AI Assistant. I'm here to help you with questions about Royal London insurance, pensions, ISAs and other financial products. How can I help you today?",
+        citations: [],
+      }]);
+      const [input, setInput]               = useState("");
+      const [loading, setLoading]           = useState(false);
+      const [error, setError]               = useState(null);
+      const [showTyping, setShowTyping]     = useState(false);
+      const [backendUrl, setBackendUrl]     = useState("http://127.0.0.1:8000");
+      const [showSettings, setShowSettings] = useState(false);
+      const bottomRef = useRef(null);
+      const inputRef  = useRef(null);
+
+      useEffect(() => {
+        bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      }, [messages, showTyping]);
+
+      const history = messages
+        .filter(m => m.id !== 0)
+        .map(m => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content }));
+
+      const send = async (query) => {
+        if (!query.trim() || loading) return;
+        const userMsg = { id: Date.now(), role: "user", content: query.trim() };
+        setMessages(prev => [...prev, userMsg]);
+        setInput("");
+        setLoading(true);
+        setShowTyping(true);
+        setError(null);
+        const aId = Date.now() + 1;
+
+        try {
+          const res = await fetch(`${backendUrl}/api/chat`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ query: query.trim(), conversation_history: history }),
+          });
+          if (!res.ok) throw new Error(`Server error: ${res.status}`);
+
+          const reader  = res.body.getReader();
+          const decoder = new TextDecoder();
+          let fullText  = "";
+          let started   = false;
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const lines = decoder.decode(value).split("\n");
+            for (const line of lines) {
+              if (!line.startsWith("data: ")) continue;
+              try {
+                const data = JSON.parse(line.slice(6));
+                if (data.token) {
+                  if (!started) {
+                    setShowTyping(false);
+                    setMessages(prev => [...prev, {
+                      id: aId, role: "assistant",
+                      content: "", streaming: true, citations: [],
+                    }]);
+                    started = true;
+                  }
+                  fullText += data.token;
+                  setMessages(prev => prev.map(m =>
+                    m.id === aId ? { ...m, content: fullText } : m
+                  ));
+                }
+                if (data.done) {
+                  setMessages(prev => prev.map(m =>
+                    m.id === aId ? {
+                      ...m, content: fullText, streaming: false,
+                      citations: data.citations || [],
+                      meta: { cached: data.cached, model_used: data.model_used, latency_ms: data.latency_ms }
+                    } : m
+                  ));
+                }
+                if (data.error) {
+                  setShowTyping(false);
+                  setMessages(prev => [...prev, {
+                    id: aId, role: "assistant", content: data.error, streaming: false, citations: [],
+                  }]);
+                }
+              } catch(e) {}
+            }
+          }
+        } catch(err) {
+          setShowTyping(false);
+          setError(`${err.message} — Is the backend running on ${backendUrl}?`);
+        } finally {
+          setLoading(false);
+          setShowTyping(false);
+          inputRef.current?.focus();
+        }
+      };
+
+      const onKey = (e) => {
+        if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); }
+      };
+
+      return (
+        <>
+          <div className="header">
+            <div className="header-left">
+              <div className="avatar">A</div>
+              <div>
+                <div className="header-name">Aria</div>
+                <div className="header-status"><span className="status-dot" /> RLG AI Assistant</div>
+              </div>
+            </div>
+            <button className="settings-btn" onClick={() => setShowSettings(!showSettings)}>⚙ Settings</button>
+          </div>
+
+          {showSettings && (
+            <div className="settings-bar">
+              <label>Backend URL:</label>
+              <input type="text" value={backendUrl} onChange={e => setBackendUrl(e.target.value)} placeholder="http://127.0.0.1:8000" />
+              <button onClick={() => setShowSettings(false)}>Done</button>
+            </div>
+          )}
+
+          <div className="messages">
+            <div className="messages-inner">
+              {messages.map(m => <Message key={m.id} msg={m} />)}
+              {showTyping && <TypingIndicator />}
+              {error && <div className="error-bar"><span className="error-msg">⚠ {error}</span></div>}
+              <div ref={bottomRef} />
+            </div>
+          </div>
+
+          {messages.length === 1 && !loading && (
+            <div className="suggestions">
+              <div className="suggestions-inner">
+                {SUGGESTED.map((q, i) => (
+                  <button key={i} className="suggestion-btn" onClick={() => send(q)}>{q}</button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="input-area">
+            <div className="input-inner">
+              <textarea
+                ref={inputRef} value={input}
+                onChange={e => setInput(e.target.value)}
+                onKeyDown={onKey}
+                placeholder="Ask about Royal London insurance, pensions or ISAs..."
+                disabled={loading} rows={1}
+              />
+              <button className="send-btn" onClick={() => send(input)} disabled={loading || !input.trim()}>
+                {loading
+                  ? <div className="spinner" />
+                  : <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" />
+                    </svg>
+                }
+              </button>
+            </div>
+            <div className="disclaimer">
+              Aria may make mistakes. For complex queries contact Royal London on 0345 600 0371
+            </div>
+          </div>
+        </>
+      );
+    }
+
+    ReactDOM.render(<App />, document.getElementById("root"));
+  </script>
+</body>
+</html>

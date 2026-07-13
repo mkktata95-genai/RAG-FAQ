@@ -77,6 +77,13 @@ v1.0.0 — July 2026 | Mukesh Kund
          - AZURE_OPENAI_DEPLOYMENT_CLASSIFICATION = gpt-4o-mini
            (separate env var, separate from DEPLOYMENT_FAST)
 
+v1.1.0 — July 2026 | Mukesh Kund
+         Expanded OBVIOUS_GREETINGS / FAREWELLS / THANKS sets
+         (companion change to supervisor.py v1.8.0)
+
+         Sets kept in sync with supervisor.py. See supervisor.py
+         v1.8.0 CHANGE LOG for full rationale and phrase list.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -151,18 +158,44 @@ def get_openai_client() -> AzureOpenAI:
 # supervisor already handled it (state.final_response set), this
 # node is never reached.
 OBVIOUS_GREETINGS = {
-    "hi", "hello", "hey", "hiya", "howdy",
-    "good morning", "good afternoon",
-    "good evening", "good night",
+    # One-word
+    "hi", "hello", "hey", "hiya", "howdy", "heya", "yo",
+    "sup", "greetings", "salutations",
+    # Time-of-day
+    "good morning", "good afternoon", "good evening",
+    "good night", "good day",
+    # Chitchat openers (no LLM needed — standard deflect)
+    "how are you", "how are you doing", "how are you today",
+    "how r u", "how r you", "hru",
+    "how is it going", "how's it going", "hows it going",
+    "how are things", "how are things going",
+    "what's up", "whats up", "wassup", "wazzup",
+    "how do you do", "how have you been",
+    "you alright", "you ok", "you okay",
+    "alright", "alright then",
+    "are you there", "is anyone there", "is there anyone",
+    "anyone there",
 }
 OBVIOUS_FAREWELLS = {
-    "bye", "goodbye", "good bye", "see you",
-    "see ya", "take care", "farewell",
+    "bye", "goodbye", "good bye", "see you", "see ya",
+    "take care", "farewell", "ciao", "cheerio", "toodles",
+    "ttyl", "talk later", "talk to you later",
+    "see you later", "see you soon", "later", "later on",
+    "have a good day", "have a great day", "have a nice day",
+    "good night", "night", "nite",
+    "all done", "that's all", "thats all", "that will be all",
+    "no more questions", "nothing else", "nothing more",
+    "i'm done", "im done", "done for now",
 }
 OBVIOUS_THANKS = {
-    "thanks", "thank you", "cheers",
-    "thank you so much", "thanks a lot",
-    "many thanks", "appreciated",
+    "thanks", "thank you", "cheers", "ta",
+    "thank you so much", "thanks a lot", "thanks so much",
+    "many thanks", "appreciated", "much appreciated",
+    "thank you very much", "thanks very much",
+    "thanks for your help", "thank you for your help",
+    "that's helpful", "thats helpful", "very helpful",
+    "that helped", "that was helpful",
+    "great help", "brilliant", "perfect", "lovely",
 }
 
 # ── Greeting responses (moved from supervisor.py) ─────────────

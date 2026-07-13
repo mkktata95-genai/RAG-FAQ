@@ -451,6 +451,46 @@ v2.0.0 — July 2026 | Mukesh Kund
          - was: load_dotenv() — no args, no override
          - now: load_dotenv(find_dotenv(usecwd=False), override=True)
 
+v2.1.0 — July 2026 | Mukesh Kund
+         Four production fixes
+
+         FIX 1 — "should i" removed from simple_indicators
+         (is_simple_query):
+         - "should i" was in the simple_indicators keyword list,
+           routing queries like "should i transfer my pension?" to
+           DEPLOYMENT_FAST (gpt-4o). However supervisor.py's
+           FINANCIAL_DECISION_TRIGGERS includes "should i" —
+           meaning the query gets needs_disclaimer=True (correct)
+           but also routes to the weaker model (wrong). For any
+           FCA-regulated query needing a disclaimer, DEPLOYMENT_MAIN
+           must handle it. Removed "should i" from simple_indicators.
+
+         FIX 2 — Dynamic max_tokens by query_type:
+         - Was hardcoded at 800. BROAD queries (pension type
+           overviews, ISA comparisons) were being truncated
+           mid-answer at 800 tokens.
+         - Now: max_tokens = 1200 for BROAD, 800 for SPECIFIC.
+         - 1200 gives sufficient headroom for a comprehensive
+           multi-type overview while staying well within the
+           model's context window and cost budget.
+
+         FIX 3 — extract_citations() duplicate index guard:
+         - Added seen_indices set alongside existing seen_urls set.
+         - Guards against the same retrieved_chunks index appearing
+           under two different original citation numbers (e.g. model
+           writes [1] and [3] both referring to the same chunk).
+           Without this, two Citation objects could be created for
+           the same chunk — one would have wrong index number and
+           pill labels could appear out of order in the UI.
+
+         FIX 4 — clean_response_text() expanded:
+         - Now also strips markdown horizontal rules (--- *** ___)
+           that gpt-4.1 occasionally emits between sections.
+         - Strips trailing whitespace per line.
+         - Collapses 3+ consecutive blank lines to max 2.
+         - These artefacts were rendering as blank gaps / horizontal
+           lines inside the demo.html bubble markdown renderer.
+
 ═══════════════════════════════════════════════════════════════
 """
 import os
@@ -667,9 +707,12 @@ def is_simple_query(
         len(query.split()) < 10,
         "?" in query and query.count("?") == 1,
         any(w in query_lower for w in [
-            "what is", "how do i", "can i", "should i",
+            "what is", "how do i", "can i",
             "where", "when", "who", "contact",
             "phone", "number", "what happens",
+            # NOTE: "should i" intentionally excluded — it signals a
+            # financial decision query (needs_disclaimer=True in
+            # supervisor.py) and must route to DEPLOYMENT_MAIN.
         ]),
     ]
     return sum(simple_indicators) >= 2
@@ -677,13 +720,24 @@ def is_simple_query(
 
 def clean_response_text(text: str) -> str:
     """
-    Post-process LLM response to fix formatting issues.
-    Removes asterisk wrapping from disclaimer lines.
+    Post-process LLM response to fix formatting issues:
+    1. Strips markdown horizontal rules (--- / *** / ___)
+       that gpt-4.1 occasionally inserts between sections.
+    2. Removes single-asterisk wrapping from disclaimer lines
+       (*disclaimer text* → disclaimer text).
+    3. Strips trailing whitespace per line.
+    4. Collapses 3+ consecutive blank lines → max 2.
     """
     lines   = text.split("\n")
     cleaned = []
     for line in lines:
         stripped = line.strip()
+
+        # Drop markdown horizontal rules
+        if re.match(r"^[-*_]{3,}$", stripped):
+            continue
+
+        # Strip single-asterisk wrapping (not **bold** or bullet point)
         if (
             stripped.startswith("*")
             and stripped.endswith("*")
@@ -691,8 +745,12 @@ def clean_response_text(text: str) -> str:
             and not stripped.startswith("* ")
         ):
             line = line.replace(stripped, stripped[1:-1])
-        cleaned.append(line)
-    return "\n".join(cleaned)
+
+        cleaned.append(line.rstrip())
+
+    # Collapse 3+ blank lines to max 2
+    result = re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned))
+    return result.strip()
 
 
 def extract_citations(
@@ -727,16 +785,26 @@ def extract_citations(
         r'\[(\d+)\]', replace_citation, response_text
     )
 
-    # Build citations list using new numbering
-    citations = []
-    seen_urls = set()
+    # Build citations list using new numbering.
+    # seen_urls deduplicates by URL — if two chunks share the same
+    # source_url (different sections of the same page), only the
+    # first-cited chunk's title/section is used for the pill label.
+    # seen_indices guards against the same chunk index appearing
+    # under two different original citation numbers (e.g. model
+    # wrote [1] and [3] both mapping to retrieved_chunks[0]).
+    citations   = []
+    seen_urls   = set()
+    seen_indices = set()
 
     for orig_num, new_num in sorted(
         seen_order.items(), key=lambda x: x[1]
     ):
         idx = int(orig_num) - 1
+        if idx in seen_indices:
+            continue
         if 0 <= idx < len(state.retrieved_chunks):
             chunk = state.retrieved_chunks[idx]
+            seen_indices.add(idx)
             if chunk.source_url not in seen_urls:
                 citations.append(Citation(
                     index=new_num,
@@ -802,13 +870,17 @@ def generator_node(state: AgentState) -> AgentState:
                 f"insurance, pensions and ISA products only."
             )
 
+        # BROAD queries (overview, multi-product) need more tokens.
+        # SPECIFIC queries: 800 is sufficient for a concise FAQ answer.
+        max_tokens = 1200 if state.query_type == "BROAD" else 800
+
         response = client.chat.completions.create(
             model=deployment,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": user_prompt},
             ],
-            max_tokens=800,
+            max_tokens=max_tokens,
             temperature=0.1,
         )
 
