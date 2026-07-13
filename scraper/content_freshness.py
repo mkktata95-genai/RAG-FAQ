@@ -22,7 +22,7 @@ DECISION LOG (v1.0.0):
     flushed. A full flush on every run would destroy valid cached
     answers for unchanged pages.
   - content_hash stored in Azure AI Search (retrievable=True,
-    v5.3.0 of chunk_and_index_hqaV4.py). This is the source of
+    v5.2.0 of chunk_and_index_hqaV3.py). This is the source of
     truth for what was indexed. Blob hash state (content_hashes.json)
     is written as a backup after every apply run.
   - Dropdown pages (scraper v4.4.0+): pages with routing <select>
@@ -119,8 +119,8 @@ PRODUCTION — AZURE CONTAINER APPS JOB (DevOps)
 #   3. aria-freshness-job    → skipped (or run report mode)
 #   The freshness job is NOT part of the manual full re-index flow.
 #
-# IMPORTANT — first run after deploying v5.3.0 of indexer:
-#   The full re-index (--full on chunk_and_index_hqaV4.py) must
+# IMPORTANT — first run after deploying v5.2.0 of indexer:
+#   The full re-index (--full on chunk_and_index_hqaV3.py) must
 #   complete before the freshness job runs for the first time.
 #   This refreshes stored hashes from MD5 (old) → SHA-256 (new).
 #   After that first re-index the nightly job works correctly.
@@ -166,6 +166,24 @@ v1.0.0 — July 2026 | Mukesh Kund
          scrape_url_with_dropdowns, scrape_urls_batch,
          chunk_page, get_embeddings_batch, index_pages,
          build_report, run_freshness_job, main
+
+v1.1.0 — July 2026 | Mukesh Kund
+         Atomic chunking for dropdown state pages — aligned with
+         chunk_and_index_hqaV4.py v5.4.0.
+
+         chunk_page() (delta indexing path) now applies the same
+         dropdown_state atomic chunking rule as chunk_pages() in
+         the full indexer. Both chunking functions must behave
+         identically — if a dropdown state page is re-indexed via
+         the nightly freshness job, it must produce the same single
+         atomic chunk as the full index run. Inconsistency between
+         the two paths would cause chunk count mismatches and
+         potentially split policy+contact content on freshness runs
+         even if the full index run was correct.
+
+         Signal: page.get("dropdown_state") non-empty string.
+         URL pattern not used — see chunk_and_index_hqaV4.py v5.4.0
+         changelog for full reasoning.
 
 ═══════════════════════════════════════════════════════════════
 """
@@ -1327,12 +1345,20 @@ def chunk_page(page: dict) -> list[dict]:
     """
     Split a page into index-ready chunks.
 
-    Mirrors chunk_pages() in chunk_and_index_hqaV3.py:
+    Mirrors chunk_pages() in chunk_and_index_hqaV4.py v5.4.0:
     - Same CHUNK_SIZE / CHUNK_OVERLAP
     - Same separator hierarchy
     - Same external URL stripping (clean_content) before hashing
-    - Title prepended to first chunk
+    - Title prepended to chunk content
     - HQA fields left empty (delta indexing — speed over HQA quality)
+    - v1.1.0: Atomic chunking for dropdown state pages
+
+    v1.1.0 — ATOMIC CHUNKING FOR DROPDOWN STATE PAGES:
+    If page.get("dropdown_state") is non-empty, this page is a
+    dropdown state entry (one per policy option). Produce exactly
+    1 chunk — no splitting — to guarantee policy context (title)
+    and contact details (content) are always in the same chunk.
+    Mirrors chunk_pages() v5.4.0 behaviour exactly.
 
     TODO: add --hqa flag if HQA on delta pages becomes a requirement.
     """
@@ -1354,11 +1380,50 @@ def chunk_page(page: dict) -> list[dict]:
     if len(content) < 50:
         return []
 
-    title   = page.get("title", "")
+    title              = page.get("title", "")
     content_with_title = f"{title}\n\n{content}" if title else content
-    splits  = splitter.split_text(content_with_title)
-    total   = len(splits)
-    chunks  = []
+
+    # v1.1.0 — ATOMIC CHUNKING: dropdown state pages get exactly 1 chunk.
+    # dropdown_state is the authoritative signal — not the URL pattern.
+    # Mirrors chunk_pages() in chunk_and_index_hqaV4.py v5.4.0 exactly.
+    is_dropdown_state = bool(page.get("dropdown_state", ""))
+
+    if is_dropdown_state:
+        if len(content_with_title.strip()) < 50:
+            return []
+        log.info(
+            "dropdown_atomic_chunk",
+            url=page.get("url", ""),
+            dropdown_state=page.get("dropdown_state"),
+            chars=len(content_with_title),
+        )
+        return [{
+            "chunk_id":            str(uuid.uuid4()),
+            "content":             content_with_title.strip(),
+            "source_url":          page["url"],
+            "title":               title,
+            "section":             page.get("section", "General"),
+            "audience":            page.get("audience", "general"),
+            "scraped_at":          page.get("scraped_at", ""),
+            "chunk_index":         0,
+            "total_chunks":        1,
+            "content_hash":        page.get("content_hash", ""),
+            "has_video":           page.get("has_video", False),
+            "content_type":        page.get("content_type", "article"),
+            "product_category":    page.get("product_category", "general"),
+            "description":         page.get("description", ""),
+            "thumbnail_url":       page.get("thumbnail_url", ""),
+            "publish_date":        page.get("publish_date", ""),
+            "collection_name":     page.get("collection_name", ""),
+            "read_time_mins":      page.get("read_time_mins", 1),
+            "augmented_questions": "",
+            "title_questions":     "",
+        }]
+
+    # Standard page — normal splitting
+    splits = splitter.split_text(content_with_title)
+    total  = len(splits)
+    chunks = []
 
     for idx, split in enumerate(splits):
         if len(split.strip()) < 50:
