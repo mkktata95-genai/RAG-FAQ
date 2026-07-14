@@ -432,8 +432,8 @@ import sys
 import time
 import traceback
 from pathlib import Path
-import urllib.parse
 from datetime import datetime, timezone
+import urllib.parse
 
 # nest_asyncio allows asyncio.run()-equivalent to work inside an already-running
 # event loop (Azure Functions, FastAPI, Jupyter). Optional — plain script use
@@ -553,6 +553,118 @@ def derive_section(url: str) -> str:
         return SECTION_MAP.get(first_segment, "General")
     except Exception:
         return "General"
+
+
+# ── CDP / Chrome subprocess (VDI fix v4.5.2) ────────────────────
+# crawl4ai 0.8.9 ignores chrome_channel and executable_path —
+# it always tries to use its own ms-playwright chromium which
+# VDI SSL restrictions block from downloading.
+# Solution: launch system Chrome with --remote-debugging-port
+# and connect crawl4ai to it via cdp_url. crawl4ai never
+# launches its own browser in CDP mode.
+
+_CDP_PORT    = int(os.getenv("PLAYWRIGHT_CDP_PORT", "9222"))
+_CDP_URL     = f"http://localhost:{_CDP_PORT}"
+_CHROME_PROC = None  # subprocess handle — module level
+
+
+def _start_chrome_cdp() -> bool:
+    """
+    Launch system Chrome with remote debugging.
+    Returns True if CDP mode should be used.
+
+    On Linux/production where PLAYWRIGHT_EXECUTABLE_PATH
+    does not exist, returns False — crawl4ai uses its own
+    Playwright browser normally (installed in Dockerfile).
+    """
+    global _CHROME_PROC
+    import socket
+    import subprocess
+    import time as _time
+
+    exec_path = PLAYWRIGHT_EXECUTABLE_PATH
+    if not exec_path or not os.path.exists(exec_path):
+        log.info("cdp_mode_skipped", reason="no_system_chrome_found")
+        return False
+
+    # Check if port already listening
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        already_up = s.connect_ex(("localhost", _CDP_PORT)) == 0
+
+    if already_up:
+        log.info("cdp_chrome_already_running", port=_CDP_PORT)
+        return True
+
+    try:
+        _CHROME_PROC = subprocess.Popen(
+            [
+                exec_path,
+                f"--remote-debugging-port={_CDP_PORT}",
+                "--headless=new",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Wait up to 7.5s for Chrome to be ready
+        for _ in range(15):
+            _time.sleep(0.5)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                if s.connect_ex(("localhost", _CDP_PORT)) == 0:
+                    log.info(
+                        "cdp_chrome_started",
+                        pid=_CHROME_PROC.pid,
+                        port=_CDP_PORT,
+                    )
+                    return True
+        log.error("cdp_chrome_start_timeout", port=_CDP_PORT)
+        return False
+    except Exception as e:
+        log.error("cdp_chrome_start_failed", error=str(e))
+        return False
+
+
+def _stop_chrome_cdp() -> None:
+    """Terminate Chrome subprocess if we launched it."""
+    global _CHROME_PROC
+    if _CHROME_PROC is not None:
+        try:
+            _CHROME_PROC.terminate()
+            _CHROME_PROC.wait(timeout=5)
+            log.info("cdp_chrome_stopped", pid=_CHROME_PROC.pid)
+        except Exception as e:
+            log.warning("cdp_chrome_stop_error", error=str(e))
+        _CHROME_PROC = None
+
+
+def _make_browser_config() -> BrowserConfig:
+    """
+    Build BrowserConfig. CDP mode on VDI, normal on production.
+
+    VDI: cdp_url set — crawl4ai connects to our Chrome subprocess.
+    Production: cdp_url=None — crawl4ai uses its own browser.
+    """
+    use_cdp = _start_chrome_cdp()
+    if use_cdp:
+        log.info("browser_config_mode", mode="CDP", url=_CDP_URL)
+        return BrowserConfig(
+            browser_type="chromium",
+            headless=True,
+            verbose=False,
+            cdp_url=_CDP_URL,
+        )
+    log.info("browser_config_mode", mode="normal_playwright")
+    return BrowserConfig(
+        browser_type="chromium",
+        headless=True,
+        verbose=False,
+    )
 
 
 # ── Step 0: Metadata extraction (v3.0.0) ────────────────────
@@ -2026,32 +2138,9 @@ def run_scraper(
 
         async def _run():
             pages_to_scrape = load_url_source(excel)
-            # VDI FIX: Set env var BEFORE crawl4ai initialises its browser.
-            # crawl4ai reads PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH at launch
-            # time — points it to system Chrome instead of the ms-playwright
-            # chromium that VDI SSL restrictions block from downloading.
-            # In production (Linux) PLAYWRIGHT_EXECUTABLE_PATH is unset or
-            # points to /usr/bin/google-chrome. os.path.exists() ensures
-            # this is a no-op when the path doesn't exist.
-            import os as _os
-            if PLAYWRIGHT_EXECUTABLE_PATH and _os.path.exists(PLAYWRIGHT_EXECUTABLE_PATH):
-                _os.environ["PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"] = PLAYWRIGHT_EXECUTABLE_PATH
-                log.info(
-                    "crawl4ai_using_system_chrome",
-                    path=PLAYWRIGHT_EXECUTABLE_PATH,
-                )
-
-            browser_config  = BrowserConfig(
-                browser_type="chromium",
-                headless=True,
-                verbose=False,
-                # v4.5.1 VDI FIX: chrome_channel="chrome" tells crawl4ai 0.8.9
-                # to use the system-installed Chrome instead of downloading its
-                # own ms-playwright chromium (blocked by VDI SSL restrictions).
-                # In production (Linux container) system Chrome is installed in
-                # the Dockerfile — this works in both environments.
-                chrome_channel="chrome",
-            )
+            # v4.5.2: Use _make_browser_config() — handles CDP mode
+            # (VDI) vs normal Playwright (production) automatically.
+            browser_config  = _make_browser_config()
             scraped      = []
             failed_urls  = []
             total        = len(pages_to_scrape)
@@ -2186,44 +2275,46 @@ async def main():
         return
 
     # ── Scrape in batches ───────────────────────────────
-    browser_config = BrowserConfig(
-        browser_type="chromium",
-        headless=True,
-        verbose=False,
-    )
+    # v4.5.2: CDP mode on VDI, normal Playwright on production.
+    browser_config = _make_browser_config()
 
     results = []
     failed_urls = []
     total = len(pages_to_scrape)
 
-    async with AsyncWebCrawler(config=browser_config) as crawler:
-        for batch_start in range(0, total, BATCH_SIZE):
-            batch = pages_to_scrape[batch_start:batch_start + BATCH_SIZE]
-            batch_num = batch_start // BATCH_SIZE + 1
-            total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+    try:
+        async with AsyncWebCrawler(config=browser_config) as crawler:
+            for batch_start in range(0, total, BATCH_SIZE):
+                batch = pages_to_scrape[batch_start:batch_start + BATCH_SIZE]
+                batch_num = batch_start // BATCH_SIZE + 1
+                total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
 
-            print(f"\nBatch {batch_num}/{total_batches}")
+                print(f"\nBatch {batch_num}/{total_batches}")
 
-            tasks = [
-                scrape_page(crawler, page_info, batch_start + i + 1, total)
-                for i, page_info in enumerate(batch)
-            ]
-            batch_results = await asyncio.gather(*tasks)
+                tasks = [
+                    scrape_page(crawler, page_info, batch_start + i + 1, total)
+                    for i, page_info in enumerate(batch)
+                ]
+                batch_results = await asyncio.gather(*tasks)
 
-            for page_info, result in zip(batch, batch_results):
-                if result is None:
-                    failed_urls.append(page_info["url"])
-                elif isinstance(result, list):
-                    # v4.4.0: multi-state dropdown page — flatten entries.
-                    results.extend(
-                        entry for entry in result
-                        if entry.get("content_length", 0) >= 20
-                    )
-                else:
-                    results.append(result)
+                for page_info, result in zip(batch, batch_results):
+                    if result is None:
+                        failed_urls.append(page_info["url"])
+                    elif isinstance(result, list):
+                        # v4.4.0: multi-state dropdown page — flatten entries.
+                        results.extend(
+                            entry for entry in result
+                            if entry.get("content_length", 0) >= 20
+                        )
+                    else:
+                        results.append(result)
 
-            if batch_start + BATCH_SIZE < total:
-                await asyncio.sleep(BATCH_DELAY_SECONDS)
+                if batch_start + BATCH_SIZE < total:
+                    await asyncio.sleep(BATCH_DELAY_SECONDS)
+
+    finally:
+        # Always stop Chrome CDP subprocess if we started it
+        _stop_chrome_cdp()
 
     # ── Save output ─────────────────────────────────────
     # v2.0.0: save_scraped_pages() abstracts local file vs
