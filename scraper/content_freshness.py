@@ -302,6 +302,22 @@ v1.2.2 — July 2026 | Mukesh Kund
          - PLAYWRIGHT_EXECUTABLE_PATH explicitly NOT added to
            Key Vault for production — omit entirely
 
+v1.2.3 — July 2026 | Mukesh Kund
+         Fix ValueError: I/O operation on closed pipe on Windows.
+         Aligned with scrape_approved_urls_updatedV4.py v4.5.3.
+
+         Same root cause and fix as scraper v4.5.3:
+         asyncio ProactorEventLoop on Windows GC-closes inherited
+         terminal handles from the Chrome subprocess after exit
+         — raises ValueError: I/O operation on closed pipe.
+
+         FIX in _cf_start_chrome_cdp():
+         - subprocess.CREATE_NO_WINDOW on Windows prevents Chrome
+           from inheriting terminal console handles.
+         - stdin=subprocess.DEVNULL added alongside stdout/stderr.
+         - creation_flags=0 on Linux/macOS — safe cross-platform.
+         - _cf_stop_chrome_cdp() pipe.close() retained as defence.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -373,9 +389,23 @@ _CF_CHROME_PROC = None
 
 
 def _cf_start_chrome_cdp() -> bool:
-    """Launch system Chrome with remote debugging for crawl4ai CDP mode."""
+    """
+    Launch system Chrome with remote debugging for crawl4ai CDP mode.
+
+    v1.2.3 FIX — CREATE_NO_WINDOW on Windows:
+    Without this flag, Chrome subprocess inherits terminal console
+    handles. asyncio's ProactorEventLoop on Windows tries to close
+    those handles during GC after subprocess exits, but they are
+    already gone → ValueError: I/O operation on closed pipe.
+    CREATE_NO_WINDOW gives Chrome its own isolated console handle
+    space. stdin=DEVNULL added explicitly for the same reason.
+    Linux/macOS: creation_flags=0 is a no-op (safe cross-platform).
+    """
     global _CF_CHROME_PROC
-    import socket, subprocess, time as _t
+    import socket
+    import subprocess
+    import sys as _sys
+    import time as _t
 
     exec_path = os.getenv(
         "PLAYWRIGHT_EXECUTABLE_PATH",
@@ -391,14 +421,23 @@ def _cf_start_chrome_cdp() -> bool:
             return True
 
     try:
+        # CREATE_NO_WINDOW: prevents Chrome from inheriting terminal
+        # handles — fixes ValueError: I/O operation on closed pipe
+        # on Windows asyncio ProactorEventLoop cleanup.
+        creation_flags = 0
+        if _sys.platform == "win32":
+            creation_flags = subprocess.CREATE_NO_WINDOW
+
         _CF_CHROME_PROC = subprocess.Popen(
             [exec_path,
              f"--remote-debugging-port={_CF_CDP_PORT}",
              "--headless=new", "--no-sandbox",
              "--disable-dev-shm-usage", "--disable-gpu",
              "--no-first-run", "--no-default-browser-check"],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            creationflags=creation_flags,
         )
         for _ in range(15):
             _t.sleep(0.5)
@@ -407,6 +446,7 @@ def _cf_start_chrome_cdp() -> bool:
                 if s.connect_ex(("localhost", _CF_CDP_PORT)) == 0:
                     log.info("cf_cdp_chrome_started", pid=_CF_CHROME_PROC.pid)
                     return True
+        log.error("cf_cdp_chrome_start_timeout", port=_CF_CDP_PORT)
         return False
     except Exception as e:
         log.error("cf_cdp_chrome_start_failed", error=str(e))
@@ -456,12 +496,12 @@ EXPECTED_DOMAIN          = "royallondon.com"
 
 # Azure AI Search
 SEARCH_ENDPOINT          = os.getenv("AZURE_SEARCH_ENDPOINT", "").rstrip("/")
-INDEX_NAME               = os.getenv("AZURE_SEARCH_INDEX_NAME", "rlg-faq-index-v3")
+INDEX_NAME               = os.getenv("AZURE_SEARCH_INDEX_NAME", "rlg-faq-index-v4")
 
 # Azure OpenAI
 AZURE_OPENAI_ENDPOINT    = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
 EMBEDDING_DEPLOYMENT     = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
-EMBEDDING_DIMS           = int(os.getenv("AZURE_OPENAI_EMBEDDING_DIMENSIONS", "1024"))
+EMBEDDING_DIMS           = int(os.getenv("AZURE_OPENAI_EMBEDDING_DIMENSIONS", "1536"))
 
 # Azure Blob Storage
 BLOB_STORAGE_CONNECTION  = os.getenv("AZURE_STORAGE_CONNECTION", "")
@@ -498,7 +538,7 @@ SCRAPE_CONCURRENCY       = 3
 # Local output dir for reports
 LOCAL_DATA_DIR           = Path("scraper/data")
 
-# Section map — mirrors scrape_approved_urls_updatedV3.py
+# Section map — mirrors scrape_approved_urls_updatedV4.py
 SECTION_MAP = {
     "existing-customers":       "Existing Customers",
     "insurance":                "Insurance",
@@ -1521,7 +1561,7 @@ def map_category_to_content_type(category: str) -> str:
 def _diff_dropdown_content(default_lines: set[str], new_text: str) -> str:
     """
     Return only lines in new_text absent from default_lines.
-    Mirrors _diff_dropdown_content in scrape_approved_urls_updatedV3.py.
+    Mirrors _diff_dropdown_content in scrape_approved_urls_updatedV4.py v4.5.0.
     """
     changed = [
         line.strip()

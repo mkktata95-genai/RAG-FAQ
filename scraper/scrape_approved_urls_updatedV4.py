@@ -503,6 +503,35 @@ v4.5.2 — July 2026 | Mukesh Kund
          VERIFIED: All 13 bereavement policy dropdown states
          captured correctly with CDP mode on VDI (July 2026).
 
+v4.5.3 — July 2026 | Mukesh Kund
+         Fix ValueError: I/O operation on closed pipe on Windows.
+
+         ROOT CAUSE:
+         Python’s asyncio ProactorEventLoop on Windows performs
+         garbage collection of subprocess handles after the process
+         exits. Without CREATE_NO_WINDOW, Chrome inherits the
+         terminal’s console handles (stdin/stdout/stderr). When
+         asyncio’s GC tries to close those inherited handles they
+         are already gone — raising ValueError: I/O operation on
+         closed pipe. This is a known Python 3.11/3.12 Windows bug
+         triggered by subprocess + ProactorEventLoop interaction.
+         The scrape completes successfully before this error but
+         the traceback is confusing and masks real errors.
+
+         FIX — subprocess.CREATE_NO_WINDOW + stdin=DEVNULL:
+         CREATE_NO_WINDOW (Windows-only flag) prevents the child
+         process from inheriting the parent’s console handles.
+         Chrome gets its own isolated handle space — asyncio GC
+         has nothing to conflict with.
+         stdin=subprocess.DEVNULL added explicitly alongside
+         stdout/stderr=DEVNULL to close all three standard streams.
+         On Linux/macOS: creation_flags=0 is a no-op — safe
+         cross-platform.
+
+         Applied in: _start_chrome_cdp() only.
+         _stop_chrome_cdp() pipe.close() fix from v4.5.2 retained
+         as defence-in-depth (belt + braces).
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -661,10 +690,22 @@ def _start_chrome_cdp() -> bool:
     On Linux/production where PLAYWRIGHT_EXECUTABLE_PATH
     does not exist, returns False — crawl4ai uses its own
     Playwright browser normally (installed in Dockerfile).
+
+    v4.5.3 FIX — CREATE_NO_WINDOW on Windows:
+    Without this flag, the Chrome subprocess inherits the
+    terminal's console handles. asyncio's ProactorEventLoop
+    on Windows tries to close those inherited handles during
+    garbage collection after the subprocess exits, but they
+    are already gone → ValueError: I/O operation on closed
+    pipe. CREATE_NO_WINDOW gives Chrome its own isolated
+    console handle space — no inheritance, no conflict.
+    stdin=DEVNULL added explicitly for the same reason.
+    Linux/macOS: creation_flags=0 is a no-op.
     """
     global _CHROME_PROC
     import socket
     import subprocess
+    import sys as _sys
     import time as _time
 
     exec_path = PLAYWRIGHT_EXECUTABLE_PATH
@@ -682,6 +723,13 @@ def _start_chrome_cdp() -> bool:
         return True
 
     try:
+        # CREATE_NO_WINDOW: Windows-only flag — prevents Chrome from
+        # inheriting terminal handles that asyncio tries to close
+        # after subprocess exit (ValueError: I/O on closed pipe fix).
+        creation_flags = 0
+        if _sys.platform == "win32":
+            creation_flags = subprocess.CREATE_NO_WINDOW
+
         _CHROME_PROC = subprocess.Popen(
             [
                 exec_path,
@@ -693,8 +741,10 @@ def _start_chrome_cdp() -> bool:
                 "--no-first-run",
                 "--no-default-browser-check",
             ],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            creationflags=creation_flags,
         )
         # Wait up to 7.5s for Chrome to be ready
         for _ in range(15):
