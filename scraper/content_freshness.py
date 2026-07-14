@@ -1112,6 +1112,35 @@ _DROPDOWN_PLACEHOLDERS = {
 }
 
 
+def _has_routing_dropdowns_in_html(html: str) -> bool:
+    """
+    Check rendered HTML for routing <select> elements.
+
+    Uses BeautifulSoup on already-fetched crawl4ai HTML — zero
+    extra network call. Returns True only if a <select> has more
+    than one non-placeholder <option>.
+
+    Ported from scrape_approved_urls_updatedV4.py v4.5.0.
+    """
+    if not html:
+        return False
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        for select in soup.find_all("select"):
+            valid_opts = [
+                o for o in select.find_all("option")
+                if o.get_text(strip=True).lower() not in _DROPDOWN_PLACEHOLDERS
+                and o.get_text(strip=True)
+            ]
+            if len(valid_opts) > 1:
+                return True
+        return False
+    except Exception as e:
+        log.warning("dropdown_html_check_failed", error=str(e))
+        return False
+
+
 def _scrape_dropdown_states_playwright(
     url:            str,
     base_title:     str,
