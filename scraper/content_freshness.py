@@ -1397,7 +1397,12 @@ async def scrape_url_with_dropdowns(entry: dict) -> list[dict] | None:
         _os.environ["PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"] = PLAYWRIGHT_EXECUTABLE_PATH
         log.info("crawl4ai_using_system_chrome", path=PLAYWRIGHT_EXECUTABLE_PATH)
 
-    browser_cfg = BrowserConfig(headless=True, verbose=False)
+    browser_cfg = BrowserConfig(
+        headless=True,
+        verbose=False,
+        # v1.2.1 VDI FIX: use system Chrome — mirrors scraper v4.5.1.
+        chrome_channel="chrome",
+    )
 
     # ── Base page scrape ──────────────────────────────────────
     run_cfg = CrawlerRunConfig(

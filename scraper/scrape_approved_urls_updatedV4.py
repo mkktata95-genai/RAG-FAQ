@@ -432,6 +432,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+import urllib.parse
 from datetime import datetime, timezone
 
 # nest_asyncio allows asyncio.run()-equivalent to work inside an already-running
@@ -2044,6 +2045,12 @@ def run_scraper(
                 browser_type="chromium",
                 headless=True,
                 verbose=False,
+                # v4.5.1 VDI FIX: chrome_channel="chrome" tells crawl4ai 0.8.9
+                # to use the system-installed Chrome instead of downloading its
+                # own ms-playwright chromium (blocked by VDI SSL restrictions).
+                # In production (Linux container) system Chrome is installed in
+                # the Dockerfile — this works in both environments.
+                chrome_channel="chrome",
             )
             scraped      = []
             failed_urls  = []
