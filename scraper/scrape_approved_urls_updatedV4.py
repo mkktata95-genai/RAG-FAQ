@@ -1598,7 +1598,7 @@ def _scrape_dropdown_states_playwright(
 
                             # Synthetic URL — mirrors crawler.py state_url pattern
                             safe_value = opt_value if opt_value else opt_text
-                            state_url  = f"{url}#policy={safe_value}"
+                            state_url  = f"{url}#state={urllib.parse.quote(safe_value)}"
                             content    = dynamic_content.strip()
 
                             results.append({
@@ -2025,6 +2025,21 @@ def run_scraper(
 
         async def _run():
             pages_to_scrape = load_url_source(excel)
+            # VDI FIX: Set env var BEFORE crawl4ai initialises its browser.
+            # crawl4ai reads PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH at launch
+            # time — points it to system Chrome instead of the ms-playwright
+            # chromium that VDI SSL restrictions block from downloading.
+            # In production (Linux) PLAYWRIGHT_EXECUTABLE_PATH is unset or
+            # points to /usr/bin/google-chrome. os.path.exists() ensures
+            # this is a no-op when the path doesn't exist.
+            import os as _os
+            if PLAYWRIGHT_EXECUTABLE_PATH and _os.path.exists(PLAYWRIGHT_EXECUTABLE_PATH):
+                _os.environ["PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"] = PLAYWRIGHT_EXECUTABLE_PATH
+                log.info(
+                    "crawl4ai_using_system_chrome",
+                    path=PLAYWRIGHT_EXECUTABLE_PATH,
+                )
+
             browser_config  = BrowserConfig(
                 browser_type="chromium",
                 headless=True,

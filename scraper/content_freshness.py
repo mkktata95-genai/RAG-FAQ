@@ -246,6 +246,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
+import urllib.parse
 
 import aiohttp
 import concurrent.futures
@@ -1287,7 +1288,7 @@ def _scrape_dropdown_states_playwright(
                                 continue
 
                             safe_value = opt_value if opt_value else opt_text
-                            state_url  = f"{url}#policy={safe_value}"
+                            state_url  = f"{url}#state={urllib.parse.quote(safe_value)}"
                             content    = dynamic_content.strip()
 
                             results.append({
@@ -1388,6 +1389,13 @@ async def scrape_url_with_dropdowns(entry: dict) -> list[dict] | None:
     url      = entry["url"]
     title    = entry.get("title", "")
     category = entry.get("category", "")
+
+    # VDI FIX: Set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH before crawl4ai
+    # initialises its internal Playwright browser. Mirrors scraper v4.5.0.
+    import os as _os
+    if PLAYWRIGHT_EXECUTABLE_PATH and _os.path.exists(PLAYWRIGHT_EXECUTABLE_PATH):
+        _os.environ["PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"] = PLAYWRIGHT_EXECUTABLE_PATH
+        log.info("crawl4ai_using_system_chrome", path=PLAYWRIGHT_EXECUTABLE_PATH)
 
     browser_cfg = BrowserConfig(headless=True, verbose=False)
 
