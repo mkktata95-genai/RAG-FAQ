@@ -535,34 +535,41 @@ v4.5.3 — July 2026 | Mukesh Kund
 v4.5.4 — July 2026 | Mukesh Kund
          Suppress asyncio ProactorEventLoop GC noise on Windows.
 
-         ROOT CAUSE:
+         ROOT CAUSE (updated understanding):
          CREATE_NO_WINDOW (v4.5.3) fixed our Chrome subprocess but
-         crawl4ai’s internal AsyncWebCrawler also launches a browser
-         subprocess. We have no control over how crawl4ai creates
-         that process — it still triggers the same Windows asyncio
-         ProactorEventLoop garbage-collection noise:
+         crawl4ai’s internal AsyncWebCrawler also launches its own
+         browser subprocess. We have no control over crawl4ai’s
+         Popen flags. The "Exception ignored in:" tracebacks:
            "ValueError: I/O operation on closed pipe"
            "ResourceWarning: unclosed transport"
-         These are "Exception ignored" — Python already swallows
-         them — but the tracebacks are confusing and mask real errors.
+         occur DURING PYTHON INTERPRETER SHUTDOWN — after
+         asyncio.run() has already returned and the event loop is
+         closed. A custom event loop exception handler cannot
+         intercept these because the loop is already torn down
+         when they fire (GC runs at interpreter exit, not while
+         the loop is running).
 
-         FIX — Custom asyncio exception handler (Windows only):
-         In the if __name__ == "__main__" block, on win32 only:
-         1. Create a new event loop
-         2. Set a custom exception handler that suppresses the two
-            specific messages above and delegates everything else
-            to loop.default_exception_handler()
-         3. Set it as the active event loop before asyncio.run()
+         FIX — sys.unraisablehook + warnings.filterwarnings:
+         sys.unraisablehook is called for every "Exception ignored"
+         traceback during GC/interpreter shutdown. We replace it
+         with a wrapper that drops the specific "I/O operation on
+         closed pipe" ValueError and delegates everything else to
+         the original hook. warnings.filterwarnings() added for
+         the ResourceWarning: unclosed transport companion warning.
+         Both are applied in if __name__ == "__main__" on win32
+         only — before asyncio.run() so they are active for the
+         full lifetime of the process including shutdown.
 
          SAFETY:
-         Real errors (Azure auth, crawl4ai crashes, network errors)
-         surface via Python exceptions, structlog log.error(), the
-         result dict, and sys.exit(1) — none go through the asyncio
-         exception handler. Suppression is surgical and specific.
+         Real errors surface via Python exceptions, structlog
+         log.error(), the result dict, and sys.exit(1) — none
+         go through unraisablehook. Only uncaught exceptions
+         during GC (which are already "Exception ignored" by
+         Python) are affected.
 
          PRODUCTION (Linux / Azure Container Apps):
-         sys.platform != "win32" — the entire block is a no-op.
-         EpollEventLoop on Linux does not have this issue.
+         sys.platform != "win32" — complete no-op.
+         EpollEventLoop on Linux does not exhibit this issue.
 
 ═══════════════════════════════════════════════════════════════
 """
@@ -2555,30 +2562,42 @@ async def main():
 
 if __name__ == "__main__":
     # Suppress asyncio ProactorEventLoop GC noise on Windows.
-    # crawl4ai's internal browser subprocess inherits console handles
-    # that asyncio tries to close after subprocess exit — raises
-    # "ValueError: I/O operation on closed pipe" and
-    # "ResourceWarning: unclosed transport" as Exception ignored.
-    # These are cosmetic Windows-only asyncio cleanup artefacts.
-    # Real errors surface via structlog, result dict, and sys.exit(1)
-    # — none go through the asyncio exception handler.
+    # The ValueError: I/O operation on closed pipe and
+    # ResourceWarning: unclosed transport errors occur DURING
+    # Python interpreter shutdown (after asyncio.run() returns),
+    # when the GC collects subprocess transport objects. A custom
+    # event loop exception handler cannot catch these because the
+    # loop is already closed at that point.
+    # Fix: filter at the warnings level before interpreter exit,
+    # and patch sys.unraisablehook to suppress the specific errors.
     # On Linux (Azure Container Apps): sys.platform != "win32"
-    # so this block is a complete no-op in production.
+    # — complete no-op in production.
+    # Real errors surface via structlog, result dict, sys.exit(1).
     import sys as _sys
     if _sys.platform == "win32":
-        import asyncio as _asyncio
+        import warnings as _warnings
+        _warnings.filterwarnings(
+            "ignore",
+            message=".*I/O operation on closed pipe.*",
+            category=ResourceWarning,
+        )
+        _warnings.filterwarnings(
+            "ignore",
+            message=".*unclosed transport.*",
+            category=ResourceWarning,
+        )
 
-        def _suppress_pipe_noise(loop, context):
-            msg = context.get("message", "")
-            if (
-                "I/O operation on closed pipe" in msg
-                or "unclosed transport" in msg
-            ):
-                return  # suppress — Windows asyncio GC noise only
-            loop.default_exception_handler(context)
+        # sys.unraisablehook: called for "Exception ignored in:"
+        # tracebacks that appear during GC/interpreter shutdown.
+        # These are exactly the ValueError: I/O on closed pipe lines.
+        _orig_unraisablehook = _sys.unraisablehook
 
-        _loop = _asyncio.new_event_loop()
-        _loop.set_exception_handler(_suppress_pipe_noise)
-        _asyncio.set_event_loop(_loop)
+        def _unraisablehook(unraisable):
+            msg = str(unraisable.exc_value)
+            if "I/O operation on closed pipe" in msg:
+                return  # suppress — Windows asyncio GC noise
+            _orig_unraisablehook(unraisable)
+
+        _sys.unraisablehook = _unraisablehook
 
     asyncio.run(main())

@@ -322,14 +322,19 @@ v1.2.4 — July 2026 | Mukesh Kund
          Suppress asyncio ProactorEventLoop GC noise on Windows.
          Aligned with scrape_approved_urls_updatedV4.py v4.5.4.
 
-         Same root cause as scraper v4.5.4: crawl4ai’s internal
-         AsyncWebCrawler subprocess still triggers Windows asyncio
-         ProactorEventLoop GC noise even after CREATE_NO_WINDOW fix
-         on our Chrome subprocess. Custom asyncio exception handler
-         added in if __name__ == "__main__" block (win32 only).
-         Suppresses "I/O operation on closed pipe" and "unclosed
-         transport" messages specifically. All real errors still
-         surface via structlog, result dict, and sys.exit(1).
+         The asyncio event loop exception handler added in v1.2.3
+         does not work because the errors occur during Python
+         interpreter shutdown — after the loop is closed. GC runs
+         at interpreter exit, not while the loop is running.
+
+         FIX — sys.unraisablehook + warnings.filterwarnings:
+         sys.unraisablehook intercepts "Exception ignored" GC
+         tracebacks during interpreter shutdown. Wrapper suppresses
+         "I/O operation on closed pipe" ValueError specifically and
+         delegates everything else to the original hook.
+         warnings.filterwarnings() suppresses the companion
+         ResourceWarning: unclosed transport.
+         Both applied in __main__ on win32 only.
          Complete no-op on Linux / Azure Container Apps.
 
 ═══════════════════════════════════════════════════════════════
@@ -2543,27 +2548,33 @@ def main():
 
 if __name__ == "__main__":
     # Suppress asyncio ProactorEventLoop GC noise on Windows.
-    # Same issue as scraper v4.5.3 — crawl4ai browser subprocess
-    # inherits console handles that asyncio GC tries to close after
-    # subprocess exit. Raises "ValueError: I/O operation on closed
-    # pipe" / "ResourceWarning: unclosed transport" as cosmetic noise.
-    # Real errors surface via structlog and sys.exit(1).
-    # On Linux (Azure Container Apps): no-op (not win32).
+    # See scraper v4.5.4 for full explanation.
+    # Fix: sys.unraisablehook + warnings filter — suppresses the
+    # errors that occur during interpreter shutdown GC, which the
+    # asyncio event loop exception handler cannot catch.
+    # On Linux (Azure Container Apps): complete no-op.
     import sys as _sys
     if _sys.platform == "win32":
-        import asyncio as _asyncio
+        import warnings as _warnings
+        _warnings.filterwarnings(
+            "ignore",
+            message=".*I/O operation on closed pipe.*",
+            category=ResourceWarning,
+        )
+        _warnings.filterwarnings(
+            "ignore",
+            message=".*unclosed transport.*",
+            category=ResourceWarning,
+        )
 
-        def _suppress_pipe_noise(loop, context):
-            msg = context.get("message", "")
-            if (
-                "I/O operation on closed pipe" in msg
-                or "unclosed transport" in msg
-            ):
-                return  # suppress — Windows asyncio GC noise only
-            loop.default_exception_handler(context)
+        _orig_unraisablehook = _sys.unraisablehook
 
-        _loop = _asyncio.new_event_loop()
-        _loop.set_exception_handler(_suppress_pipe_noise)
-        _asyncio.set_event_loop(_loop)
+        def _unraisablehook(unraisable):
+            msg = str(unraisable.exc_value)
+            if "I/O operation on closed pipe" in msg:
+                return  # suppress — Windows asyncio GC noise
+            _orig_unraisablehook(unraisable)
+
+        _sys.unraisablehook = _unraisablehook
 
     main()
