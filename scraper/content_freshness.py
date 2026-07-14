@@ -318,6 +318,20 @@ v1.2.3 — July 2026 | Mukesh Kund
          - creation_flags=0 on Linux/macOS — safe cross-platform.
          - _cf_stop_chrome_cdp() pipe.close() retained as defence.
 
+v1.2.4 — July 2026 | Mukesh Kund
+         Suppress asyncio ProactorEventLoop GC noise on Windows.
+         Aligned with scrape_approved_urls_updatedV4.py v4.5.4.
+
+         Same root cause as scraper v4.5.4: crawl4ai’s internal
+         AsyncWebCrawler subprocess still triggers Windows asyncio
+         ProactorEventLoop GC noise even after CREATE_NO_WINDOW fix
+         on our Chrome subprocess. Custom asyncio exception handler
+         added in if __name__ == "__main__" block (win32 only).
+         Suppresses "I/O operation on closed pipe" and "unclosed
+         transport" messages specifically. All real errors still
+         surface via structlog, result dict, and sys.exit(1).
+         Complete no-op on Linux / Azure Container Apps.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -2528,4 +2542,28 @@ def main():
 
 
 if __name__ == "__main__":
+    # Suppress asyncio ProactorEventLoop GC noise on Windows.
+    # Same issue as scraper v4.5.3 — crawl4ai browser subprocess
+    # inherits console handles that asyncio GC tries to close after
+    # subprocess exit. Raises "ValueError: I/O operation on closed
+    # pipe" / "ResourceWarning: unclosed transport" as cosmetic noise.
+    # Real errors surface via structlog and sys.exit(1).
+    # On Linux (Azure Container Apps): no-op (not win32).
+    import sys as _sys
+    if _sys.platform == "win32":
+        import asyncio as _asyncio
+
+        def _suppress_pipe_noise(loop, context):
+            msg = context.get("message", "")
+            if (
+                "I/O operation on closed pipe" in msg
+                or "unclosed transport" in msg
+            ):
+                return  # suppress — Windows asyncio GC noise only
+            loop.default_exception_handler(context)
+
+        _loop = _asyncio.new_event_loop()
+        _loop.set_exception_handler(_suppress_pipe_noise)
+        _asyncio.set_event_loop(_loop)
+
     main()

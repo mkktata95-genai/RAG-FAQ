@@ -532,6 +532,38 @@ v4.5.3 — July 2026 | Mukesh Kund
          _stop_chrome_cdp() pipe.close() fix from v4.5.2 retained
          as defence-in-depth (belt + braces).
 
+v4.5.4 — July 2026 | Mukesh Kund
+         Suppress asyncio ProactorEventLoop GC noise on Windows.
+
+         ROOT CAUSE:
+         CREATE_NO_WINDOW (v4.5.3) fixed our Chrome subprocess but
+         crawl4ai’s internal AsyncWebCrawler also launches a browser
+         subprocess. We have no control over how crawl4ai creates
+         that process — it still triggers the same Windows asyncio
+         ProactorEventLoop garbage-collection noise:
+           "ValueError: I/O operation on closed pipe"
+           "ResourceWarning: unclosed transport"
+         These are "Exception ignored" — Python already swallows
+         them — but the tracebacks are confusing and mask real errors.
+
+         FIX — Custom asyncio exception handler (Windows only):
+         In the if __name__ == "__main__" block, on win32 only:
+         1. Create a new event loop
+         2. Set a custom exception handler that suppresses the two
+            specific messages above and delegates everything else
+            to loop.default_exception_handler()
+         3. Set it as the active event loop before asyncio.run()
+
+         SAFETY:
+         Real errors (Azure auth, crawl4ai crashes, network errors)
+         surface via Python exceptions, structlog log.error(), the
+         result dict, and sys.exit(1) — none go through the asyncio
+         exception handler. Suppression is surgical and specific.
+
+         PRODUCTION (Linux / Azure Container Apps):
+         sys.platform != "win32" — the entire block is a no-op.
+         EpollEventLoop on Linux does not have this issue.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -2522,4 +2554,31 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Suppress asyncio ProactorEventLoop GC noise on Windows.
+    # crawl4ai's internal browser subprocess inherits console handles
+    # that asyncio tries to close after subprocess exit — raises
+    # "ValueError: I/O operation on closed pipe" and
+    # "ResourceWarning: unclosed transport" as Exception ignored.
+    # These are cosmetic Windows-only asyncio cleanup artefacts.
+    # Real errors surface via structlog, result dict, and sys.exit(1)
+    # — none go through the asyncio exception handler.
+    # On Linux (Azure Container Apps): sys.platform != "win32"
+    # so this block is a complete no-op in production.
+    import sys as _sys
+    if _sys.platform == "win32":
+        import asyncio as _asyncio
+
+        def _suppress_pipe_noise(loop, context):
+            msg = context.get("message", "")
+            if (
+                "I/O operation on closed pipe" in msg
+                or "unclosed transport" in msg
+            ):
+                return  # suppress — Windows asyncio GC noise only
+            loop.default_exception_handler(context)
+
+        _loop = _asyncio.new_event_loop()
+        _loop.set_exception_handler(_suppress_pipe_noise)
+        _asyncio.set_event_loop(_loop)
+
     asyncio.run(main())
