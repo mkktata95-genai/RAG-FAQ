@@ -2,88 +2,125 @@
 Royal London FAQ — Web Scraper v4 (Customer Approved URLs Only)
 ════════════════════════════════════════════════════════════
 Scrapes customer-approved Royal London pages and saves structured
-JSON for chunk_and_index_hqaV3.py to index into Azure AI Search.
+JSON for chunk_and_index_hqaV4.py to index into Azure AI Search.
 
 Pipeline:
-  1. Load approved URLs from Excel (header-based column detection —
-     no hardcoded positions, works with any column layout)
+  1. Load approved URLs from Excel from Azure Blob Storage
   2. Scrape each URL with crawl4ai (main content only)
   3. Clean content (deduplicate, strip nav/footer boilerplate)
-  4. Extract rich metadata (video, content type, product category,
-     description, thumbnail, publish date — from HTML, zero extra calls)
-  5. Save JSON → local file or Azure Blob Storage (production)
+  4. Detect routing dropdowns → scrape per-option states via Playwright
+  5. Extract rich metadata (video, content type, product category etc.)
+  6. Save JSON → local file or Azure Blob Storage (production)
 
 Input:
-  Any Excel file with a "URL" column (header-based detection).
-  Title and status columns optional — detected automatically.
+  Approved URL Excel from Azure Blob Storage (production) or
+  local file (--file flag for VDI/dev). Header-based column
+  detection — no hardcoded positions.
 
 Output:
-  scraper/data/royal_london_faq_approved_<timestamp>.json
-  (or Azure Blob Storage when AZURE_STORAGE_CONNECTION is set)
+  scraper/data/royal_london_faq_approved_<timestamp>.json (local)
+  or Azure Blob Storage: scraper-data/royal_london_faq_latest.json
 
 Output fields per page:
   url, title, section, audience, content, scraped_at,
   content_length, content_hash, has_video, content_type,
   product_category, description, thumbnail_url, publish_date,
-  collection_name, read_time_mins
+  collection_name, read_time_mins, dropdown_state, dropdown_value
 
 ═══════════════════════════════════════════════════════════════
-LOCAL USAGE
+LOCAL USAGE (VDI)
 ═══════════════════════════════════════════════════════════════
 
-    # Standard scrape (reads APPROVED_EXCEL from .env / constant)
-    python scraper/scrape_approved_urls_updatedV2.py
-
-    # Custom Excel file
-    python scraper/scrape_approved_urls_updatedV2.py \
-        --file scraper/data/your_approved_urls.xlsx
+    # Standard scrape — local Excel
+    python scraper/scrape_approved_urls_updatedV4.py \
+        --file scraper/data/Approved_URLs.xlsx
 
     # Dry run — validate Excel + URL detection, no scraping
-    python scraper/scrape_approved_urls_updatedV2.py --dry-run
+    python scraper/scrape_approved_urls_updatedV4.py \
+        --file scraper/data/Approved_URLs.xlsx --dry-run
 
-    # Dry run on custom file
-    python scraper/scrape_approved_urls_updatedV2.py \
-        --file scraper/data/your_approved_urls.xlsx --dry-run
+    # Required .env for VDI (Chrome CDP mode):
+    # PLAYWRIGHT_EXECUTABLE_PATH=C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe
+    # AZURE_STORAGE_CONNECTION=<blob-conn-string>   (if saving to Blob)
 
 ═══════════════════════════════════════════════════════════════
-PRODUCTION — AZURE CONTAINER APPS JOB
+PRODUCTION — AZURE CONTAINER APPS JOB (DevOps)
 ═══════════════════════════════════════════════════════════════
-Andy: Container Apps Job (aria-scraper-job) runs this script.
-      Required env vars (set in Key Vault, not in code):
 
-    AZURE_STORAGE_CONNECTION   — Blob Storage connection string.
-                                  Not set = local mode (local dev).
-                                  Set = uploads JSON to Blob Storage.
-    BLOB_CONTAINER_NAME        — Blob container (default: scraper-data)
-    BLOB_SCRAPED_FILENAME      — Output blob filename. Must match
-                                  BLOB_SCRAPED_FILENAME in
-                                  chunk_and_index_hqaV3.py so the
-                                  indexer reads the correct file.
-                                  Default: royal_london_faq_latest.json
-    APPROVED_EXCEL_PATH        — Override the default Excel path
-                                  (optional — for production URL list)
-
-    # ADO pipeline / manual trigger:
-    az containerapp job start \
-        --name aria-scraper-job \
-        --resource-group <rg> \
-        --env-vars AZURE_STORAGE_CONNECTION=<conn> DRY_RUN=false
-
-    # In the Container Apps Job entrypoint script:
-    dry_run     = os.getenv("DRY_RUN", "false").lower() == "true"
-    excel_path  = os.getenv("APPROVED_EXCEL_PATH", None)
-    result      = run_scraper(excel_path=excel_path, dry_run=dry_run)
-
-    # Run order (both jobs must be in same resource group):
-    # Job 1: aria-scraper-job     → produces Blob JSON
-    # Job 2: aria-indexer-job     → reads Blob JSON, indexes to AI Search
-    # Both triggered by ADO pipeline in sequence after URL list update.
+# TODO (DevOps): Create Container Apps Job: aria-scraper-job
+# Trigger: manual only (ADO pipeline after URL list update)
+#          NOT scheduled — scraper runs on demand, freshness runs nightly
+#
+# ── DOCKERFILE ────────────────────────────────────────────────
+#
+#   FROM python:3.11-slim
+#   RUN apt-get update && apt-get install -y \
+#       wget gnupg ca-certificates fonts-liberation \
+#       libasound2 libatk-bridge2.0-0 libdrm2 libxkbcommon0 \
+#       libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+#       libgbm1 libnss3 libnspr4 libdbus-1-3 libatspi2.0-0 \
+#       && rm -rf /var/lib/apt/lists/*
+#   COPY requirements.txt .
+#   RUN pip install -r requirements.txt
+#   # Install Playwright chromium + system deps (production browser)
+#   RUN playwright install chromium --with-deps
+#   # DO NOT set PLAYWRIGHT_EXECUTABLE_PATH — leave unset so CDP
+#   # mode is skipped and crawl4ai uses its own playwright chromium.
+#   COPY . .
+#   CMD ["python", "scraper/scrape_approved_urls_updatedV4.py"]
+#
+# ── AZURE MANAGED IDENTITY ────────────────────────────────────
+#
+#   Container app must have User/System-Assigned Managed Identity
+#   with these RBAC roles:
+#
+#   Resource                    Role
+#   ─────────────────────────── ────────────────────────────────
+#   Azure Blob Storage          Storage Blob Data Contributor
+#   Azure Key Vault             Key Vault Secrets User
+#
+#   DefaultAzureCredential picks up Managed Identity automatically
+#   in Container Apps — no service principal or API keys needed.
+#   TODO (DevOps): assign identity to aria-scraper-job + grant roles.
+#
+# ── AZURE KEY VAULT — required secrets ───────────────────────
+#
+#   Secret Name                   Value
+#   ───────────────────────────── ────────────────────────────────────
+#   AZURE-STORAGE-CONNECTION      Blob Storage connection string
+#   BLOB-CONTAINER-NAME           scraper-data
+#   BLOB-SCRAPED-FILENAME         royal_london_faq_latest.json
+#                                 (must match BLOB_SCRAPED_FILENAME in
+#                                  chunk_and_index_hqaV4.py)
+#   BLOB-APPROVED-EXCEL-NAME      approved-urls/Approved_URLs.xlsx
+#                                 (dedicated team always overwrites this
+#                                  fixed name — no date-stamped filenames)
+#   APPROVED-EXCEL-PATH           (leave unset — use BLOB_APPROVED_EXCEL_NAME)
+#
+#   DO NOT add PLAYWRIGHT-EXECUTABLE-PATH to Key Vault.
+#   In production, crawl4ai uses playwright chromium from Dockerfile.
+#   CDP mode auto-skipped when path doesn't exist.
+#
+# ── CONTAINER APPS JOB trigger ────────────────────────────────
+#
+#   # Manual trigger (ADO pipeline after URL list update):
+#   az containerapp job start \
+#       --name aria-scraper-job \
+#       --resource-group <rg>
+#
+# ── JOB RUN ORDER (manual full re-index) ─────────────────────
+#
+#   1. aria-scraper-job   → scrape → Blob JSON
+#   2. aria-indexer-job   → chunk_and_index_hqaV4.py --full → AI Search
+#   3. Update AZURE-SEARCH-INDEX-NAME in Key Vault → rlg-faq-index-v4
+#   4. Restart ARIA server (picks up new index from Key Vault)
+#   5. aria-freshness-job → run --mode report to verify, then enable nightly
 
 ═══════════════════════════════════════════════════════════════
 PROGRAMMATIC (DEVOPS / TESTING)
 ═══════════════════════════════════════════════════════════════
 
-    from scraper.scrape_approved_urls_updatedV2 import run_scraper
+    from scraper.scrape_approved_urls_updatedV4 import run_scraper
 
     result = run_scraper()                          # default Excel
     result = run_scraper(excel_path="custom.xlsx") # custom file
@@ -94,7 +131,7 @@ PROGRAMMATIC (DEVOPS / TESTING)
     #   "success":       bool,
     #   "pages_scraped": int,
     #   "pages_failed":  int,
-    #   "output_path":   str,  # local path or blob filename
+    #   "output_path":   str,  # local path or blob name
     #   "dry_run":       bool,
     #   "error":         str,  # empty if success
     # }
@@ -400,23 +437,71 @@ v4.5.0 — July 2026 | Mukesh Kund
          - _truncate_base_content_at_dropdown(): strips repeated option
            content from base page markdown before storing.
 
-         PLAYWRIGHT EXECUTABLE PATH:
-         VDI/corporate environments block Playwright's chromium binary
-         download via SSL cert interception. _scrape_dropdown_states_playwright()
-         now reads PLAYWRIGHT_EXECUTABLE_PATH env var (default:
-         C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe on Windows)
-         and passes it as executable_path to pw.chromium.launch() if the
-         path exists. Falls back to None (Playwright finds its own chromium)
-         when path doesn't exist — correct behaviour in Linux containers.
-         Set PLAYWRIGHT_EXECUTABLE_PATH in .env for local VDI use;
-         Key Vault for production.
+         PLAYWRIGHT EXECUTABLE PATH (v4.5.0):
+         _scrape_dropdown_states_playwright() reads
+         PLAYWRIGHT_EXECUTABLE_PATH env var (default: system Chrome
+         on Windows). Falls back to None on Linux containers.
+         VDI: set in .env. Production: leave UNSET — Dockerfile
+         installs playwright chromium via: RUN playwright install
+         chromium --with-deps. Do NOT add to Key Vault.
 
          REMOVED:
          - _JS_DETECT_DROPDOWNS, _JS_SELECT_OPTION, _JS_GET_BODY_TEXT
-           constants (crawl4ai JS injection approach — replaced by
-           Playwright).
-         - _scrape_dropdown_states() async function (replaced by
-           _scrape_dropdown_states_playwright()).
+         - _scrape_dropdown_states() async function
+
+v4.5.1 — July 2026 | Mukesh Kund
+         #state= URL encoding + urllib.parse.quote.
+
+         state_url changed from:
+           f"{url}#policy={safe_value}"  (regex-sanitised)
+         to:
+           f"{url}#state={urllib.parse.quote(safe_value)}"
+         Spaces and special chars (ampersands, apostrophes) now
+         correctly percent-encoded. Consistent with content_freshness.py.
+         import urllib.parse added at top-level imports.
+
+v4.5.2 — July 2026 | Mukesh Kund
+         CDP mode for crawl4ai 0.8.9 VDI fix.
+
+         ROOT CAUSE:
+         crawl4ai 0.8.9 ignores chrome_channel and executable_path
+         parameters — it always attempts to use its own ms-playwright
+         chromium binary. VDI SSL restrictions block the binary
+         download (UNABLE_TO_GET_ISSUER_CERT_LOCALLY). All previous
+         env var attempts (PLAYWRIGHT_BROWSERS_PATH, PLAYWRIGHT_
+         CHROMIUM_EXECUTABLE_PATH) were also ineffective because
+         crawl4ai 0.8.9 does not read them.
+
+         FIX — CDP mode:
+         - _CDP_PORT, _CDP_URL, _CHROME_PROC constants added.
+         - _start_chrome_cdp(): launches system Chrome subprocess
+           with --remote-debugging-port=9222 --headless=new if
+           PLAYWRIGHT_EXECUTABLE_PATH exists. Waits up to 7.5s
+           for port to be ready via socket check. Returns False
+           on Linux/production (path absent → no-op).
+         - _stop_chrome_cdp(): terminates Chrome subprocess with
+           full pipe cleanup (close stdin/stdout/stderr) to prevent
+           ValueError: I/O operation on closed pipe during Python
+           asyncio cleanup after subprocess exits. Called in
+           main() finally block.
+         - _make_browser_config(): returns BrowserConfig with
+           cdp_url="http://localhost:9222" on VDI (CDP mode),
+           or normal BrowserConfig on production (Playwright mode).
+         - Both BrowserConfig instances (scrape_page + main) replaced
+           with _make_browser_config() call.
+
+         VDI .env:
+           PLAYWRIGHT_EXECUTABLE_PATH=C:\\\\Program Files\\\\Google\\\\
+           Chrome\\\\Application\\\\chrome.exe
+
+         PRODUCTION (Azure Container Apps Linux):
+           PLAYWRIGHT_EXECUTABLE_PATH unset → CDP skipped →
+           crawl4ai uses playwright chromium from:
+             RUN playwright install chromium --with-deps
+           Do NOT add PLAYWRIGHT_EXECUTABLE_PATH to Key Vault.
+
+         VERIFIED: All 13 bereavement policy dropdown states
+         captured correctly with CDP mode on VDI (July 2026).
 
 ═══════════════════════════════════════════════════════════════
 """
@@ -634,13 +719,25 @@ def _stop_chrome_cdp() -> None:
     """Terminate Chrome subprocess if we launched it."""
     global _CHROME_PROC
     if _CHROME_PROC is not None:
+        pid = _CHROME_PROC.pid
         try:
             _CHROME_PROC.terminate()
+        except Exception:
+            pass
+        try:
             _CHROME_PROC.wait(timeout=5)
-            log.info("cdp_chrome_stopped", pid=_CHROME_PROC.pid)
-        except Exception as e:
-            log.warning("cdp_chrome_stop_error", error=str(e))
+        except Exception:
+            pass
+        # Close pipes explicitly to prevent I/O on closed pipe errors
+        # that occur when asyncio cleanup runs after subprocess exit
+        for pipe in [_CHROME_PROC.stdin, _CHROME_PROC.stdout, _CHROME_PROC.stderr]:
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
         _CHROME_PROC = None
+        log.info("cdp_chrome_stopped", pid=pid)
 
 
 def _make_browser_config() -> BrowserConfig:
@@ -2092,7 +2189,7 @@ def run_scraper(
 
         # In job entrypoint (e.g. entrypoint.py):
         import os
-        from scraper.scrape_approved_urls_updatedV2 import run_scraper
+        from scraper.scrape_approved_urls_updatedV4 import run_scraper
 
         dry_run    = os.getenv("DRY_RUN", "false").lower() == "true"
         excel_path = os.getenv("APPROVED_EXCEL_PATH", None)

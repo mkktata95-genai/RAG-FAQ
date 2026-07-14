@@ -49,6 +49,98 @@ Programmatic (DevOps / Container Apps Job):
     result = run_pipeline(mode="full", no_hqa=True)   # baseline
 
 ═══════════════════════════════════════════════════════════════
+PRODUCTION — AZURE CONTAINER APPS JOB (DevOps)
+═══════════════════════════════════════════════════════════════
+
+# TODO (DevOps): Create Container Apps Job: aria-indexer-job
+# Trigger: manual only (ADO pipeline, after aria-scraper-job completes)
+#          NOT scheduled — indexer runs on demand after a full scrape
+#
+# ── DOCKERFILE ──────────────────────────────────────────────────
+#
+#   FROM python:3.11-slim
+#   RUN apt-get update && apt-get install -y \
+#       ca-certificates && rm -rf /var/lib/apt/lists/*
+#   COPY requirements.txt .
+#   RUN pip install -r requirements.txt
+#   # No playwright needed — indexer uses Azure SDK + OpenAI only
+#   COPY . .
+#   CMD ["python", "scraper/chunk_and_index_hqaV4.py", "--full"]
+#
+# ── AZURE MANAGED IDENTITY ─────────────────────────────────────────
+#
+#   Container app must have User/System-Assigned Managed Identity
+#   with these RBAC roles:
+#
+#   Resource                    Role
+#   ─────────────────────────── ────────────────────────────────
+#   Azure AI Search             Search Index Data Contributor
+#   Azure OpenAI                Cognitive Services OpenAI User
+#   Azure Blob Storage          Storage Blob Data Reader
+#                               (reads scraper JSON output)
+#   Azure Key Vault             Key Vault Secrets User
+#   Azure Cache for Redis       (connection string from Key Vault)
+#
+#   DefaultAzureCredential picks up Managed Identity automatically
+#   in Container Apps — no service principal or API keys needed.
+#   TODO (DevOps): assign identity to aria-indexer-job + grant roles.
+#
+# ── AZURE KEY VAULT — required secrets ────────────────────────
+#
+#   Secret Name                              Value
+#   ──────────────────────────────────────── ────────────────────
+#   AZURE-SEARCH-ENDPOINT                    https://<name>.search.windows.net
+#   AZURE-SEARCH-INDEX-NAME                  rlg-faq-index-v4
+#   AZURE-SEARCH-BASELINE-INDEX-NAME         rlg-faq-index-v4-baseline
+#   AZURE-OPENAI-ENDPOINT                    https://<name>.openai.azure.com
+#   AZURE-OPENAI-EMBEDDING-DEPLOYMENT        text-embedding-3-large
+#   AZURE-OPENAI-EMBEDDING-DIMENSIONS        1536
+#   AZURE-OPENAI-DEPLOYMENT-HQA             gpt-4o-mini
+#   AZURE-STORAGE-CONNECTION                 Blob conn string
+#                                            (to read scraper JSON output)
+#   BLOB-CONTAINER-NAME                      scraper-data
+#   BLOB-SCRAPED-FILENAME                    royal_london_faq_latest.json
+#   REDIS-URL                                rediss://<name>.redis.cache.windows.net:6380
+#                                            (for cache clear after --full)
+#   AZURE-SEARCH-SEMANTIC-CONFIG             rlg-semantic-config
+#
+# ── CONTAINER APPS JOB trigger ───────────────────────────────────
+#
+#   # Manual trigger — ADO pipeline after aria-scraper-job:
+#   az containerapp job start \
+#       --name aria-indexer-job \
+#       --resource-group <rg>
+#
+# ── JOB RUN ORDER (full re-index) ──────────────────────────────────
+#
+#   Step  Job                      What it does
+#   ────  ─────────────────────  ─────────────────────────────
+#   1     aria-scraper-job         Scrape → Blob JSON
+#   2     aria-indexer-job         --full --no-hqa → v4-baseline (~20 min)
+#   3     aria-indexer-job         --full → v4 full HQA (~3.5 hrs)
+#   4     DevOps (Key Vault)       AZURE-SEARCH-INDEX-NAME → rlg-faq-index-v4
+#   5     ARIA server              Restart → picks up new index from Key Vault
+#   6     aria-freshness-job       --mode report → verify hashes + URLs
+#   7     aria-freshness-job       Enable nightly schedule (0 2 * * *)
+#   8     Monitor                  Keep v3 live for 1-2 weeks as fallback
+#
+# ── IMPORTANT NOTES ─────────────────────────────────────────────────
+#
+#   - NEVER run --full on rlg-faq-index-v3 or v3-baseline.
+#     These are the live fallback indexes. Wiping them removes
+#     your rollback option. v4 targets only.
+#   - HQA run (~3.5 hrs) consumes ~$0.91 in OpenAI token cost.
+#     Run --pilot first to validate question quality on 100 chunks
+#     before committing to the full run.
+#   - EMBEDDING_DIMS=1536 is configured in Key Vault. The index
+#     vector field dimension MUST match this value. Mismatch causes
+#     upload failure. If you need to change dims, --full re-index
+#     is mandatory (dimensions are immutable in AI Search).
+#   - REDIS_URL in Key Vault — indexer clears Redis cache after
+#     --full run automatically. If Redis unavailable, warning is
+#     logged but index is still valid (cache expires via TTL).
+
+═══════════════════════════════════════════════════════════════
 CHANGE LOG
 ═══════════════════════════════════════════════════════════════
 
@@ -471,8 +563,8 @@ v5.1.0 — July 2026 | Mukesh Kund
          BM25 and the embedding naturally).
 
          This creates a clean A/B experiment:
-           rlg-faq-index-v3          — full HQA + title_questions
-           rlg-faq-index-v3-baseline — title as implicit signal only
+           rlg-faq-index-v4          — full HQA + title_questions
+           rlg-faq-index-v4-baseline — title as implicit signal only
 
          Run compare_indexes.py against both with the same 25
          queries used for v1 vs v2 comparison. This proves
@@ -485,7 +577,7 @@ v5.1.0 — July 2026 | Mukesh Kund
          - build_embedding_texts() falls back to content-only
            (title already in content via chunk_pages() prepend)
          - No LLM API calls — run completes in ~15-20 minutes
-         - INDEX_NAME defaults to rlg-faq-index-v3-baseline
+         - INDEX_NAME defaults to rlg-faq-index-v4-baseline
            (set via AZURE_SEARCH_INDEX_NAME env var to override)
          - All other settings identical: same chunking, same
            embeddings, same schema, same scoring profile
@@ -567,8 +659,9 @@ v5.3.0 — July 2026 | Mukesh Kund
            all identical to v5.2.0
 
          PRODUCTION STEPS:
-         1. Run scraper to produce fresh JSON from v4.4.0 scraper
-            python scraper/scrape_approved_urls_updatedV3.py
+         1. Run scraper to produce fresh JSON:
+            python scraper/scrape_approved_urls_updatedV4.py \\
+               --file scraper/data/Approved_URLs.xlsx
          2. Build v4-baseline (fast, ~15-20 min, no HQA):
             python scraper/chunk_and_index_hqaV4.py --full --no-hqa
          3. Build v4 full HQA index (~3.5 hours):
@@ -629,6 +722,47 @@ v5.4.0 — July 2026 | Mukesh Kund
          (delta indexing path) — both chunking functions must behave
          identically or freshness re-indexing produces different chunk
          structure than the full index run.
+
+v5.5.0 — July 2026 | Mukesh Kund
+         EMBEDDING_DIMS default 1024 → 1536. DevOps section added.
+
+         EMBEDDING_DIMS CHANGE:
+         Default value of AZURE_OPENAI_EMBEDDING_DIMENSIONS changed
+         from 1024 → 1536. Rationale: Royal London FAQ content is
+         domain-specific financial/insurance text with nuanced semantic
+         differences between similar products (ISA vs pension vs
+         protection). Higher dimensions = better semantic separation.
+         No compromise on accuracy.
+
+         Latency impact: ~5-10% slower vector search, ~10-15% slower
+         embedding generation. Acceptable for a chat interface
+         (~200-500ms total, negligible difference to user).
+
+         ACTION REQUIRED (DevOps):
+         - Update AZURE-OPENAI-EMBEDDING-DIMENSIONS in Key Vault → 1536
+         - Run --full re-index after updating Key Vault secret
+           (embedding dimension change requires full rebuild —
+            Azure AI Search vector field dimensions are immutable)
+         - Update AZURE_OPENAI_EMBEDDING_DIMENSIONS in content_freshness.py
+           and embeddings.py to 1536 (already done in those files)
+
+         PRODUCTION DEVOPS SECTION ADDED:
+         Complete production deployment guide added to module docstring:
+         - Dockerfile (python:3.11-slim, no playwright required)
+         - Managed Identity RBAC roles table (5 resources)
+         - Key Vault secrets list (12 secrets, correct names + values)
+         - Container Apps Job trigger (manual, ADO pipeline)
+         - 8-step job run order table (scraper → baseline → full HQA
+           → Key Vault update → server restart → freshness verify
+           → enable nightly → monitor)
+         - Important notes (never touch v3, pilot before full,
+           dim immutability, Redis TTL fallback)
+
+         OTHER FIXES in this version:
+         - v5.1.0 changelog: index names corrected from v3 to v4
+           (v5.1.0 was written before v4 was created)
+         - v5.3.0 production steps: scraper name corrected from
+           scrape_approved_urls_updatedV3.py to V4
 
 ═══════════════════════════════════════════════════════════════
 """
@@ -701,7 +835,11 @@ BASELINE_INDEX_NAME   = os.getenv(
     "AZURE_SEARCH_BASELINE_INDEX_NAME",
     "rlg-faq-index-v4-baseline",
 )
-EMBEDDING_DIMS        = int(os.getenv("AZURE_OPENAI_EMBEDDING_DIMENSIONS", "1024"))
+# v5.5.0: default changed 1024 → 1536 for improved semantic accuracy
+# on Royal London domain-specific financial content.
+# Requires re-index (--full) to rebuild vectors at new dimension.
+# Update AZURE_OPENAI_EMBEDDING_DIMENSIONS in Key Vault to 1536.
+EMBEDDING_DIMS        = int(os.getenv("AZURE_OPENAI_EMBEDDING_DIMENSIONS", "1536"))
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
 SEARCH_ENDPOINT       = os.getenv("AZURE_SEARCH_ENDPOINT", "").rstrip("/")
 EMBEDDING_DEPLOYMENT  = os.getenv(

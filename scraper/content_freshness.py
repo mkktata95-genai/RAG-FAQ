@@ -26,10 +26,10 @@ DECISION LOG (v1.0.0):
     truth for what was indexed. Blob hash state (content_hashes.json)
     is written as a backup after every apply run.
   - Dropdown pages (scraper v4.4.0+): pages with routing <select>
-    elements produce synthetic URLs (base_url#policy=option_value).
+    elements produce synthetic URLs (base_url#state=<encoded_value>).
     Health checks use only the base URL — fragment URLs are not
     real HTTP endpoints. When a base URL changes or is removed,
-    ALL its #policy= variant chunks are also deleted.
+    ALL its #state= variant chunks are also deleted.
   - Hash input: SHA-256 of content AFTER clean_content() external
     URL stripping (identical to chunk_and_index_hqaV3.py v5.2.0).
     Scraper, indexer, and freshness script all use the same
@@ -45,7 +45,7 @@ TWO MODES:
         NEW URLs     → scrape (+ dropdown states) → chunk → embed → index
         CHANGED URLs → delete old chunks → re-scrape → chunk → embed
                        → index → invalidate cache
-        REMOVED URLs → delete all chunks (incl. #policy= variants)
+        REMOVED URLs → delete all chunks (incl. #state= variants)
                        → invalidate cache
 
 ═══════════════════════════════════════════════════════════════
@@ -77,53 +77,108 @@ PRODUCTION — AZURE CONTAINER APPS JOB (DevOps)
 
 # TODO (DevOps): Create Container Apps Job: aria-freshness-job
 # Schedule: nightly at 02:00 UTC (after CMS publishing windows)
-# Image: same image as aria-scraper-job (crawl4ai + dependencies)
+# Image: same image as aria-scraper-job (crawl4ai + Playwright)
 #
-# Required env vars — set in Azure Key Vault, NOT in code:
+# ── DOCKERFILE (required for Playwright in container) ────────
 #
-#   AZURE_STORAGE_CONNECTION   — Blob Storage connection string
-#   BLOB_CONTAINER_NAME        — container holding Excel + hash state
-#                                Default: "scraper-data"
-#   BLOB_APPROVED_EXCEL_NAME   — fixed path of approved Excel in Blob
-#                                Dedicated team always overwrites this
-#                                fixed name (no date-stamped filenames)
-#                                Default: "approved-urls/Approved_URLs.xlsx"
-#   BLOB_HASH_STATE_NAME       — hash state blob written after each run
-#                                Default: "freshness/content_hashes.json"
-#   BLOB_REPORT_PREFIX         — Blob prefix for archived reports
-#                                Default: "freshness/reports/"
-#   AZURE_SEARCH_ENDPOINT      — Azure AI Search endpoint
-#   AZURE_SEARCH_INDEX_NAME    — Target index (default: rlg-faq-index-v3)
-#   AZURE_OPENAI_ENDPOINT      — Azure OpenAI endpoint (embeddings)
-#   AZURE_OPENAI_EMBEDDING_DEPLOYMENT — text-embedding-3-large
-#   AZURE_OPENAI_EMBEDDING_DIMENSIONS — 1024
-#   AZURE_OPENAI_DEPLOYMENT_HQA       — gpt-4o-mini (reserved for future
-#                                        HQA on delta pages, not used yet)
-#   REDIS_URL                  — Azure Cache for Redis connection string
-#   FRESHNESS_MODE             — "report" or "apply"
-#                                (can also pass via --mode CLI flag)
+#   FROM python:3.11-slim
+#   RUN apt-get update && apt-get install -y \
+#       wget gnupg ca-certificates fonts-liberation \
+#       libasound2 libatk-bridge2.0-0 libdrm2 libxkbcommon0 \
+#       libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+#       libgbm1 libnss3 libnspr4 libdbus-1-3 libatspi2.0-0 \
+#       && rm -rf /var/lib/apt/lists/*
+#   COPY requirements.txt .
+#   RUN pip install -r requirements.txt
+#   # Install Playwright chromium + system deps — production browser
+#   RUN playwright install chromium --with-deps
+#   # DO NOT set PLAYWRIGHT_EXECUTABLE_PATH in container —
+#   # leave unset so CDP mode is skipped and Playwright uses
+#   # its own chromium installed above.
+#   COPY . .
+#   CMD ["python", "scraper/content_freshness.py", "--mode", "apply"]
 #
-# Trigger (ADO pipeline or Azure Scheduler):
+# ── AZURE MANAGED IDENTITY (preferred over connection strings) ─
 #
+#   The container app must have a User-Assigned or System-Assigned
+#   Managed Identity with the following RBAC roles:
+#
+#   Resource                    Role
+#   ─────────────────────────── ────────────────────────────────
+#   Azure AI Search             Search Index Data Contributor
+#   Azure OpenAI                Cognitive Services OpenAI User
+#   Azure Blob Storage          Storage Blob Data Contributor
+#   Azure Key Vault             Key Vault Secrets User
+#
+#   DefaultAzureCredential in the code picks up Managed Identity
+#   automatically in Container Apps — no client ID or secret needed.
+#   TODO (DevOps): assign identity to aria-freshness-job and grant
+#   above roles. No service principal or API keys required.
+#
+# ── AZURE KEY VAULT — required secrets ───────────────────────
+#
+#   Secret Name                        Value
+#   ──────────────────────────────────────────────────────────
+#   AZURE-STORAGE-CONNECTION           Blob Storage conn string
+#                                      (or use Managed Identity
+#                                       + BLOB_STORAGE_ACCOUNT_NAME)
+#   AZURE-SEARCH-ENDPOINT              https://<name>.search.windows.net
+#   AZURE-SEARCH-INDEX-NAME            rlg-faq-index-v4
+#   AZURE-OPENAI-ENDPOINT              https://<name>.openai.azure.com
+#   AZURE-OPENAI-EMBEDDING-DEPLOYMENT  text-embedding-3-large
+#   AZURE-OPENAI-EMBEDDING-DIMENSIONS  1536
+#   REDIS-URL                          rediss://<name>.redis.cache.windows.net:6380
+#   FRESHNESS-MODE                     apply
+#
+#   Optional (leave unset in production — Playwright uses its own
+#   chromium installed via Dockerfile RUN playwright install):
+#   PLAYWRIGHT-EXECUTABLE-PATH         (unset in production)
+#   PLAYWRIGHT-CDP-PORT                (unset, default 9222)
+#
+#   TODO (DevOps): create Key Vault secrets above and link them
+#   to the Container Apps Job as env vars (dashes → underscores
+#   automatically when mapped, e.g. AZURE-SEARCH-ENDPOINT →
+#   AZURE_SEARCH_ENDPOINT in the container).
+#
+# ── BLOB STORAGE paths ────────────────────────────────────────
+#
+#   Container: scraper-data (default, set BLOB_CONTAINER_NAME to override)
+#   approved-urls/Approved_URLs.xlsx  ← dedicated team updates this
+#   freshness/content_hashes.json     ← written after each apply run
+#   freshness/reports/freshness_report_apply_<timestamp>.xlsx
+#
+# ── CONTAINER APPS JOB trigger ────────────────────────────────
+#
+#   # Nightly schedule (set in Azure portal or Bicep):
+#   Schedule: "0 2 * * *"  (02:00 UTC daily)
+#
+#   # Manual trigger (ADO pipeline or CLI):
 #   az containerapp job start \
 #       --name aria-freshness-job \
-#       --resource-group <rg> \
-#       --env-vars FRESHNESS_MODE=apply
+#       --resource-group <rg>
 #
-# Job run order (nightly — automated):
-#   aria-freshness-job only. Runs independently every night.
+# ── JOB RUN ORDER ─────────────────────────────────────────────
 #
-# Job run order (manual full re-index — when explicitly triggered):
-#   1. aria-scraper-job      → full scrape → Blob JSON
-#   2. aria-indexer-job      → full index  → AI Search
-#   3. aria-freshness-job    → skipped (or run report mode)
-#   The freshness job is NOT part of the manual full re-index flow.
+#   Nightly (automated):
+#     aria-freshness-job only — runs independently every night.
 #
-# IMPORTANT — first run after deploying v5.2.0 of indexer:
-#   The full re-index (--full on chunk_and_index_hqaV3.py) must
-#   complete before the freshness job runs for the first time.
-#   This refreshes stored hashes from MD5 (old) → SHA-256 (new).
-#   After that first re-index the nightly job works correctly.
+#   Manual full re-index (explicit trigger only):
+#     1. aria-scraper-job   → full scrape → Blob JSON
+#     2. aria-indexer-job   → chunk_and_index_hqaV4.py --full
+#     3. aria-freshness-job → skip or run --mode report to verify
+#     Freshness job is NOT part of the manual full re-index flow.
+#
+# ── FIRST RUN CHECKLIST (after v4 index is built) ────────────
+#
+#   1. chunk_and_index_hqaV4.py --full completes (builds v4 index
+#      with SHA-256 hashes + retrievable=True content_hash field)
+#   2. Update AZURE-SEARCH-INDEX-NAME secret → rlg-faq-index-v4
+#   3. Run freshness in report mode first to verify scan:
+#      python scraper/content_freshness.py --mode report
+#   4. Review Excel report — confirm URLs, hashes, dropdown states
+#   5. Enable nightly Container Apps Job schedule
+#   6. First apply run will write freshness/content_hashes.json
+#      to Blob — subsequent runs use this for faster hash comparison
 
 ═══════════════════════════════════════════════════════════════
 CHANGE LOG
@@ -142,9 +197,9 @@ v1.0.0 — July 2026 | Mukesh Kund
 
          DROPDOWN PAGES (scraper v4.4.0+):
          Pages with routing <select> elements produce synthetic
-         URLs (base_url#policy=option_value). Health checks use
+         URLs (base_url#state=<encoded_value>). Health checks use
          base URL only. When base URL changes or is removed, ALL
-         #policy= variant chunks are deleted from the index.
+         #state= variant chunks are deleted from the index.
 
          HASH ALIGNMENT (chunk_and_index_hqaV3.py v5.2.0):
          SHA-256 of content after clean_content() external URL
@@ -186,44 +241,66 @@ v1.1.0 — July 2026 | Mukesh Kund
          changelog for full reasoning.
 
 v1.2.0 — July 2026 | Mukesh Kund
-         Playwright-based dropdown scraping in freshness script.
+         Playwright-based dropdown scraping. Replaced crawl4ai
+         JS injection with BeautifulSoup + Playwright approach.
          Aligned with scrape_approved_urls_updatedV4.py v4.5.0.
+         _has_routing_dropdowns_in_html() added (BeautifulSoup
+         check on already-fetched HTML, zero extra network call).
+         _scrape_dropdown_states_playwright() ported from scraper.
+         Old JS constants removed. Base page timeout 30000ms kept.
 
-         PROBLEM WITH v1.0.0/v1.1.0 DROPDOWN APPROACH:
-         scrape_url_with_dropdowns() used crawl4ai JS injection
-         (arun() calls with wait_until="networkidle") to detect
-         and iterate dropdown options — same approach that caused
-         dropdown_detect_failed timeouts in the scraper (v4.4.0).
-         Additionally, page_timeout values inside the dropdown
-         detection blocks were 30000ms — wrong, should be 45000ms.
+v1.2.1 — July 2026 | Mukesh Kund
+         CDP mode for VDI. Aligned with scraper v4.5.2.
 
-         FIX — Replace crawl4ai dropdown handling with Playwright:
-         scrape_url_with_dropdowns() now uses BeautifulSoup to
-         detect <select> elements in the already-fetched crawl4ai
-         HTML (zero extra network call), then calls
-         _scrape_dropdown_states_playwright() via ThreadPoolExecutor
-         — identical to scrape_approved_urls_updatedV4.py v4.5.0.
+         crawl4ai 0.8.9 ignores chrome_channel and executable_path
+         and always tries to download its own ms-playwright chromium
+         — blocked by VDI SSL restrictions.
 
-         Base page timeout (line 1133): kept at 30000ms —
-         wait_until="domcontentloaded", no networkidle issue.
+         FIX — CDP mode:
+         - _cf_start_chrome_cdp(): launches system Chrome with
+           --remote-debugging-port=9222 if PLAYWRIGHT_EXECUTABLE_PATH
+           exists. Waits up to 7.5s for port to be ready. Returns
+           False on Linux/production (path doesn't exist → no-op).
+         - _cf_stop_chrome_cdp(): terminates Chrome subprocess with
+           full pipe cleanup (stdin/stdout/stderr.close()) to prevent
+           ValueError: I/O operation on closed pipe during asyncio
+           cleanup after subprocess exits.
+         - _cf_make_browser_config(): BrowserConfig with cdp_url set
+           on VDI, normal BrowserConfig on production.
+         - _cf_stop_chrome_cdp() called in run_freshness_job()
+           finally block after scrape_urls_batch() completes.
 
-         NEW FUNCTIONS (ported from scraper v4.5.0):
-         - _DROPDOWN_PLACEHOLDERS: placeholder option text set
-         - _scrape_dropdown_states_playwright(): Playwright thread
-           mirroring crawler.py v0.1.0 exactly — single page load,
-           DOM detection, JS event injection, 1.5s wait, line diff.
+         VDI .env:
+           PLAYWRIGHT_EXECUTABLE_PATH=C:\\Program Files\\Google\\
+           Chrome\\Application\\chrome.exe
 
-         PLAYWRIGHT EXECUTABLE PATH:
-         Same VDI fix as scraper v4.5.0 — PLAYWRIGHT_EXECUTABLE_PATH
-         constant reads env var (default: system Chrome on Windows),
-         passed as executable_path to pw.chromium.launch(). Falls
-         back to None on Linux/production containers.
+         PRODUCTION: leave PLAYWRIGHT_EXECUTABLE_PATH unset.
+         Dockerfile installs chromium via:
+           RUN playwright install chromium --with-deps
+         CDP mode auto-skipped when path doesn't exist.
 
-         REMOVED:
-         - _JS_DETECT_DROPDOWNS, _JS_GET_BODY_TEXT JS constants
-         - crawl4ai arun() dropdown detection blocks inside
-           scrape_url_with_dropdowns()
-         - Stale _JS_DETECT_DROPDOWNS comment in config section
+         URL ENCODING: state_url now uses urllib.parse.quote()
+         with #state= fragment (was #policy= + regex sanitise).
+         import urllib.parse added at top-level imports.
+
+v1.2.2 — July 2026 | Mukesh Kund
+         DevOps section fully documented.
+
+         ADDED to production docstring:
+         - Complete Dockerfile with playwright install chromium
+           --with-deps and required apt packages
+         - Azure Managed Identity RBAC roles table (AI Search,
+           OpenAI, Blob Storage, Key Vault)
+         - Azure Key Vault secrets list with correct names/values
+           Updated: AZURE_SEARCH_INDEX_NAME → rlg-faq-index-v4
+           Updated: AZURE_OPENAI_EMBEDDING_DIMENSIONS → 1536
+           Added: PLAYWRIGHT_EXECUTABLE_PATH documented as UNSET
+           in production (Dockerfile installs chromium)
+         - Blob Storage container/path layout
+         - Container Apps Job cron schedule: "0 2 * * *"
+         - First run checklist (build v4 → report mode → apply)
+         - PLAYWRIGHT_EXECUTABLE_PATH explicitly NOT added to
+           Key Vault for production — omit entirely
 
 ═══════════════════════════════════════════════════════════════
 """
@@ -284,6 +361,91 @@ try:
     _LANGCHAIN_AVAILABLE = True
 except ImportError:
     _LANGCHAIN_AVAILABLE = False
+
+
+# ══════════════════════════════════════════════════════════════
+# CDP / Chrome subprocess (VDI fix — mirrors scraper v4.5.2)
+# ══════════════════════════════════════════════════════════════
+
+_CF_CDP_PORT    = int(os.getenv("PLAYWRIGHT_CDP_PORT", "9222"))
+_CF_CDP_URL     = f"http://localhost:{_CF_CDP_PORT}"
+_CF_CHROME_PROC = None
+
+
+def _cf_start_chrome_cdp() -> bool:
+    """Launch system Chrome with remote debugging for crawl4ai CDP mode."""
+    global _CF_CHROME_PROC
+    import socket, subprocess, time as _t
+
+    exec_path = os.getenv(
+        "PLAYWRIGHT_EXECUTABLE_PATH",
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    )
+    if not exec_path or not os.path.exists(exec_path):
+        return False
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        if s.connect_ex(("localhost", _CF_CDP_PORT)) == 0:
+            log.info("cf_cdp_chrome_already_running", port=_CF_CDP_PORT)
+            return True
+
+    try:
+        _CF_CHROME_PROC = subprocess.Popen(
+            [exec_path,
+             f"--remote-debugging-port={_CF_CDP_PORT}",
+             "--headless=new", "--no-sandbox",
+             "--disable-dev-shm-usage", "--disable-gpu",
+             "--no-first-run", "--no-default-browser-check"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        for _ in range(15):
+            _t.sleep(0.5)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                if s.connect_ex(("localhost", _CF_CDP_PORT)) == 0:
+                    log.info("cf_cdp_chrome_started", pid=_CF_CHROME_PROC.pid)
+                    return True
+        return False
+    except Exception as e:
+        log.error("cf_cdp_chrome_start_failed", error=str(e))
+        return False
+
+
+def _cf_stop_chrome_cdp() -> None:
+    """Terminate Chrome CDP subprocess if we started it."""
+    global _CF_CHROME_PROC
+    if _CF_CHROME_PROC is not None:
+        pid = _CF_CHROME_PROC.pid
+        try:
+            _CF_CHROME_PROC.terminate()
+        except Exception:
+            pass
+        try:
+            _CF_CHROME_PROC.wait(timeout=5)
+        except Exception:
+            pass
+        # Close pipes to prevent ValueError: I/O operation on closed pipe
+        # during asyncio cleanup after subprocess exit
+        for pipe in [_CF_CHROME_PROC.stdin, _CF_CHROME_PROC.stdout, _CF_CHROME_PROC.stderr]:
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+        _CF_CHROME_PROC = None
+        log.info("cf_cdp_chrome_stopped", pid=pid)
+
+
+def _cf_make_browser_config() -> "BrowserConfig":
+    """CDP mode on VDI, normal Playwright on production."""
+    use_cdp = _cf_start_chrome_cdp()
+    if use_cdp:
+        return BrowserConfig(
+            headless=True, verbose=False, cdp_url=_CF_CDP_URL
+        )
+    return BrowserConfig(headless=True, verbose=False)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -594,13 +756,13 @@ def normalise_url(url: str) -> str:
 
 
 def is_dropdown_url(url: str) -> bool:
-    """Return True if URL is a synthetic dropdown state URL (#policy=...)."""
-    return "#policy=" in url
+    """Return True if URL is a synthetic dropdown state URL (#state=...)."""
+    return "#state=" in url
 
 
 def get_base_url(url: str) -> str:
-    """Return base URL, stripping any #policy= fragment."""
-    return url.split("#policy=")[0] if "#policy=" in url else url
+    """Return base URL, stripping any #state= fragment."""
+    return url.split("#state=")[0] if "#state=" in url else url
 
 
 # ══════════════════════════════════════════════════════════════
@@ -681,7 +843,7 @@ async def check_single_url(
     """
     Async HEAD check for a single URL.
 
-    Dropdown synthetic URLs (#policy=...) are NOT HTTP-checked —
+    Dropdown synthetic URLs (#state=...) are NOT HTTP-checked —
     the fragment is client-side only. get_base_url() is called
     before the HEAD request; the result records the base URL as
     the health-checked URL.
@@ -755,9 +917,9 @@ async def check_all_urls_health(
     """
     Concurrent HEAD checks for all approved URLs.
 
-    Dropdown #policy= URLs share the same base URL — we deduplicate
+    Dropdown #state= URLs share the same base URL — we deduplicate
     before checking so each base URL is only HEAD-checked once, then
-    the result is applied to all its #policy= variants.
+    the result is applied to all its #state= variants.
     """
     # Deduplicate by base URL for health checking
     seen_base:    dict[str, dict] = {}  # base_url -> first entry
@@ -880,7 +1042,7 @@ def get_chunk_ids_for_url(url: str) -> list[str]:
     """
     Return all chunk_ids in the index belonging to a given URL.
 
-    Handles both real URLs and synthetic #policy= URLs by using
+    Handles both real URLs and synthetic #state= URLs by using
     exact source_url match. source_url is SearchableField so we
     use a filter on equality.
     """
@@ -923,9 +1085,9 @@ def delete_chunks_for_urls(urls: list[str], dry_run: bool = False) -> dict[str, 
     """
     Delete ALL index chunks for the given URLs.
 
-    For base URLs that have dropdown variants (#policy=...) stored
+    For base URLs that have dropdown variants (#state=...) stored
     in the index, the caller must pass both the base URL and all its
-    known #policy= URLs. get_all_urls_to_delete() handles this.
+    known #state= URLs. get_all_urls_to_delete() handles this.
 
     Returns: dict mapping URL → chunks deleted count.
     """
@@ -961,7 +1123,7 @@ def delete_chunks_for_urls(urls: list[str], dry_run: bool = False) -> dict[str, 
 def get_all_urls_to_delete(base_urls: list[str]) -> list[str]:
     """
     For a list of base URLs, find ALL URLs in the index that derive
-    from them — including #policy= dropdown variants.
+    from them — including #state= dropdown variants.
 
     We scan the index source_url field. Any URL that starts with a
     base_url (before the # fragment) is included.
@@ -1001,7 +1163,7 @@ def get_all_urls_to_delete(base_urls: list[str]) -> list[str]:
         log.warning("get_all_urls_scan_failed", error=str(e))
         return list(to_delete)
 
-    # Add any #policy= variants whose base URL is in our delete list
+    # Add any #state= variants whose base URL is in our delete list
     norm_bases = {normalise_url(u) for u in base_urls}
     for indexed_url in indexed_urls:
         base = get_base_url(indexed_url)
@@ -1039,7 +1201,7 @@ def invalidate_cache_for_urls(urls: list[str], dry_run: bool = False) -> int:
         return 0
 
     norm_urls   = {normalise_url(u) for u in urls}
-    # Also match base URLs for any #policy= variant being removed
+    # Also match base URLs for any #state= variant being removed
     norm_bases  = {normalise_url(get_base_url(u)) for u in urls}
     all_norms   = norm_urls | norm_bases
 
@@ -1390,19 +1552,10 @@ async def scrape_url_with_dropdowns(entry: dict) -> list[dict] | None:
     title    = entry.get("title", "")
     category = entry.get("category", "")
 
-    # VDI FIX: Set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH before crawl4ai
-    # initialises its internal Playwright browser. Mirrors scraper v4.5.0.
-    import os as _os
-    if PLAYWRIGHT_EXECUTABLE_PATH and _os.path.exists(PLAYWRIGHT_EXECUTABLE_PATH):
-        _os.environ["PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"] = PLAYWRIGHT_EXECUTABLE_PATH
-        log.info("crawl4ai_using_system_chrome", path=PLAYWRIGHT_EXECUTABLE_PATH)
-
-    browser_cfg = BrowserConfig(
-        headless=True,
-        verbose=False,
-        # v1.2.1 VDI FIX: use system Chrome — mirrors scraper v4.5.1.
-        chrome_channel="chrome",
-    )
+    # v1.2.2: CDP mode on VDI, normal Playwright on production.
+    # Mirrors scraper v4.5.2 — _cf_make_browser_config() handles
+    # launching system Chrome via CDP automatically.
+    browser_cfg = _cf_make_browser_config()
 
     # ── Base page scrape ──────────────────────────────────────
     run_cfg = CrawlerRunConfig(
@@ -1849,7 +2002,7 @@ def build_report(
         ["POLICY NOTES", ""],
         ["Internal redirects",  "Treated as removed — new URL must be added to Excel."],
         ["De-listed URLs",      "Removed from index — still live but not in approved Excel."],
-        ["Dropdown variants",   "All #policy= URLs deleted when base URL changes/removed."],
+        ["Dropdown variants",   "All #state= URLs deleted when base URL changes/removed."],
         ["HQA questions",       "Not generated for delta-indexed pages (speed). Full re-index for HQA."],
     ]:
         ws3.append(row_data)
@@ -2004,19 +2157,17 @@ def run_freshness_job(
 
         # ── Step 5: Detect de-listed URLs ─────────────────────
         print("\n📊 Step 5: Detecting de-listed URLs...")
-        # URLs in index (base URLs) that are NOT in the approved Excel
-        indexed_base_norm = {
-            normalise_url(get_base_url(u.replace("://", "").split("/")[0] + "dummy"))
-            if "#policy=" not in u else normalise_url(get_base_url(u))
-            for u in index_hashes
-        }
-        # Simpler: just get all indexed source_urls and compare base
+        # Build set of all base URLs currently in the index.
+        # get_base_url() strips #state= fragment for dropdown URLs,
+        # returns URL unchanged for standard pages. is_dropdown_url()
+        # guards against double-counting dropdown variants — we only
+        # want base URLs here to compare against approved Excel.
         all_indexed_norms = set(index_hashes.keys())
         delisted_norm = {
             normalise_url(get_base_url(u))
             for u in all_indexed_norms
             if normalise_url(get_base_url(u)) not in approved_norm_base
-            and not is_dropdown_url(u)  # dropdown variants handled via base
+            and not is_dropdown_url(u)  # dropdown variants handled via their base URL
         }
         print(f"   {len(delisted_norm):,} de-listed base URLs (in index, not in Excel).")
 
@@ -2120,7 +2271,11 @@ def run_freshness_job(
 
         if urls_to_scrape:
             print(f"\n🕷️  Step 7: Scraping {len(urls_to_scrape):,} URLs...")
-            scrape_results = asyncio.run(scrape_urls_batch(urls_to_scrape))
+            try:
+                scrape_results = asyncio.run(scrape_urls_batch(urls_to_scrape))
+            finally:
+                # Stop Chrome CDP subprocess if we launched one for VDI
+                _cf_stop_chrome_cdp()
 
             for entry, pages in zip(urls_to_scrape, scrape_results):
                 norm = normalise_url(entry["url"])
