@@ -400,6 +400,17 @@ v4.5.0 — July 2026 | Mukesh Kund
          - _truncate_base_content_at_dropdown(): strips repeated option
            content from base page markdown before storing.
 
+         PLAYWRIGHT EXECUTABLE PATH:
+         VDI/corporate environments block Playwright's chromium binary
+         download via SSL cert interception. _scrape_dropdown_states_playwright()
+         now reads PLAYWRIGHT_EXECUTABLE_PATH env var (default:
+         C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe on Windows)
+         and passes it as executable_path to pw.chromium.launch() if the
+         path exists. Falls back to None (Playwright finds its own chromium)
+         when path doesn't exist — correct behaviour in Linux containers.
+         Set PLAYWRIGHT_EXECUTABLE_PATH in .env for local VDI use;
+         Key Vault for production.
+
          REMOVED:
          - _JS_DETECT_DROPDOWNS, _JS_SELECT_OPTION, _JS_GET_BODY_TEXT
            constants (crawl4ai JS injection approach — replaced by
@@ -483,6 +494,27 @@ BLOB_SCRAPED_FILENAME   = os.getenv(
     "BLOB_SCRAPED_FILENAME",
     "royal_london_faq_latest.json",
 )
+
+# ── Playwright browser executable path ─────────────────────────
+# VDI/corporate environments block Playwright's chromium download
+# via SSL certificate interception (UNABLE_TO_GET_ISSUER_CERT).
+# Use system Chrome instead — set PLAYWRIGHT_EXECUTABLE_PATH in
+# .env or Key Vault.
+#
+# VDI (Windows):
+#   PLAYWRIGHT_EXECUTABLE_PATH=C:\Program Files\Google\Chrome\Application\chrome.exe
+#   (default below — works on Royal London VDI without any .env change)
+#
+# Production (Azure Container Apps — Linux):
+#   Set PLAYWRIGHT_EXECUTABLE_PATH=/usr/bin/google-chrome in Key Vault
+#   OR leave unset — container image installs chromium via
+#   `playwright install chromium` in Dockerfile (no SSL issue in Azure).
+#
+# TODO (DevOps): Add to Dockerfile:
+#   RUN playwright install chromium --with-deps
+#   ENV PLAYWRIGHT_EXECUTABLE_PATH=""
+_PLAYWRIGHT_DEFAULT_WIN = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+PLAYWRIGHT_EXECUTABLE_PATH = os.getenv("PLAYWRIGHT_EXECUTABLE_PATH", _PLAYWRIGHT_DEFAULT_WIN)
 
 # Section mapping from first URL path segment
 SECTION_MAP = {
@@ -1440,7 +1472,16 @@ def _scrape_dropdown_states_playwright(
 
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
+            # Use system Chrome if available (VDI/corporate SSL restriction
+            # blocks Playwright chromium download). Falls back to Playwright's
+            # own chromium when executable_path doesn't exist (production/Linux).
+            import os as _os
+            _exec = PLAYWRIGHT_EXECUTABLE_PATH
+            _exec_arg = _exec if _exec and _os.path.exists(_exec) else None
+            browser = pw.chromium.launch(
+                headless=True,
+                executable_path=_exec_arg,
+            )
             try:
                 page = browser.new_page()
 

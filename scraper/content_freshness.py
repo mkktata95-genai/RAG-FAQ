@@ -185,6 +185,46 @@ v1.1.0 — July 2026 | Mukesh Kund
          URL pattern not used — see chunk_and_index_hqaV4.py v5.4.0
          changelog for full reasoning.
 
+v1.2.0 — July 2026 | Mukesh Kund
+         Playwright-based dropdown scraping in freshness script.
+         Aligned with scrape_approved_urls_updatedV4.py v4.5.0.
+
+         PROBLEM WITH v1.0.0/v1.1.0 DROPDOWN APPROACH:
+         scrape_url_with_dropdowns() used crawl4ai JS injection
+         (arun() calls with wait_until="networkidle") to detect
+         and iterate dropdown options — same approach that caused
+         dropdown_detect_failed timeouts in the scraper (v4.4.0).
+         Additionally, page_timeout values inside the dropdown
+         detection blocks were 30000ms — wrong, should be 45000ms.
+
+         FIX — Replace crawl4ai dropdown handling with Playwright:
+         scrape_url_with_dropdowns() now uses BeautifulSoup to
+         detect <select> elements in the already-fetched crawl4ai
+         HTML (zero extra network call), then calls
+         _scrape_dropdown_states_playwright() via ThreadPoolExecutor
+         — identical to scrape_approved_urls_updatedV4.py v4.5.0.
+
+         Base page timeout (line 1133): kept at 30000ms —
+         wait_until="domcontentloaded", no networkidle issue.
+
+         NEW FUNCTIONS (ported from scraper v4.5.0):
+         - _DROPDOWN_PLACEHOLDERS: placeholder option text set
+         - _scrape_dropdown_states_playwright(): Playwright thread
+           mirroring crawler.py v0.1.0 exactly — single page load,
+           DOM detection, JS event injection, 1.5s wait, line diff.
+
+         PLAYWRIGHT EXECUTABLE PATH:
+         Same VDI fix as scraper v4.5.0 — PLAYWRIGHT_EXECUTABLE_PATH
+         constant reads env var (default: system Chrome on Windows),
+         passed as executable_path to pw.chromium.launch(). Falls
+         back to None on Linux/production containers.
+
+         REMOVED:
+         - _JS_DETECT_DROPDOWNS, _JS_GET_BODY_TEXT JS constants
+         - crawl4ai arun() dropdown detection blocks inside
+           scrape_url_with_dropdowns()
+         - Stale _JS_DETECT_DROPDOWNS comment in config section
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -208,6 +248,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import aiohttp
+import concurrent.futures
 import structlog
 from dotenv import find_dotenv, load_dotenv
 
@@ -323,29 +364,21 @@ URL_HEADERS      = {"url", "page url", "link", "webpage", "web page", "web url"}
 TITLE_HEADERS    = {"title", "page title", "name"}
 CATEGORY_HEADERS = {"category", "content category", "page category", "type"}
 
-# JS injected into crawl4ai to detect routing <select> elements
-# Mirrors _JS_DETECT_DROPDOWNS in scrape_approved_urls_updatedV3.py exactly
-_JS_DETECT_DROPDOWNS = """
-() => {
-    const selects = Array.from(document.querySelectorAll('select'));
-    const result = [];
-    selects.forEach((sel, idx) => {
-        const opts = Array.from(sel.options)
-            .map(o => ({ value: o.value, text: o.text.trim() }))
-            .filter(o => o.text && o.text.toLowerCase() !== 'select...'
-                              && o.text.toLowerCase() !== 'select'
-                              && o.text.toLowerCase() !== 'please select'
-                              && o.text.toLowerCase() !== '--');
-        if (opts.length > 1) {
-            result.push({ selectIndex: idx, options: opts });
-        }
-    });
-    return result;
-}
-"""
-
-_JS_GET_BODY_TEXT = "() => document.body.innerText"
-
+# ── Playwright browser executable path ─────────────────────────
+# Mirrors PLAYWRIGHT_EXECUTABLE_PATH in scrape_approved_urls_updatedV4.py.
+# VDI/corporate SSL restriction blocks Playwright chromium download.
+# Use system Chrome instead — set PLAYWRIGHT_EXECUTABLE_PATH in .env.
+#
+# VDI (Windows):
+#   PLAYWRIGHT_EXECUTABLE_PATH=C:\Program Files\Google\Chrome\Application\chrome.exe
+#
+# Production (Azure Container Apps — Linux):
+#   Set in Key Vault or leave unset (container image installs chromium).
+#
+# TODO (DevOps): ensure Dockerfile includes:
+#   RUN playwright install chromium --with-deps
+_PLAYWRIGHT_DEFAULT_WIN    = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+PLAYWRIGHT_EXECUTABLE_PATH = os.getenv("PLAYWRIGHT_EXECUTABLE_PATH", _PLAYWRIGHT_DEFAULT_WIN)
 
 # ── Singleton clients ─────────────────────────────────────────
 _credential:    Optional[DefaultAzureCredential] = None
@@ -1068,8 +1101,214 @@ def invalidate_cache_for_urls(urls: list[str], dry_run: bool = False) -> int:
 
 
 # ══════════════════════════════════════════════════════════════
-# SCRAPING — mirrors scrape_approved_urls_updatedV3.py v4.4.0
+# SCRAPING — mirrors scrape_approved_urls_updatedV4.py v4.5.0
 # ══════════════════════════════════════════════════════════════
+
+# Dropdown placeholder option text — skip these during detection.
+# Mirrors _DROPDOWN_PLACEHOLDERS in scrape_approved_urls_updatedV4.py.
+_DROPDOWN_PLACEHOLDERS = {
+    "select...", "select", "please select", "--", "choose...",
+    "choose", "please choose",
+}
+
+
+def _scrape_dropdown_states_playwright(
+    url:            str,
+    base_title:     str,
+    base_page_data: dict,
+) -> list[dict]:
+    """
+    Scrape per-option content from a routing dropdown page using Playwright.
+
+    Ported from scrape_approved_urls_updatedV4.py v4.5.0 —
+    mirrors _scrape_dropdown_states_playwright() exactly.
+
+    Runs synchronously — called via asyncio ThreadPoolExecutor
+    from scrape_url_with_dropdowns() to avoid blocking crawl4ai
+    event loop.
+
+    Single page load → detect <select> from live DOM → per-option
+    JS event injection → 1.5s DOM wait → body text diff → extract
+    only changed lines (phone number, address, hours).
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        log.error(
+            "playwright_not_installed",
+            note="pip install playwright && playwright install chromium",
+        )
+        return []
+
+    results: list[dict] = []
+
+    try:
+        with sync_playwright() as pw:
+            # Use system Chrome if available (VDI/corporate SSL restriction).
+            # Falls back to None (Playwright finds its own chromium) in production.
+            import os as _os
+            _exec    = PLAYWRIGHT_EXECUTABLE_PATH
+            _exec_arg = _exec if _exec and _os.path.exists(_exec) else None
+            browser = pw.chromium.launch(
+                headless=True,
+                executable_path=_exec_arg,
+            )
+            try:
+                page = browser.new_page()
+                page.route(
+                    "**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,eot}",
+                    lambda route: route.abort(),
+                )
+
+                log.info("playwright_navigating", url=url)
+                page.goto(url, wait_until="networkidle", timeout=45000)
+
+                try:
+                    page.wait_for_selector(
+                        "main, article, [role='main']",
+                        timeout=10000,
+                    )
+                except PWTimeout:
+                    pass
+
+                # Detect routing dropdowns from live DOM
+                selects          = page.query_selector_all("select")
+                routing_dropdowns = []
+
+                for select in selects:
+                    options    = select.query_selector_all("option")
+                    valid_opts = []
+                    for opt in options:
+                        text  = opt.inner_text().strip()
+                        value = opt.get_attribute("value") or ""
+                        if text and text.lower() not in _DROPDOWN_PLACEHOLDERS:
+                            valid_opts.append({"value": value, "text": text})
+                    if len(valid_opts) > 1:
+                        routing_dropdowns.append({
+                            "select_element": select,
+                            "options":        valid_opts,
+                        })
+
+                if not routing_dropdowns:
+                    log.info("playwright_no_dropdowns_found", url=url)
+                    return []
+
+                log.info(
+                    "playwright_dropdowns_detected",
+                    url=url,
+                    dropdown_count=len(routing_dropdowns),
+                )
+
+                # Capture default body text for diffing
+                default_raw_text = page.inner_text("body")
+                default_lines    = {
+                    line.strip()
+                    for line in default_raw_text.split("\n")
+                    if line.strip()
+                }
+
+                for dropdown in routing_dropdowns:
+                    select_el = dropdown["select_element"]
+                    options   = dropdown["options"]
+
+                    for option in options:
+                        opt_value = option["value"]
+                        opt_text  = option["text"]
+
+                        try:
+                            select_el.evaluate(
+                                """(el, optText) => {
+                                    const options = Array.from(el.options);
+                                    const target = options.find(
+                                        o => o.text.trim() === optText
+                                    );
+                                    if (target) {
+                                        el.value = target.value;
+                                        el.dispatchEvent(
+                                            new Event('input', { bubbles: true })
+                                        );
+                                        el.dispatchEvent(
+                                            new Event('change', { bubbles: true })
+                                        );
+                                    }
+                                }""",
+                                opt_text,
+                            )
+
+                            time.sleep(1.5)
+
+                            new_raw_text  = page.inner_text("body")
+                            new_lines     = [
+                                line.strip()
+                                for line in new_raw_text.split("\n")
+                                if line.strip()
+                            ]
+                            changed_lines = [
+                                line for line in new_lines
+                                if line not in default_lines
+                            ]
+                            dynamic_content = "\n".join(changed_lines)
+
+                            if not dynamic_content or len(dynamic_content.strip()) < 20:
+                                log.warning(
+                                    "playwright_option_no_change",
+                                    url=url,
+                                    option=opt_text,
+                                )
+                                continue
+
+                            safe_value = opt_value if opt_value else opt_text
+                            state_url  = f"{url}#policy={safe_value}"
+                            content    = dynamic_content.strip()
+
+                            results.append({
+                                "url":              state_url,
+                                "title":            f"{base_title} — {opt_text}",
+                                "section":          base_page_data["section"],
+                                "content":          content,
+                                "scraped_at":       datetime.now(timezone.utc).isoformat(),
+                                "content_length":   len(content),
+                                "content_hash":     hashlib.sha256(
+                                    content.encode("utf-8")
+                                ).hexdigest(),
+                                "audience":         base_page_data.get("audience", "general"),
+                                "has_video":        base_page_data.get("has_video", False),
+                                "content_type":     base_page_data.get("content_type", "article"),
+                                "product_category": base_page_data.get("product_category", "general"),
+                                "description":      base_page_data.get("description", ""),
+                                "thumbnail_url":    base_page_data.get("thumbnail_url", ""),
+                                "publish_date":     base_page_data.get("publish_date", ""),
+                                "collection_name":  base_page_data.get("collection_name", ""),
+                                "read_time_mins":   max(1, len(content.split()) // 200),
+                                "dropdown_state":   opt_text,
+                                "dropdown_value":   opt_value or "",
+                            })
+
+                            log.info(
+                                "playwright_option_scraped",
+                                url=state_url,
+                                option=opt_text,
+                                chars=len(content),
+                            )
+
+                        except Exception as e:
+                            log.warning(
+                                "playwright_option_error",
+                                url=url,
+                                option=opt_text,
+                                error=str(e),
+                            )
+                            continue
+
+            finally:
+                browser.close()
+
+    except Exception as e:
+        log.error("playwright_dropdown_scrape_error", url=url, error=str(e))
+
+    return results
+
+
 
 def derive_section(url: str) -> str:
     """Derive section from first URL path segment. Mirrors scraper v3."""
@@ -1182,125 +1421,32 @@ async def scrape_url_with_dropdowns(entry: dict) -> list[dict] | None:
                 "dropdown_value":   "",
             }
 
-            # ── Dropdown detection ────────────────────────────
+            # ── Dropdown detection (v1.2.0) ───────────────────
+            # BeautifulSoup check on already-fetched HTML — zero
+            # extra network call. If dropdowns found, Playwright
+            # handles option iteration (mirrors scraper v4.5.0).
             dropdown_states: list[dict] = []
-            try:
-                detect_cfg    = CrawlerRunConfig(
-                    js_code=_JS_DETECT_DROPDOWNS,
-                    wait_until="networkidle",
-                    page_timeout=30000,
-                    verbose=False,
-                )
-                detect_result = await crawler.arun(url=url, config=detect_cfg)
+            raw_html = getattr(result, "html", "") or ""
 
-                if detect_result.success:
-                    dropdowns = getattr(detect_result, "js_return_value", None) or []
-
-                    if dropdowns:
-                        # Capture default body text for diffing
-                        body_cfg    = CrawlerRunConfig(
-                            js_code=_JS_GET_BODY_TEXT,
-                            wait_until="networkidle",
-                            page_timeout=30000,
-                            verbose=False,
-                        )
-                        body_result = await crawler.arun(url=url, config=body_cfg)
-                        default_body = getattr(body_result, "js_return_value", "") or ""
-                        default_lines: set[str] = {
-                            line.strip()
-                            for line in default_body.split("\n")
-                            if line.strip()
-                        }
-
-                        for dropdown in dropdowns:
-                            select_idx = dropdown["selectIndex"]
-                            options    = dropdown["options"]
-
-                            for option in options:
-                                opt_value = option["value"]
-                                opt_text  = option["text"]
-
-                                try:
-                                    select_js = f"""
-async () => {{
-    const selects = Array.from(document.querySelectorAll('select'));
-    const sel = selects[{select_idx}];
-    if (!sel) return '';
-    const target = Array.from(sel.options)
-        .find(o => o.text.trim() === {json.dumps(opt_text)});
-    if (!target) return '';
-    sel.value = target.value;
-    sel.dispatchEvent(new Event('input',  {{ bubbles: true }}));
-    sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
-    await new Promise(r => setTimeout(r, 1500));
-    return document.body.innerText;
-}}
-"""
-                                    opt_cfg    = CrawlerRunConfig(
-                                        js_code=select_js,
-                                        wait_until="networkidle",
-                                        page_timeout=30000,
-                                        verbose=False,
-                                    )
-                                    opt_result = await crawler.arun(url=url, config=opt_cfg)
-
-                                    if not opt_result.success:
-                                        continue
-
-                                    new_body = getattr(opt_result, "js_return_value", "") or ""
-                                    if not new_body:
-                                        continue
-
-                                    dynamic_content = _diff_dropdown_content(
-                                        default_lines, new_body
-                                    )
-
-                                    if not dynamic_content or len(dynamic_content.strip()) < 20:
-                                        continue
-
-                                    safe_value = re.sub(
-                                        r"[^a-zA-Z0-9_-]", "_", opt_value or opt_text
-                                    )
-                                    state_url  = f"{url}#policy={safe_value}"
-                                    content    = dynamic_content.strip()
-
-                                    dropdown_states.append({
-                                        "url":              state_url,
-                                        "title":            f"{title} — {opt_text}",
-                                        "section":          base_page["section"],
-                                        "content":          content,
-                                        "scraped_at":       datetime.now(timezone.utc).isoformat(),
-                                        "content_length":   len(content),
-                                        "content_hash":     compute_content_hash(content),
-                                        "has_video":        base_page["has_video"],
-                                        "content_type":     base_page["content_type"],
-                                        "product_category": base_page["product_category"],
-                                        "description":      base_page["description"],
-                                        "thumbnail_url":    base_page["thumbnail_url"],
-                                        "publish_date":     base_page["publish_date"],
-                                        "collection_name":  base_page["collection_name"],
-                                        "read_time_mins":   max(1, len(content.split()) // 200),
-                                        "audience":         base_page["audience"],
-                                        "dropdown_state":   opt_text,
-                                        "dropdown_value":   opt_value or "",
-                                    })
-                                    log.info(
-                                        "dropdown_state_scraped",
-                                        url=state_url,
-                                        option=opt_text,
-                                        chars=len(content),
-                                    )
-
-                                except Exception as e:
-                                    log.warning(
-                                        "dropdown_option_error",
-                                        url=url,
-                                        option=opt_text,
-                                        error=str(e),
-                                    )
-
-            except Exception as e:
-                log.warning("dropdown_detection_skipped", url=url, error=str(e))
+            if _has_routing_dropdowns_in_html(raw_html):
+                log.info("dropdown_page_detected_via_html", url=url)
+                try:
+                    loop     = asyncio.get_event_loop()
+                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    dropdown_states = await loop.run_in_executor(
+                        executor,
+                        _scrape_dropdown_states_playwright,
+                        url,
+                        title,
+                        base_page,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "playwright_dropdown_skipped",
+                        url=url,
+                        error=str(e),
+                    )
+                    dropdown_states = []
 
             pages = [base_page] + dropdown_states
             if dropdown_states:
