@@ -28,6 +28,14 @@ from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
 load_dotenv(find_dotenv(usecwd=False), override=True)
 
+try:
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    _OPENPYXL_OK = True
+except ImportError:
+    _OPENPYXL_OK = False
+
 import structlog
 log = structlog.get_logger()
 
@@ -172,7 +180,6 @@ def stop_chrome_cdp():
 
 
 def load_urls_from_excel(file_path: str) -> list[dict]:
-    from openpyxl import load_workbook
     wb = load_workbook(file_path, read_only=True, data_only=True)
     ws = wb.active
 
@@ -335,11 +342,7 @@ async def run_detection(entries: list[dict]) -> list[dict]:
 
 def build_report(results: list[dict], output_path: Path) -> None:
     """Build Excel report with 3 sheets."""
-    try:
-        from openpyxl import Workbook
-        from openpyxl.styles import Alignment, Font, PatternFill
-        from openpyxl.utils import get_column_letter
-    except ImportError:
+    if not _OPENPYXL_OK:
         print("openpyxl not installed — skipping Excel report")
         return
 
@@ -434,7 +437,6 @@ def _style_header(ws, bg_hex: str):
 
 
 def _auto_width(ws, max_w: int = 80):
-    from openpyxl.utils import get_column_letter
     for col in ws.columns:
         max_len    = 0
         col_letter = get_column_letter(col[0].column)
