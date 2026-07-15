@@ -305,8 +305,20 @@ async def run_detection(entries: list[dict]) -> list[dict]:
             print(f"   CDP mode — connecting to Chrome on port {_CDP_PORT}")
             browser = await pw.chromium.connect_over_cdp(_CDP_URL)
         else:
-            print("   Playwright mode — launching own browser")
-            browser = await pw.chromium.launch(headless=True)
+            # Fallback: use system Chrome executable directly if available
+            # (VDI cannot download ms-playwright chromium due to SSL restrictions)
+            exec_path = PLAYWRIGHT_EXECUTABLE_PATH if (
+                PLAYWRIGHT_EXECUTABLE_PATH and
+                os.path.exists(PLAYWRIGHT_EXECUTABLE_PATH)
+            ) else None
+            if exec_path:
+                print(f"   Direct Chrome mode — {exec_path}")
+            else:
+                print("   Playwright mode — launching own browser")
+            browser = await pw.chromium.launch(
+                headless=True,
+                executable_path=exec_path,
+            )
 
         context = await browser.new_context(
             user_agent="ARIA-DropdownDetector/1.0 (internal diagnostic)"
