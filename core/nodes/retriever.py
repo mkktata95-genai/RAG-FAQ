@@ -566,18 +566,34 @@ def retriever_node(state: AgentState) -> AgentState:
 
         if not chunks:
             from core.refusal import get_refusal, RefusalReason
+            from core.nodes.prompt_builder_node import CONTACT_CITATION
+            from core.schemas import Citation
             state.refusal_triggered = True
             state.final_response    = get_refusal(
                 RefusalReason.NO_RESULTS
             )
+            state.citations = [Citation(
+                index=1,
+                url=CONTACT_CITATION["url"],
+                title=CONTACT_CITATION["title"],
+                section=CONTACT_CITATION["section"],
+            )]
             log.warning("no_chunks_retrieved")
 
     except Exception as e:
         log.error("retriever_error", error=str(e))
         from core.refusal import get_refusal, RefusalReason
+        from core.nodes.prompt_builder_node import CONTACT_CITATION
+        from core.schemas import Citation
         state.refusal_triggered = True
         state.final_response    = get_refusal(
             RefusalReason.GENERAL
         )
+        state.citations = [Citation(
+            index=1,
+            url=CONTACT_CITATION["url"],
+            title=CONTACT_CITATION["title"],
+            section=CONTACT_CITATION["section"],
+        )]
 
     return state

@@ -185,6 +185,7 @@ class GraphState(TypedDict):
     is_sensitive: bool
     latency_ms: dict
     token_usage: dict
+    stream_tokens: list   # v2.3.0 — set by generator_node, read by server.py
     error: Any
     # v1.2.0 — new Sprint 1 fields set by classifier_node
     # and prompt_builder_node. Declared here so LangGraph
@@ -442,6 +443,7 @@ def run_query(
         "is_sensitive": False,
         "latency_ms": {},
         "token_usage": {},
+        "stream_tokens": [],
         "error": None,
         # v1.2.0 — Sprint 1 new fields (declared AgentState
         # Pydantic fields + GraphState TypedDict keys)

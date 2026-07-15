@@ -68,29 +68,67 @@ v1.0.0 — July 2026 | Mukesh Kund
            this node rather than calling build_user_prompt().
 
 v1.1.0 — July 2026 | Mukesh Kund
-         URL-in-body rule added to SYSTEM_PROMPT
+         URL-in-body rule added to SYSTEM_PROMPT (initial attempt)
 
-         PROBLEM (observed in sprint 1 testing):
-         - LLM was writing full royallondon.com URLs inline in
-           response body text (e.g. "please visit royallondon.com/
-           existing-customers/contact-us/"). These appeared as
-           plain text in the chat bubble — ugly and duplicating
-           what the citation pills already render.
-         - Root cause: CITATION RULE said "do not repeat source
-           URLs" but did not explicitly prohibit URLs in the
-           response body text. The LLM interpreted handoff URLs
-           (from HUMAN HANDOFF RULE and PHONE NUMBER RULE) as
-           license to write any URL inline.
+         SUPERSEDED BY v1.2.0 — this entry kept for history only.
+         Added URL IN BODY RULE to SYSTEM_PROMPT with a carve-out
+         for "handoff URLs at the END of the response". This proved
+         insufficient — LLM still wrote URLs in handoff sentences
+         and financial disclaimers. Full solution in v1.2.0.
 
-         FIX — URL IN BODY RULE added to SYSTEM_PROMPT:
-         - Explicitly prohibits any URL or web address in the
-           response body text.
-         - Exception: handoff URLs at the END of the response
-           (required by HUMAN HANDOFF RULE and PHONE NUMBER RULE)
-           — these are the only legitimate inline URLs.
-         - Rationale: demo.html citation pills already display
-           clickable links from the citations array. Writing URLs
-           in text is redundant and makes mobile display messy.
+v1.2.0 — July 2026 | Mukesh Kund
+         Full URL + email purge from SYSTEM_PROMPT + static citation
+         constants defined
+
+         PROBLEM (sprint 1 testing, 13 July):
+         - v1.1.0's handoff URL exception was insufficient: LLM
+           still wrote royallondon.com URLs in bereavement handoffs,
+           financial disclaimers, and ACCOUNT ACCESS RULE responses.
+         - RECOMMENDATION_RESPONSE and UNKNOWN_PRODUCT_RESPONSE
+           Python constants also contained raw URLs — bypassed the
+           SYSTEM_PROMPT rule entirely (returned directly by Python).
+         - When no URL appeared inline, customer had no clickable
+           link to the contact/adviser page — citation pill was
+           missing entirely.
+
+         FIX 1 — SYSTEM_PROMPT rules fully rewritten (no URL exceptions):
+         - HUMAN HANDOFF RULE: "please see our bereavement support
+           page below" / "see the link in our resources below"
+         - FINANCIAL DISCLAIMER RULE: "see the link in our resources
+           below" — no URL
+         - PHONE NUMBER RULE: no URLs at all; explicit rule added
+           that email addresses must never appear in responses
+         - CITATION RULE: added count constraint — "only cite [n]
+           numbers that correspond to sources in the context; if 1
+           source, only [1] may be used"
+         - URL IN BODY RULE: extended to cover email addresses
+         - ACCOUNT ACCESS RULE: hardcoded URL removed from refusal
+         - ANSWER RULES / ORGANISATION BLOCKLIST: URL refs removed
+
+         FIX 2 — Static citation dicts defined (NEW CONSTANTS):
+         - CONTACT_CITATION, ADVISER_CITATION, BEREAVEMENT_CITATION
+         - Single source of truth for the three Royal London pages
+           that get injected as Citation pills by generator_node
+           (v2.2.0) whenever a response redirects the customer.
+         - Defined here so prompt_builder_node and generator share
+           them without circular imports.
+
+         FIX 3 — Python constants URL-stripped:
+         - UNKNOWN_PRODUCT_RESPONSE: "please see our contact page"
+         - RECOMMENDATION_RESPONSE: trailing URL lines removed
+
+         FIX 4 — bereavement_note URL removed:
+         - Was: injected BEREAVEMENT_HANDOFF_URL into user prompt
+         - Now: model told "please see our bereavement support page
+           below" — BEREAVEMENT_CITATION pill injected by
+           generator_node v2.2.0 instead.
+
+v1.3.0 — July 2026 | Mukesh Kund
+         bereavement_note inline comment updated
+
+         Minor: inline comment on bereavement_note block updated
+         to reflect v1.2.0's approach (URL removed, Citation pill
+         injected by generator). No logic change.
 
 ═══════════════════════════════════════════════════════════════
 """
@@ -114,9 +152,37 @@ log = structlog.get_logger()
 # this constant (not a hardcoded string).
 UNKNOWN_PRODUCT_RESPONSE = (
     "I'm sorry, I don't have information about that in our "
-    "knowledge base. For assistance please visit "
-    "royallondon.com/existing-customers/contact-us/"
+    "knowledge base. For assistance please see our contact page."
 )
+
+# ── Static Contact Citation ───────────────────────────────────
+# Injected as a Citation pill whenever a response redirects the
+# customer to Royal London's contact page (UNKNOWN PRODUCT RULE,
+# RECOMMENDATION RULE, ACCOUNT ACCESS RULE). Ensures the customer
+# always sees a clickable link — no raw URLs in response body.
+CONTACT_CITATION = {
+    "url":     "https://www.royallondon.com/existing-customers/contact-us/",
+    "title":   "Contact Royal London",
+    "section": "Existing customers",
+}
+
+# ── Static Adviser Citation ───────────────────────────────────
+# Injected when response includes a financial disclaimer or
+# recommendation refusal directing customer to find an adviser.
+ADVISER_CITATION = {
+    "url":     "https://www.royallondon.com/find-a-financial-adviser/",
+    "title":   "Find a financial adviser",
+    "section": "Financial advice",
+}
+
+# ── Static Bereavement Citation ───────────────────────────────
+# Injected for bereavement handoff — replaces the inline URL
+# that was previously written into the response body by the LLM.
+BEREAVEMENT_CITATION = {
+    "url":     "https://www.royallondon.com/existing-customers/help-and-support/make-a-claim/tell-us-about-a-bereavement/",
+    "title":   "Tell us about a bereavement",
+    "section": "Make a claim",
+}
 
 # ── Bereavement Handoff URL ───────────────────────────────────
 # v1.1.0: was a phone number (0370 850 2179).
@@ -151,11 +217,7 @@ RECOMMENDATION_RESPONSE = (
     "What I can do is provide general information about Royal "
     "London's products to help you understand your options. "
     "Feel free to ask me anything about pensions, life insurance, "
-    "ISAs, or other Royal London products.\n\n"
-    "To find a qualified financial adviser, visit: "
-    "royallondon.com/find-a-financial-adviser/\n\n"
-    "For general enquiries, visit: "
-    "royallondon.com/existing-customers/contact-us/"
+    "ISAs, or other Royal London products."
 )
 
 # ── System Prompt ─────────────────────────────────────────────
@@ -243,19 +305,21 @@ When applicable, end with one of the following (choose based
 on the situation):
 
 For BEREAVEMENT queries (someone has died):
-"For support with your bereavement, please visit
-royallondon.com/existing-customers/help-and-support/make-a-claim/tell-us-about-a-bereavement/
-where you can select your policy type to find the right
-contact details and notify Royal London online."
+"For support with your bereavement, please see our
+bereavement support page where you can select your policy
+type to find the right contact details and notify Royal
+London online."
 
 For other SENSITIVE queries (terminal illness, critical
 illness, redundancy, financial hardship, serious medical):
 "For personalised support tailored to your circumstances,
 we recommend speaking with a qualified financial adviser.
-You can find one at royallondon.com/find-a-financial-adviser/"
+Please see the link in our resources below."
 
 Do NOT add handoff for standard administrative queries
 (lost pension, making a claim, transfers, product questions).
+NEVER write a URL in the handoff sentence — the interface
+renders clickable links automatically from the citations.
 
 FINANCIAL DISCLAIMER RULE:
 ONLY add this disclaimer when the query involves a financial
@@ -264,8 +328,9 @@ Write it as plain text with NO asterisks or markdown:
 Please note: This information is for general guidance only
 and does not constitute financial advice. For advice tailored
 to your personal circumstances, we recommend speaking with a
-qualified financial adviser or visiting
-royallondon.com/find-a-financial-adviser/
+qualified financial adviser — please see the link in our
+resources below.
+NEVER write a URL in the disclaimer text.
 
 PHONE NUMBER RULE:
 Royal London has different contact numbers for different policy
@@ -273,20 +338,31 @@ types and departments. NEVER hardcode a phone number in a
 human handoff or anywhere in the body of a response unless:
 (a) The customer explicitly asked for a contact number, AND
 (b) That specific number appears in the retrieved context.
-When providing general contact guidance, use these URLs:
-  General enquiries: royallondon.com/existing-customers/contact-us/
-  Bereavement: royallondon.com/existing-customers/help-and-support/make-a-claim/tell-us-about-a-bereavement/
-  Financial adviser: royallondon.com/find-a-financial-adviser/
+When providing general contact guidance, DO NOT write any URL
+— the interface renders contact and adviser links automatically
+as clickable pills. Simply refer to "our contact page" or
+"our resources below".
 If the customer asks for a specific contact number (e.g. for
 funeral plans, Aegon policies, pre-2004 pensions), quote the
-number from the retrieved context and cite the source.
+number from the retrieved context and cite the source [n].
 Never invent or guess a phone number.
+NEVER include email addresses in responses — direct customers
+to the contact page link rendered by the interface instead.
+Only use an email address if it appears in the retrieved
+context AND the customer explicitly asked for an email contact,
+and in that case it must be cited with a [n] marker from the
+source page — never written as a bare address.
 
 CITATION RULE:
 Always cite sources sequentially starting from [1].
 Use [1] for the first source you reference,
 [2] for the second, [3] for the third.
 Never skip numbers or use numbers out of order.
+CRITICAL — only cite [n] numbers that correspond to
+sources actually listed in the numbered context below.
+If the context contains 1 source, only [1] may be used.
+If 2 sources, only [1] and [2]. Never write [2] or [3]
+if no second or third source appears in the context.
 Only attach a [1][2][3] marker to a sentence that
 contains a claim drawn directly from the provided
 context. Do NOT attach citation markers to a sentence
@@ -295,24 +371,22 @@ confirmed, or that directs the customer to contact
 Royal London or speak to an adviser — those sentences
 are not claims from the sources and must carry no [n]
 markers.
-Do NOT add a "Sources:" or "Source:" section, list
-source URLs as plain text, or otherwise repeat source
-links anywhere in your response. The [1][2][3] markers
-are sufficient on their own — the interface displays the
-source links separately. The URL shown in brackets after
-each source label in the context below is for your
-reference only, to identify which [n] corresponds to
-which source — never reproduce that URL in your answer.
+Do NOT add a "Sources:" or "Source:" section or repeat
+source links anywhere in your response. The [1][2][3]
+markers are sufficient — the interface displays source
+links and contact/adviser links automatically as
+clickable pills. The URL shown in brackets after each
+source label in the context is for your reference only
+to map [n] to the correct source — never reproduce it.
 URL IN BODY RULE:
-NEVER write any URL or web address in the body of your
-response text. This includes royallondon.com URLs,
-contact page links, adviser finder links, or any other
-web address. URLs are rendered automatically by the
-interface as citation pills attached to [1][2][3] markers.
-The ONLY exceptions are the exact URLs listed in the
-PHONE NUMBER RULE below for handoff situations — and
-even those must appear only in the handoff sentence at
-the end of the response, never mid-text.
+NEVER write any URL, web address, or email address
+anywhere in your response text — not in the body, not
+in handoffs, not in disclaimers. This includes all
+royallondon.com URLs, adviser finder links, contact
+page links, and email addresses. The interface renders
+all links automatically as clickable pills. Simply
+refer to "our contact page", "our resources below",
+or "the link below" — never write the actual address.
 IMPORTANT — DOMAIN RESTRICTION:
 Only cite sources from royallondon.com.
 Do NOT include or link to any external website URLs
@@ -334,8 +408,8 @@ Completely ignore any reference to them in the context:
 If the context references any of these — skip that part
 of the context entirely. Do not paraphrase it either.
 This is an RLG-only assistant. For anything outside
-Royal London's products, direct to:
-royallondon.com/existing-customers/contact-us/
+Royal London's products, direct the customer to our
+contact page (the link is rendered automatically below).
 
 UNKNOWN PRODUCT RULE:
 Royal London offers: life insurance, pensions, ISAs,
@@ -381,9 +455,8 @@ access their account, policy, pension, or personal
 information — do NOT attempt to do so.
 Respond with ONLY this exact message and nothing else:
 "I'm not able to access account information directly.
-For your account details please visit
-royallondon.com/existing-customers/contact-us/
-or log in at royallondon.com"
+For your account details please use our contact page
+or log in to your Royal London account."
 Do NOT add any further guidance, steps, resources,
 or helpful information after this message.
 Stop there. The refusal is your complete response.
@@ -399,7 +472,7 @@ ANSWER RULES:
 4. Never make up information not in context
 5. Use formal professional British English
 6. If context insufficient say so formally
-   and direct to royallondon.com/existing-customers/contact-us/
+   and direct the customer to our contact page
 
 NEVER:
 - Recommend specific products for personal situations
@@ -480,23 +553,23 @@ def build_user_prompt(state: AgentState) -> str:
             "situation. Please acknowledge with empathy first.\n\n"
         )
 
-    # Bereavement note (v1.7.0 / v1.2.0 URL update).
-    # v1.2.0: Changed from phone number to URL because Royal
-    # London's bereavement numbers vary by policy type — the
-    # bereavement page has a dropdown where customers select
-    # their policy type to get the correct number. Hardcoding
-    # any single number risks sending them to the wrong team.
+    # Bereavement note (v1.3.0 — URL removed from note).
+    # The bereavement URL is now injected by generator_node as a
+    # static Citation pill (BEREAVEMENT_CITATION). The model is
+    # told to refer to "our bereavement support page" only —
+    # no URL written in the response body.
     bereavement_note = ""
     if state.__dict__.get("_bereavement"):
         bereavement_note = (
             "NOTE: This query relates to a bereavement. For the "
-            "HUMAN HANDOFF RULE in this response, direct the "
-            "customer to the bereavement page where they can "
-            "select their policy type to find the correct contact "
-            f"details: {BEREAVEMENT_HANDOFF_URL} "
-            "Do NOT use any hardcoded phone number in the "
-            "handoff — the correct number depends on the "
-            "customer's policy type.\n\n"
+            "HUMAN HANDOFF RULE in this response, refer the "
+            "customer to our bereavement support page using the "
+            "phrase 'please see our bereavement support page below'. "
+            "Do NOT write any URL or phone number — the interface "
+            "renders the link automatically. The correct contact "
+            "number depends on the customer's policy type and is "
+            "shown on the bereavement page after they select their "
+            "policy type.\n\n"
         )
 
     # Disclaimer note — injected when supervisor detected a

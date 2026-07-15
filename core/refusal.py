@@ -38,15 +38,13 @@ REFUSAL_TEMPLATES = {
         "I wasn't able to find specific information about "
         "that in our knowledge base. For detailed assistance "
         "please contact Royal London directly on "
-        "0345 600 0371 or visit "
-        "royallondon.com/existing-customers/contact-us/"
+        "0345 600 0371 or see our contact page below."
     ),
 
     RefusalReason.GENERAL: (
         "I'm unable to process your request at the moment. "
         "Please contact Royal London directly on "
-        "0345 600 0371 or visit "
-        "royallondon.com/existing-customers/contact-us/"
+        "0345 600 0371 or see our contact page below."
     ),
 }
 

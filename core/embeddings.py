@@ -24,7 +24,7 @@ EMBEDDING_DEPLOYMENT  = os.getenv(
     "text-embedding-3-large",
 )
 EMBEDDING_DIMENSIONS  = int(
-    os.getenv("AZURE_OPENAI_EMBEDDING_DIMENSIONS", "1024")
+    os.getenv("AZURE_OPENAI_EMBEDDING_DIMENSIONS", "1536")
 )
 
 # Singleton clients — created once, reused

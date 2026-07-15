@@ -272,10 +272,45 @@ v1.8.0 — July 2026 | Mukesh Kund
 
          Sets kept in sync between supervisor.py (quick path)
          and classifier_node.py (secondary check) — both updated.
-         - was: load_dotenv() — no args, no override
-         - now: load_dotenv(find_dotenv(usecwd=False), override=True)
-           find_dotenv: works regardless of CWD
-           override=True: .env always wins over shell env vars
+
+v1.9.0 — July 2026 | Mukesh Kund
+         RECOMMENDATION_TRIGGERS expanded
+
+         PROBLEM (sprint 1 testing, 13 July — Image 2):
+         - "Will my pension be enough to retire on at 65?" went
+           through the full pipeline and got a substantive answer
+           instead of hitting RECOMMENDATION_RESPONSE. This is a
+           personal financial sufficiency assessment — under FCA
+           Consumer Duty rules Aria must not answer it, the same as
+           "which pension is better for me?".
+         - Root cause: RECOMMENDATION_TRIGGERS list was phrase-exact
+           and only covered explicit recommendation requests
+           ("recommend", "which is better for me" etc). It had no
+           coverage for sufficiency/adequacy, projection, or
+           comparison questions.
+
+         FIX — RECOMMENDATION_TRIGGERS expanded from 18 → 33 phrases:
+         - Sufficiency/adequacy: "enough to retire", "will my pension
+           be enough", "is my pension enough", "am i saving enough",
+           "will i have enough", "do i have enough",
+           "how much do i need to retire", "can i afford to retire",
+           "when can i retire", "am i on track",
+           "on track for retirement", "will i be okay",
+           "will i be able to retire"
+         - Comparison/superiority: "is it worth", "better to",
+           "is it better", "which is better", "better option",
+           "is royal london better", "better than",
+           "worth switching", "worth transferring"
+         - Personal projection: "how much will i get",
+           "how much will i have", "how much will my pension be",
+           "what will my pension be worth", "will i get enough",
+           "will my savings be enough"
+         - NOTE: "is it worth" and "better to" were already in
+           FINANCIAL_DECISION_TRIGGERS (sets needs_disclaimer) but
+           NOT in RECOMMENDATION_TRIGGERS (sets _skip_cache +
+           RECOMMENDATION_RESPONSE). Now added to both — a query
+           triggering needs_disclaimer should also trigger the
+           full recommendation refusal, not just add a disclaimer.
 
 ═══════════════════════════════════════════════════════════════
 """
@@ -466,6 +501,7 @@ def is_bereavement(query: str) -> bool:
 # _skip_cache=True is read by cache_check_node v1.6.0 which
 # skips all cache stages (direct lookup + canonical rewrite).
 RECOMMENDATION_TRIGGERS = [
+    # Explicit recommendation requests
     "recommend", "recommendation", "recommendations",
     "suggest", "suggestion",
     "what should i", "which should i",
@@ -475,6 +511,26 @@ RECOMMENDATION_TRIGGERS = [
     "what do you recommend", "which do you recommend",
     "should i choose", "help me decide", "help me choose",
     "which is best", "what is best for me",
+    # Retirement sufficiency / adequacy questions
+    # (Image 2: "Will my pension be enough to retire on at 65?"
+    #  was not caught — these are personal financial assessments,
+    #  not factual FAQ queries, and must be refused under FCA rules)
+    "enough to retire", "will my pension be enough",
+    "is my pension enough", "am i saving enough",
+    "will i have enough", "do i have enough",
+    "how much do i need to retire", "how much do i need for retirement",
+    "can i afford to retire", "when can i retire",
+    "am i on track", "on track for retirement",
+    "will i be okay", "will i be able to retire",
+    # Comparison / superiority questions (competitor or product)
+    "is it worth", "better to", "is it better",
+    "which is better", "better option",
+    "is royal london better", "better than",
+    "worth switching", "worth transferring",
+    # Personal projection questions
+    "how much will i get", "how much will i have",
+    "how much will my pension be", "what will my pension be worth",
+    "will i get enough", "will my savings be enough",
 ]
 
 

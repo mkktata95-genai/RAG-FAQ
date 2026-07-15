@@ -571,6 +571,68 @@ v4.5.4 — July 2026 | Mukesh Kund
          sys.platform != "win32" — complete no-op.
          EpollEventLoop on Linux does not exhibit this issue.
 
+v4.5.5 — July 2026 | Mukesh Kund
+         Bulletproof dropdown scraping — contact signal validation
+         + navigation guard + placeholder expansion.
+
+         BACKGROUND:
+         Full scrape of 350 approved URLs revealed that our dropdown
+         detection was too broad — triggering Playwright on pages
+         with filter controls (Newest/Oldest sort, Category/Years/
+         Months filters), form inputs (Mr/Mrs/Ms title, language
+         selectors), registration routing (pension plan type), and
+         navigation tabs. This produced 132 extra ‘pages’ (350
+         approved → 482 scraped) of low-quality or irrelevant content.
+
+         A standalone diagnostic script (detect_dropdowns.py) was
+         run against all 350 URLs and confirmed exactly 36 URLs have
+         detectable dropdowns, classified as:
+           contact_routing  —  5 URLs (the ONLY ones worth scraping)
+           content_filter   — 22 URLs (Newest/Oldest, Category etc)
+           form_field       —  2 URLs (Mr/Mrs/Ms, language)
+           unknown          —  7 URLs (confirmed no useful content)
+
+         STRATEGY — 3-layer filter (all rules auto, no manual list):
+
+         Layer 1 — Navigation guard:
+         After firing JS event, check page.url against original URL.
+         If changed — page navigated (SPA routing) — skip option and
+         re-navigate back. Fixes find-a-lost-pension stale element
+         errors and prevents indexing off-page content.
+
+         Layer 2 — Content signal validation:
+         After getting body text diff, check if it contains at least
+         one contact signal:
+           • Phone number:  UK format e.g. 0345 646 2101
+           • Address:       "write to us", "lines are open",
+                              "call us", "excluding bank holidays"
+           • Form link:     "fill in our online form",
+                              "tell us someone has died"
+         If NO signal — skip. Eliminates filter controls, form inputs,
+         registration routing, and navigation tabs automatically.
+         No whitelist, no manual maintenance required.
+         Approved Excel remains the sole source of truth.
+
+         Layer 3 — Placeholder expansion:
+         Added dashed/numbered variants to _DROPDOWN_PLACEHOLDERS:
+         "-- select an option --", "- select -", "select an option",
+         "select option", "none", "n/a", "0", "all".
+         Prevents garbage #state= URLs like
+         #state=--Select%20an%20option-- appearing in the index.
+
+         RULES SATISFIED (from client architect meeting July 2026):
+         Rule 1 — Form dropdowns: no contact signal → skipped
+         Rule 2 — Navigation redirect: page.url check → skipped
+         Rule 3 — No content change: <20 chars check → skipped
+         Rule 4 — Personal detail dropdowns: no signal → skipped
+         Rule 5 — Complaint/other forms: no signal → skipped
+         Rule 6 — Core: selection→contact content only → captured
+         Rule 7 — No manual list: fully automatic → satisfied
+
+         VERIFIED against 36 dropdown URLs — only genuine contact
+         routing pages (bereavement, lost pension etc) produce
+         contact signals and pass all 3 layers.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -1653,11 +1715,65 @@ def map_excel_category_to_content_type(excel_category: str, url: str) -> str:
 # then iterates options via JS event injection — matching the proven
 # standalone crawler.py script (v0.1.0) exactly.
 
-# Dropdown option text that indicates a placeholder (skip these)
+# Dropdown option text that indicates a placeholder (skip these).
+# v4.5.5: expanded to include dashed variants and form defaults
+# that slipped through and produced garbage #state= URLs.
 _DROPDOWN_PLACEHOLDERS = {
     "select...", "select", "please select", "--", "choose...",
-    "choose", "please choose",
+    "choose", "please choose", "-- select an option --",
+    "- select -", "select an option", "select option",
+    "none", "n/a", "0", "all",
 }
+
+# Contact signals that must be present in dropdown diff content
+# for it to be worth indexing. Eliminates filter controls, form
+# inputs, registration routing, and navigation tabs automatically.
+# Any diff that contains at least one signal is a genuine contact
+# routing option (phone number, address, or online form link).
+_CONTACT_SIGNAL_PATTERNS = [
+    # Phone numbers: 0345 646 2101, 0800123456, 1850 201351
+    re.compile(r'0\d{3,4}[\s\-]?\d{3,4}[\s\-]?\d{3,4}'),
+    re.compile(r'1\d{3,4}[\s\-]?\d{3,4}[\s\-]?\d{3,4}'),  # ROI numbers
+]
+_CONTACT_SIGNAL_KEYWORDS = [
+    "call us",
+    "write to us",
+    "lines are open",
+    "excluding bank holidays",
+    "fill in our online form",
+    "tell us someone has died",
+    "fill out our online form",
+    "monday to friday",
+    "8am to",
+    "9am to",
+]
+
+
+def _has_contact_signals(text: str) -> bool:
+    """
+    Check if dropdown diff content contains genuine contact signals.
+
+    v4.5.5 — Layer 2 of bulletproof dropdown filter.
+    Returns True only if the diff contains a phone number, address
+    keyword, or online form link. This eliminates:
+      - Content filter dropdowns (Newest/Oldest, Category/Years)
+      - Form input dropdowns (Mr/Mrs/Ms, language selectors)
+      - Registration routing (pension plan type -> same content)
+      - Navigation tabs (switching between sibling pages)
+
+    Only genuine contact routing options (bereavement policy type
+    -> phone number) contain these signals.
+    """
+    text_lower = text.lower()
+    # Check keyword signals first (fast)
+    for kw in _CONTACT_SIGNAL_KEYWORDS:
+        if kw in text_lower:
+            return True
+    # Check phone number patterns
+    for pattern in _CONTACT_SIGNAL_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
 
 
 def _has_routing_dropdowns_in_html(html: str) -> bool:
@@ -1850,7 +1966,6 @@ def _scrape_dropdown_states_playwright(
 
                         try:
                             # Fire JS input + change events on the select element
-                            # Mirrors crawler.py evaluate() call exactly
                             select_el.evaluate(
                                 """(el, optText) => {
                                     const options = Array.from(el.options);
@@ -1870,12 +1985,61 @@ def _scrape_dropdown_states_playwright(
                                 opt_text,
                             )
 
-                            # Wait 1.5s for DOM to update — same as crawler.py
+                            # Wait 1.5s for DOM to update
                             time.sleep(1.5)
+
+                            # ── Layer 1: Navigation guard ─────────────────
+                            # If JS event caused a page navigation (SPA routing)
+                            # the page.url will differ from our original url.
+                            # Skip this option — content belongs to a different
+                            # page that may or may not be in the approved list.
+                            # Re-navigate back so next option starts clean.
+                            current_url = page.url.split("?")[0].rstrip("/")
+                            original_clean = url.split("?")[0].rstrip("/")
+                            if current_url != original_clean:
+                                log.warning(
+                                    "playwright_option_navigated",
+                                    url=url,
+                                    option=opt_text,
+                                    navigated_to=page.url[:80],
+                                )
+                                try:
+                                    page.goto(
+                                        url,
+                                        wait_until="networkidle",
+                                        timeout=45000,
+                                    )
+                                    # Re-capture default lines after re-navigation
+                                    default_raw_text = page.inner_text("body")
+                                    default_lines = {
+                                        line.strip()
+                                        for line in default_raw_text.split("\n")
+                                        if line.strip()
+                                    }
+                                    # Re-query selects — stale after navigation
+                                    selects = page.query_selector_all("select")
+                                    routing_dropdowns = []
+                                    for sel in selects:
+                                        opts = sel.query_selector_all("option")
+                                        vopts = []
+                                        for o in opts:
+                                            t = o.inner_text().strip()
+                                            v = o.get_attribute("value") or ""
+                                            if t and t.lower() not in _DROPDOWN_PLACEHOLDERS:
+                                                vopts.append({"value": v, "text": t})
+                                        if len(vopts) > 1:
+                                            routing_dropdowns.append({
+                                                "select_element": sel,
+                                                "options": vopts,
+                                            })
+                                    log.info("playwright_re_navigated_after_option", url=url)
+                                except Exception as _nav_e:
+                                    log.warning("playwright_re_navigate_failed", error=str(_nav_e))
+                                continue  # Skip this option regardless
 
                             new_raw_text = page.inner_text("body")
 
-                            # Line-by-line diff — only lines NOT in default state
+                            # ── Layer 2a: Minimum content check ───────────
                             new_lines     = [
                                 line.strip()
                                 for line in new_raw_text.split("\n")
@@ -1895,7 +2059,22 @@ def _scrape_dropdown_states_playwright(
                                 )
                                 continue
 
-                            # Synthetic URL — mirrors crawler.py state_url pattern
+                            # ── Layer 2b: Contact signal validation ───────
+                            # Only index dropdown states that contain genuine
+                            # contact information (phone, address, form link).
+                            # Eliminates: filter controls, form inputs,
+                            # registration routing, navigation tabs.
+                            # No whitelist needed — fully automatic.
+                            if not _has_contact_signals(dynamic_content):
+                                log.info(
+                                    "playwright_option_no_contact_signal",
+                                    url=url,
+                                    option=opt_text,
+                                    chars=len(dynamic_content),
+                                )
+                                continue
+
+                            # ── All 3 layers passed — save this state ─────
                             safe_value = opt_value if opt_value else opt_text
                             state_url  = f"{url}#state={urllib.parse.quote(safe_value)}"
                             content    = dynamic_content.strip()

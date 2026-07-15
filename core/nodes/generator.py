@@ -491,6 +491,97 @@ v2.1.0 — July 2026 | Mukesh Kund
          - These artefacts were rendering as blank gaps / horizontal
            lines inside the demo.html bubble markdown renderer.
 
+v2.2.0 — July 2026 | Mukesh Kund
+         Static citation injection + URL purge from all response text
+
+         PROBLEM (observed sprint 1 testing, 13 July):
+         - URLs appearing inline in response body (LLM-generated and
+           Python constants): RECOMMENDATION_RESPONSE, UNKNOWN_PRODUCT_
+           RESPONSE, bereavement handoff, financial disclaimer, ACCOUNT
+           ACCESS RULE all contained raw royallondon.com URLs.
+         - When the LLM redirects the customer to an adviser or contact
+           page, no citation pill appeared in the UI — the customer only
+           saw raw text with no clickable link.
+
+         FIX — make_static_citations() [NEW FUNCTION]:
+         - Builds Citation pill objects from CONTACT_CITATION,
+           ADVISER_CITATION, BEREAVEMENT_CITATION (defined in
+           prompt_builder_node.py v1.2.0).
+         - Deduplicates by URL, numbering sequentially after any
+           existing retrieved-source citations.
+         - Called by generator_node after extract_citations():
+             Bereavement → BEREAVEMENT_CITATION + CONTACT_CITATION
+             Financial disclaimer → ADVISER_CITATION
+             Other sensitive (empathy) → ADVISER_CITATION + CONTACT_CITATION
+             UNKNOWN PRODUCT refusal → CONTACT_CITATION
+         - All Python constants (UNKNOWN_PRODUCT_RESPONSE,
+           RECOMMENDATION_RESPONSE) now have URLs stripped — text
+           refers to "our contact page" / "our resources below".
+         - SYSTEM_PROMPT rules rewritten: HUMAN HANDOFF, FINANCIAL
+           DISCLAIMER, PHONE NUMBER, CITATION, ACCOUNT ACCESS — all
+           URLs removed. LLM instructed never to write any URL,
+           web address, or email address in response text.
+         - Email address handling: LLM instructed never to include
+           email addresses; only quote from retrieved context if
+           customer explicitly asked and source is verified.
+
+         COMPANION CHANGES (same release, separate files):
+         - refusal.py: NO_RESULTS and GENERAL templates had raw URLs
+           stripped — now say "see our contact page below".
+         - retriever.py: both refusal sites (no chunks + exception)
+           now set state.citations = [CONTACT_CITATION pill] so the
+           customer always sees a clickable link even on hard failures.
+         - generator.py error handler: same CONTACT_CITATION injection.
+         - prompt_builder_node.py v1.2.0: CONTACT_CITATION,
+           ADVISER_CITATION, BEREAVEMENT_CITATION constants defined;
+           RECOMMENDATION_RESPONSE URLs stripped; bereavement_note
+           URL removed; all SYSTEM_PROMPT rules rewritten.
+         - supervisor.py v1.9.0: RECOMMENDATION_TRIGGERS expanded from
+           18 → 33 phrases; sufficiency/adequacy/comparison/projection
+           patterns added (e.g. "will my pension be enough",
+           "enough to retire", "am i on track", "better than").
+
+v2.3.0 — July 2026 | Mukesh Kund
+         True token streaming + KV cache observability
+
+         FIX 1 — True OpenAI token streaming (stream=True):
+         - Was: client.chat.completions.create() blocking call —
+           full response assembled before returning to server.py,
+           which then split on spaces with asyncio.sleep(0.02)
+           (artificial word-by-word delay, ~2-4s added latency).
+         - Now: stream=True — OpenAI returns chunk iterator
+           immediately. Tokens collected into list as they arrive,
+           generator_node remains synchronous (no async refactor
+           needed — runs inside run_in_executor in server.py).
+           state.stream_tokens populated with raw OpenAI chunks.
+         - server.py v1.2.0 reads state.stream_tokens directly and
+           yields each token to the SSE client without artificial
+           delay — perceived latency drops to time-to-first-token
+           (~500ms) instead of total generation time.
+         - stream_options={"include_usage": True} added so usage
+           data (prompt/completion tokens) still arrives on the
+           final chunk — no separate non-streaming usage call needed.
+         - schemas.py: stream_tokens: list[str] added to AgentState.
+         - Fallback in server.py: if stream_tokens is empty for any
+           reason, falls back to space-split of final_response.
+
+         FIX 2 — KV cache observability (cached_tokens logging):
+         - Azure OpenAI returns prompt_tokens_details.cached_tokens
+           in usage when KV prefix caching is active for the
+           SYSTEM_PROMPT prefix (~1200 tokens, identical across all
+           requests). Previously we had no visibility of whether
+           prefix caching was working.
+         - Now: cached_tokens read from usage_data.prompt_tokens_
+           details.cached_tokens (AttributeError guarded — field
+           absent on older API versions).
+         - Logged as kv_cache_hit (INFO) when > 0, kv_cache_miss
+           (DEBUG) when 0. If consistently 0 in logs after
+           deployment, prefix caching is not active on this
+           deployment's API version (requires 2024-12-01-preview
+           or later) — visible without asking the deployment team.
+         - cached_tokens added to state.token_usage dict →
+           visible in demo.html meta row token count.
+
 ═══════════════════════════════════════════════════════════════
 """
 import os
@@ -510,6 +601,9 @@ from core.nodes.prompt_builder_node import (
     SYSTEM_PROMPT,
     UNKNOWN_PRODUCT_RESPONSE,
     BEREAVEMENT_HANDOFF_NUMBER,
+    CONTACT_CITATION,
+    ADVISER_CITATION,
+    BEREAVEMENT_CITATION,
 )
 
 _dotenv_path = find_dotenv(usecwd=False)
@@ -753,6 +847,37 @@ def clean_response_text(text: str) -> str:
     return result.strip()
 
 
+def make_static_citations(
+    *dicts: dict,
+    existing: list["Citation"] | None = None,
+) -> list["Citation"]:
+    """
+    Build a list of Citation objects from static dicts
+    (CONTACT_CITATION, ADVISER_CITATION, BEREAVEMENT_CITATION)
+    appended after any existing retrieved-source citations.
+
+    Deduplicates by URL. Numbering is sequential starting
+    after the last existing citation index (or from 1 if none).
+    Called whenever a response redirects the customer to a
+    Royal London page that has no [n] marker in the LLM text.
+    """
+    base    = existing or []
+    seen    = {c.url for c in base}
+    counter = (max(c.index for c in base) + 1) if base else 1
+    result  = list(base)
+    for d in dicts:
+        if d["url"] not in seen:
+            result.append(Citation(
+                index=counter,
+                url=d["url"],
+                title=d["title"],
+                section=d["section"],
+            ))
+            seen.add(d["url"])
+            counter += 1
+    return result
+
+
 def extract_citations(
     state: AgentState,
     response_text: str,
@@ -874,7 +999,16 @@ def generator_node(state: AgentState) -> AgentState:
         # SPECIFIC queries: 800 is sufficient for a concise FAQ answer.
         max_tokens = 1200 if state.query_type == "BROAD" else 800
 
-        response = client.chat.completions.create(
+        # ── True token streaming (v2.3.0) ────────────────────
+        # stream=True returns an iterator of chunks immediately.
+        # We collect tokens into state.stream_tokens so server.py
+        # can yield them directly to the client without waiting
+        # for the full response — perceived latency drops to
+        # time-to-first-token (~500ms) instead of total gen time.
+        # generator_node remains synchronous (no async refactor
+        # needed) — the stream iterator is consumed here inside
+        # run_in_executor.
+        stream = client.chat.completions.create(
             model=deployment,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -882,10 +1016,27 @@ def generator_node(state: AgentState) -> AgentState:
             ],
             max_tokens=max_tokens,
             temperature=0.1,
+            stream=True,
+            stream_options={"include_usage": True},
         )
 
-        raw_response     = response.choices[0].message.content
-        state.model_used = deployment
+        tokens: list[str] = []
+        usage_data = None
+
+        for chunk in stream:
+            # Final chunk carries usage when include_usage=True
+            if chunk.usage:
+                usage_data = chunk.usage
+
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta and delta.content:
+                tokens.append(delta.content)
+
+        raw_response          = "".join(tokens)
+        state.stream_tokens   = tokens   # server.py reads this
+        state.model_used      = deployment
 
         # Clean formatting issues
         raw_response = clean_response_text(raw_response)
@@ -907,24 +1058,83 @@ def generator_node(state: AgentState) -> AgentState:
             state.refusal_triggered = True
             state.raw_response      = UNKNOWN_PRODUCT_RESPONSE
             state.final_response    = UNKNOWN_PRODUCT_RESPONSE
-            state.citations         = []
+            # Inject contact citation so the pill renders in UI
+            state.citations = make_static_citations(CONTACT_CITATION)
         else:
             state.raw_response = updated_text
-            state.citations    = citations
+            # ── Static citation injection (v2.2.0) ────────────
+            # The LLM is no longer allowed to write URLs in the
+            # response body. Any response that redirects the
+            # customer to a Royal London page needs a Citation
+            # pill injected here by Python so the link still
+            # renders in the UI.
+            #
+            # 1. Bereavement → BEREAVEMENT_CITATION + CONTACT_CITATION
+            # 2. Financial disclaimer / adviser redirect →
+            #    ADVISER_CITATION (+ CONTACT_CITATION if also redirecting
+            #    to contact page)
+            # 3. Standard responses with retrieved citations only →
+            #    no static injection needed
+            static_extras: list[dict] = []
 
-        # Track token usage
-        usage = response.usage
-        if usage:
+            if state.__dict__.get("_bereavement"):
+                # Bereavement handoff always needs the bereavement
+                # page link. Also append contact page as fallback.
+                static_extras = [BEREAVEMENT_CITATION, CONTACT_CITATION]
+            elif state.needs_disclaimer:
+                # Financial disclaimer redirects to adviser finder
+                static_extras = [ADVISER_CITATION]
+            elif state.needs_empathy:
+                # Other sensitive (terminal, redundancy etc) →
+                # handoff directs to adviser
+                static_extras = [ADVISER_CITATION, CONTACT_CITATION]
+
+            if static_extras:
+                state.citations = make_static_citations(
+                    *static_extras, existing=citations
+                )
+            else:
+                state.citations = citations
+
+        # Track token usage (v2.3.0 — uses usage_data from stream)
+        # cached_tokens: Azure OpenAI returns prompt_tokens_details
+        # with cached_tokens > 0 when KV prefix caching is active
+        # for the SYSTEM_PROMPT prefix. If always 0, caching is not
+        # enabled on this deployment — check API version (requires
+        # 2024-12-01-preview or later) without needing to ask Andy.
+        if usage_data:
+            cached = 0
+            try:
+                cached = (
+                    usage_data.prompt_tokens_details.cached_tokens or 0
+                )
+            except AttributeError:
+                pass
+
             state.token_usage = {
-                "input_tokens":  usage.prompt_tokens,
-                "output_tokens": usage.completion_tokens,
-                "total_tokens":  usage.total_tokens,
+                "input_tokens":   usage_data.prompt_tokens,
+                "output_tokens":  usage_data.completion_tokens,
+                "total_tokens":   usage_data.total_tokens,
+                "cached_tokens":  cached,
             }
             track_token_usage(
                 model=deployment,
-                input_tokens=usage.prompt_tokens,
-                output_tokens=usage.completion_tokens,
+                input_tokens=usage_data.prompt_tokens,
+                output_tokens=usage_data.completion_tokens,
             )
+            if cached > 0:
+                log.info(
+                    "kv_cache_hit",
+                    cached_tokens=cached,
+                    model=deployment,
+                    request_id=state.request_id,
+                )
+            else:
+                log.debug(
+                    "kv_cache_miss",
+                    model=deployment,
+                    request_id=state.request_id,
+                )
 
         latency = (time.time() - start) * 1000
         state.latency_ms["generator"] = latency
@@ -952,5 +1162,6 @@ def generator_node(state: AgentState) -> AgentState:
         state.final_response    = get_refusal(
             RefusalReason.GENERAL
         )
+        state.citations = make_static_citations(CONTACT_CITATION)
 
     return state

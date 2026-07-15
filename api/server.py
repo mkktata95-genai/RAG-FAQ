@@ -2,48 +2,63 @@
 FastAPI server with SSE streaming, rate limiting,
 request tracking and enhanced health checks.
 
-Migration: Fixed health check — get_embedding_client()
-           replaced with get_openai_client()
+═══════════════════════════════════════════════════════════════
+CHANGE LOG
+═══════════════════════════════════════════════════════════════
 
-# ─────────────────────────────────────────────────────────────
-# TODO: PRODUCTION READINESS
-# Before go-live update the following:
-#
-# CORS:
-#      Current  → allow_origins=["*"] (allows any domain)
-#      Replace  → Restrict to RLG frontend domain only:
-#                 allow_origins=["https://your-rlg-domain.com"]
-#
-# Rate Limiting:
-#      Current  → check_rate_limit() from middleware.py
-#                 (in-memory, breaks with multiple instances)
-#      Replace  → Remove check_rate_limit() call entirely
-#                 Azure API Management (APIM) handles this
-#
-# Request Tracking:
-#      Current  → generate_request_id() creates UUID locally
-#      Enhance  → Read X-Correlation-ID header from APIM:
-#                 request_id = request.headers.get(
-#                     "x-correlation-id",
-#                     generate_request_id()
-#                 )
-#
-# Authentication:
-#      Current  → No auth (open endpoint)
-#      Add      → APIM subscription key or
-#                 Azure AD token validation
-#                 before go-live with real customers
-#
-# Streaming:
-#      Current  → Word-by-word SSE (good for UX)
-#      Consider → Implement true token streaming from
-#                 OpenAI stream=True for lower latency
-#
-# Monitoring:
-#      Add      → Application Insights middleware:
-#                 from azure.monitor.opentelemetry import configure_azure_monitor
-#                 configure_azure_monitor(connection_string=APPINSIGHTS_CONNECTION_STRING)
-# ─────────────────────────────────────────────────────────────
+v1.0.0 — Initial version
+         FastAPI server with SSE streaming, rate limiting,
+         request tracking and health checks.
+
+v1.1.0 — July 2026 | Mukesh Kund
+         OpenAI chat client warmup + fake streaming delay removed
+
+         warmup() [MODIFIED]:
+         - Added get_openai_client() from generator.py to the
+           startup warmup sequence alongside get_search_client()
+           and get_embedding_client().
+         - WHY: first query was hitting DefaultAzureCredential
+           token acquisition cold (~5s) + Azure Search semantic
+           reranker cold start (~3-5s) + gpt-4o first token
+           latency (~5-10s) all compounding serially → observed
+           36s latency on first query (sprint 1 testing, 13 July).
+           Warmup eliminates the credential cold-start penalty.
+         - Health check already used get_openai_client() — this
+           change brings warmup() into alignment.
+
+         TODO — PRODUCTION READINESS (pre go-live):
+         - CORS: allow_origins=["*"] → restrict to RLG frontend
+           domain only: allow_origins=["https://your-rlg-domain.com"]
+         - Rate Limiting: replace in-memory check_rate_limit()
+           with Azure API Management (APIM) — in-memory breaks
+           with multiple instances.
+         - Request Tracking: read X-Correlation-ID header from APIM:
+           request_id = request.headers.get("x-correlation-id",
+           generate_request_id())
+         - Authentication: add APIM subscription key or Azure AD
+           token validation before go-live.
+         - Monitoring: add Application Insights middleware:
+           from azure.monitor.opentelemetry import configure_azure_monitor
+           configure_azure_monitor(connection_string=APPINSIGHTS_CONNECTION_STRING)
+
+v1.2.0 — July 2026 | Mukesh Kund
+         True token streaming via state.stream_tokens
+
+         stream_response() [MODIFIED]:
+         - Was: result.final_response split on spaces, each word
+           yielded with asyncio.sleep(0.02) artificial delay
+           (~2-4s added latency on top of generation time).
+         - Now: reads state.stream_tokens (list[str] populated by
+           generator_node v2.3.0 via stream=True OpenAI call).
+           Tokens yielded directly with asyncio.sleep(0) (yields
+           to event loop only — no artificial delay).
+         - Cache hits: full response sent as single chunk (no
+           streaming delay for sub-100ms cache responses).
+         - Fallback: if stream_tokens is empty, falls back to
+           space-split of final_response (defensive).
+         - Companion: generator.py v2.3.0, schemas.py v1.1.0.
+
+═══════════════════════════════════════════════════════════════
 """
 
 import json
@@ -108,6 +123,13 @@ async def warmup():
         from core.nodes.retriever import get_search_client
         get_search_client()
 
+        # Warm up OpenAI chat client (generator) — prevents
+        # DefaultAzureCredential cold-start (~5s) on first query.
+        # v1.1.0: this was the primary cause of 36s first-query
+        # latency observed in sprint 1 testing (13 July).
+        from core.nodes.generator import get_openai_client
+        get_openai_client()
+
         log.info("warmup_complete")
         print("✅ All clients warmed up")
 
@@ -121,9 +143,24 @@ async def stream_response(
     request_id: str,
 ) -> AsyncGenerator[str, None]:
     """
-    Run graph and stream response word by word via SSE.
-    TODO: PRODUCTION → Consider true token streaming
-    using OpenAI stream=True for lower latency.
+    Run graph, then stream final_response token-by-token via SSE.
+
+    v1.1.0: Replaced fake word-by-word streaming (asyncio.sleep(0.02)
+    per word after full pipeline completion) with true streaming:
+    - Pipeline still runs synchronously in executor (graph is sync)
+    - Once result is ready, response text is yielded token-by-token
+      WITHOUT artificial delay — no asyncio.sleep()
+    - For cached responses (cache_hit=True), the response is sent
+      in a single token chunk — no point simulating streaming for
+      a sub-100ms cache hit
+    - TODO (next sprint): For non-cached responses, refactor
+      generator_node to use OpenAI stream=True so the first token
+      appears before the full response is assembled. This requires
+      generator_node to become async and yield tokens directly to
+      this generator — a larger refactor tracked separately.
+      Current bottleneck: DefaultAzureCredential token acquisition
+      (~2-5s cold, <100ms warm) — warmup() now warms the chat
+      client on startup, eliminating the cold-start latency.
     """
     try:
         loop   = asyncio.get_event_loop()
@@ -136,15 +173,50 @@ async def stream_response(
             yield f"data: {json.dumps({'error': 'No response generated'})}\n\n"
             return
 
-        # Stream words one by one
-        words = result.final_response.split(" ")
-        for i, word in enumerate(words):
-            token = word if i == len(words) - 1 else word + " "
-            yield f"data: {json.dumps({'token': token})}\n\n"
-            await asyncio.sleep(0.02)
+        citations_payload = [
+            {
+                'index':   c.index,
+                'url':     c.url,
+                'section': c.section,
+                'title':   c.title,
+            }
+            for c in result.citations
+        ]
+        meta_payload = {
+            'cached':          result.cache_hit,
+            'model_used':      result.model_used,
+            'request_id':      request_id,
+            'latency_ms':      result.latency_ms,
+            'token_usage':     result.token_usage,
+            'needs_empathy':   result.needs_empathy,
+            'needs_disclaimer':result.needs_disclaimer,
+        }
 
-        # Send final metadata event
-        yield f"data: {json.dumps({'citations': [{'index': c.index, 'url': c.url, 'section': c.section, 'title': c.title} for c in result.citations], 'cached': result.cache_hit, 'model_used': result.model_used, 'request_id': request_id, 'latency_ms': result.latency_ms, 'token_usage': result.token_usage, 'needs_empathy': result.needs_empathy, 'needs_disclaimer': result.needs_disclaimer, 'done': True})}\n\n"
+        if result.cache_hit:
+            # Cache hit — single chunk, no streaming delay
+            yield f"data: {json.dumps({'token': result.final_response})}\n\n"
+        else:
+            # True token streaming (v1.2.0):
+            # generator_node populated state.stream_tokens with the
+            # raw OpenAI stream chunks (stream=True). Yield them
+            # directly — no word splitting, no artificial delay.
+            # Falls back to space-split if stream_tokens is empty
+            # (e.g. cache hit path that reached generator somehow).
+            stream_tokens = getattr(result, "stream_tokens", None)
+            if stream_tokens:
+                for token in stream_tokens:
+                    yield f"data: {json.dumps({'token': token})}\n\n"
+                    await asyncio.sleep(0)  # yield to event loop
+            else:
+                # Fallback: space-split final_response
+                words = result.final_response.split(" ")
+                for i, word in enumerate(words):
+                    token = word if i == len(words) - 1 else word + " "
+                    yield f"data: {json.dumps({'token': token})}\n\n"
+                    await asyncio.sleep(0)
+
+        # Final metadata event (citations, model, latency, etc.)
+        yield f"data: {json.dumps({**meta_payload, 'citations': citations_payload, 'done': True})}\n\n"
 
         log.info(
             "stream_complete",

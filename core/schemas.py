@@ -65,6 +65,25 @@ v1.2.0 — July 2026 | Mukesh Kund
            checks for built_prompt before using it and falls
            back to a minimal prompt if not set (defensive).
 
+v1.3.0 — July 2026 | Mukesh Kund
+         stream_tokens field added to AgentState
+
+         stream_tokens: list[str] = []
+         - Set by generator_node v2.3.0 when stream=True OpenAI
+           call is used. Contains the raw token strings from the
+           OpenAI chunk iterator in order of arrival.
+         - Read by server.py v1.2.0 stream_response() to yield
+           tokens directly to the SSE client — avoids word-
+           splitting final_response on spaces (which lost OpenAI
+           token boundary information and added ~2-4s artificial
+           delay via asyncio.sleep(0.02)).
+         - Empty list default: safe — server.py falls back to
+           space-split of final_response if list is empty.
+         - Not persisted to cache — cache stores final_response
+           (assembled string) only. On cache hit, stream_tokens
+           stays [] and server.py sends final_response as single
+           chunk (no streaming delay for cached responses).
+
 ═══════════════════════════════════════════════════════════════
 """
 import re
@@ -124,6 +143,9 @@ class AgentState(BaseModel):
     # Final output
     citations: list[Citation] = Field(default_factory=list)
     final_response: str | None = None
+    # Streaming tokens (v2.3.0 — populated by generator_node
+    # when stream=True; consumed by server.py stream_response)
+    stream_tokens: list[str] = Field(default_factory=list)
     # Flags
     needs_empathy: bool = False
     needs_disclaimer: bool = False

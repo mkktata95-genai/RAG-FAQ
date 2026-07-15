@@ -337,6 +337,28 @@ v1.2.4 — July 2026 | Mukesh Kund
          Both applied in __main__ on win32 only.
          Complete no-op on Linux / Azure Container Apps.
 
+v1.2.5 — July 2026 | Mukesh Kund
+         Bulletproof dropdown scraping — aligned with scraper v4.5.5.
+
+         Same 3-layer filter applied to _scrape_dropdown_states_playwright()
+         in the delta indexing path (content freshness nightly job):
+
+         Layer 1 — Navigation guard: page.url check after JS event.
+           If page navigated — re-navigate back and skip option.
+         Layer 2a — Minimum content check: <20 chars → skip.
+         Layer 2b — Contact signal validation: diff must contain
+           phone number, address keyword, or online form link.
+           Eliminates filter controls, form inputs, registration
+           routing, and navigation tabs automatically.
+         Layer 3 — Placeholder expansion: added dashed variants.
+
+         _has_contact_signals() + _CONTACT_SIGNAL_PATTERNS +
+         _CONTACT_SIGNAL_KEYWORDS constants added (mirrors scraper).
+         _DROPDOWN_PLACEHOLDERS expanded with dashed variants.
+
+         Ensures freshness delta re-indexing produces identical
+         dropdown state filtering as the full index run.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -1327,11 +1349,33 @@ def invalidate_cache_for_urls(urls: list[str], dry_run: bool = False) -> int:
 # ══════════════════════════════════════════════════════════════
 
 # Dropdown placeholder option text — skip these during detection.
-# Mirrors _DROPDOWN_PLACEHOLDERS in scrape_approved_urls_updatedV4.py.
+# Mirrors _DROPDOWN_PLACEHOLDERS in scrape_approved_urls_updatedV4.py v4.5.5.
+# v1.2.5: expanded to include dashed variants and form defaults.
 _DROPDOWN_PLACEHOLDERS = {
     "select...", "select", "please select", "--", "choose...",
-    "choose", "please choose",
+    "choose", "please choose", "-- select an option --",
+    "- select -", "select an option", "select option",
+    "none", "n/a", "0", "all",
 }
+
+# Contact signal patterns for Layer 2b filtering.
+# Mirrors _CONTACT_SIGNAL_PATTERNS in scrape_approved_urls_updatedV4.py v4.5.5.
+_CONTACT_SIGNAL_PATTERNS = [
+    re.compile(r'0\d{3,4}[\s\-]?\d{3,4}[\s\-]?\d{3,4}'),
+    re.compile(r'1\d{3,4}[\s\-]?\d{3,4}[\s\-]?\d{3,4}'),
+]
+_CONTACT_SIGNAL_KEYWORDS = [
+    "call us",
+    "write to us",
+    "lines are open",
+    "excluding bank holidays",
+    "fill in our online form",
+    "tell us someone has died",
+    "fill out our online form",
+    "monday to friday",
+    "8am to",
+    "9am to",
+]
 
 
 def _has_routing_dropdowns_in_html(html: str) -> bool:
@@ -1361,6 +1405,21 @@ def _has_routing_dropdowns_in_html(html: str) -> bool:
     except Exception as e:
         log.warning("dropdown_html_check_failed", error=str(e))
         return False
+
+
+def _has_contact_signals(text: str) -> bool:
+    """
+    Check if dropdown diff content contains genuine contact signals.
+    Layer 2b of bulletproof dropdown filter — mirrors scraper v4.5.5.
+    """
+    text_lower = text.lower()
+    for kw in _CONTACT_SIGNAL_KEYWORDS:
+        if kw in text_lower:
+            return True
+    for pattern in _CONTACT_SIGNAL_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
 
 
 def _scrape_dropdown_states_playwright(
@@ -1500,6 +1559,7 @@ def _scrape_dropdown_states_playwright(
                             ]
                             dynamic_content = "\n".join(changed_lines)
 
+                            # Layer 2a: minimum content check
                             if not dynamic_content or len(dynamic_content.strip()) < 20:
                                 log.warning(
                                     "playwright_option_no_change",
@@ -1508,6 +1568,39 @@ def _scrape_dropdown_states_playwright(
                                 )
                                 continue
 
+                            # Layer 1: navigation guard
+                            current_url  = page.url.split("?")[0].rstrip("/")
+                            original_clean = url.split("?")[0].rstrip("/")
+                            if current_url != original_clean:
+                                log.warning(
+                                    "playwright_option_navigated",
+                                    url=url,
+                                    option=opt_text,
+                                    navigated_to=page.url[:80],
+                                )
+                                try:
+                                    page.goto(url, wait_until="networkidle", timeout=45000)
+                                    default_raw_text = page.inner_text("body")
+                                    default_lines = {
+                                        line.strip()
+                                        for line in default_raw_text.split("\n")
+                                        if line.strip()
+                                    }
+                                except Exception as _nav_e:
+                                    log.warning("playwright_re_navigate_failed", error=str(_nav_e))
+                                continue
+
+                            # Layer 2b: contact signal validation
+                            if not _has_contact_signals(dynamic_content):
+                                log.info(
+                                    "playwright_option_no_contact_signal",
+                                    url=url,
+                                    option=opt_text,
+                                    chars=len(dynamic_content),
+                                )
+                                continue
+
+                            # All layers passed — save this state
                             safe_value = opt_value if opt_value else opt_text
                             state_url  = f"{url}#state={urllib.parse.quote(safe_value)}"
                             content    = dynamic_content.strip()
