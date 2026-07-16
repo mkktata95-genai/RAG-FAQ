@@ -124,7 +124,7 @@ v1.3.0 — July 2026 | Mukesh Kund
 
          scoring_profile added to search call:
          - Passes "rl-retrieval-profile" (created in
-           chunk_and_index_hqaV3.py at index build time) only
+           chunk_and_index_hqaV4.py at index build time) only
            when state.query_type == "BROAD". Specific queries
            use Azure's default scoring — the title_questions
            boost would distort specific-query results.
@@ -132,6 +132,22 @@ v1.3.0 — July 2026 | Mukesh Kund
          dotenv fix:
          - was: load_dotenv() — no args, no override
          - now: load_dotenv(find_dotenv(usecwd=False), override=True)
+
+v1.4.0 — July 2026 | Mukesh Kund
+         V3_SELECT renamed to V4_SELECT. All stale v3 references
+         updated to v4. Comments corrected to reflect that the
+         retriever now queries rlg-faq-index-v4 exclusively.
+
+         RENAMED:
+           V3_SELECT → V4_SELECT (variable name in retriever_node)
+           "v3+" → "v4+" in all inline comments
+           "v2 and v3" → "v2, v3, or v4" in fallback comment
+           scoring_profile comment: "v3+" → "v4+"
+           fallback error comment: "v3+ indexes" → "v4 indexes"
+           error note string: "v3+ indexes" → "v4 indexes"
+           changelog v1.3.0 scoring_profile reference updated
+
+         NO logic changes — retrieval behaviour identical.
 
 ═══════════════════════════════════════════════════════════════
 """
@@ -341,19 +357,20 @@ def retriever_node(state: AgentState) -> AgentState:
         query_type   = state.query_type or "SPECIFIC"
 
         # ── Select fields ─────────────────────────────────────
-        # BASE_SELECT works on v2 and v3 indexes.
-        # V3_SELECT adds title_questions (v3+ only).
-        # The except block falls back to BASE_SELECT if v3
-        # fields cause an InvalidRequestParameter error.
+        # BASE_SELECT: core fields present on all index versions.
+        # V4_SELECT: adds title_questions (v4 indexes only).
+        # The except block falls back to BASE_SELECT if v4
+        # fields cause an InvalidRequestParameter error
+        # (e.g. when querying an older index during migration).
         BASE_SELECT = [
             "chunk_id", "content", "source_url", "section", "title",
         ]
-        V3_SELECT = BASE_SELECT + ["title_questions"]
+        V4_SELECT = BASE_SELECT + ["title_questions"]
 
         search_kwargs = dict(
             search_text=state.query,
             vector_queries=[vector_query],
-            select=V3_SELECT,
+            select=V4_SELECT,
             top=TOP_K * 3,
         )
         if use_semantic:
@@ -361,7 +378,7 @@ def retriever_node(state: AgentState) -> AgentState:
             search_kwargs["semantic_configuration_name"] = SEMANTIC_CONFIG
 
         # v1.3.0: scoring profile for BROAD queries only.
-        # rl-retrieval-profile boosts title_questions on v3+.
+        # rl-retrieval-profile boosts title_questions on v4+.
         if query_type == "BROAD" and SEMANTIC_CONFIG:
             search_kwargs["scoring_profile"] = "rl-retrieval-profile"
             log.info(
@@ -379,11 +396,12 @@ def retriever_node(state: AgentState) -> AgentState:
             search_kwargs["query_answer_count"]     = 3
             search_kwargs["query_answer_threshold"] = 0.7
 
-        # ── Execute search with v3 feature fallback ───────────
+        # ── Execute search with v4 feature fallback ───────────
         # title_questions field and rl-retrieval-profile only
-        # exist on v3+ indexes. On v2, remove both and retry once.
-        # Both are removed in the same catch to avoid a second fail.
-        # ── Execute search with v3 feature fallback ───────────
+        # exist on v4 indexes. On older indexes, remove both
+        # and retry once. Both removed in same catch to avoid
+        # a second failure.
+        # ── Execute search with v4 feature fallback ───────────
         # get_answers() MUST be called on the SearchItemPaged object
         # BEFORE converting to list() — the Azure SDK iterator is
         # exhausted by list() and answers are no longer accessible
@@ -417,13 +435,13 @@ def retriever_node(state: AgentState) -> AgentState:
                 search_kwargs["select"] = BASE_SELECT
                 search_kwargs.pop("scoring_profile", None)
                 log.warning(
-                    "v3_features_not_available",
+                    "v4_features_not_available",
                     index=INDEX_NAME,
                     error=err[:120],
                     note=(
                         "title_questions and rl-retrieval-profile "
-                        "only exist on v3+ indexes. Removed both — "
-                        "retrying with v2-compatible select and default scoring."
+                        "only exist on v4 indexes. Removed both — "
+                        "retrying with base select and default scoring."
                     ),
                 )
                 results, raw_answers = _execute_search(search_kwargs)

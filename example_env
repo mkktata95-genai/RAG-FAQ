@@ -1,0 +1,183 @@
+# ═══════════════════════════════════════════════════════════════
+# ARIA — Environment Variables
+# Royal London Group — RAG Chatbot
+# ═══════════════════════════════════════════════════════════════
+#
+# USAGE:
+#   Copy this file to .env and fill in real values.
+#   .env is gitignored — never commit real credentials.
+#
+# TIERS:
+#   Local (.env)      — dev/VDI use. Fill in values below.
+#   Production        — all secrets live in Azure Key Vault.
+#                       Key Vault secret names shown in comments.
+#                       DO NOT duplicate Key Vault secrets in .env
+#                       when running in Container Apps.
+#
+# KEY VAULT SECRET NAMING:
+#   Azure Key Vault uses hyphens, not underscores.
+#   AZURE_SEARCH_ENDPOINT (env) → AZURE-SEARCH-ENDPOINT (Key Vault)
+# ═══════════════════════════════════════════════════════════════
+
+
+# ── Azure AI Search ───────────────────────────────────────────
+# Key Vault: AZURE-SEARCH-ENDPOINT
+AZURE_SEARCH_ENDPOINT=https://<your-search-service>.search.windows.net
+
+# Main index — full HQA + title_questions
+# Key Vault: AZURE-SEARCH-INDEX-NAME
+AZURE_SEARCH_INDEX_NAME=rlg-faq-index-v4
+
+# Baseline index — no HQA (A/B comparison)
+# Key Vault: AZURE-SEARCH-BASELINE-INDEX-NAME
+AZURE_SEARCH_BASELINE_INDEX_NAME=rlg-faq-index-v4-baseline
+
+# Semantic ranker config name (set in Azure Portal)
+# Key Vault: AZURE-SEARCH-SEMANTIC-CONFIG
+AZURE_SEARCH_SEMANTIC_CONFIG=rlg-semantic-config
+
+
+# ── Azure OpenAI ──────────────────────────────────────────────
+# Key Vault: AZURE-OPENAI-ENDPOINT
+AZURE_OPENAI_ENDPOINT=https://<your-openai-service>.openai.azure.com
+
+# Embedding model — text-embedding-3-large
+# Key Vault: AZURE-OPENAI-EMBEDDING-DEPLOYMENT
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-large
+
+# Embedding dimensions — 1536 for domain-specific accuracy
+# Key Vault: AZURE-OPENAI-EMBEDDING-DIMENSIONS
+AZURE_OPENAI_EMBEDDING_DIMENSIONS=1536
+
+# HQA generation model (gpt-4o-mini — fast, cost-effective)
+# Used by chunk_and_index_hqaV4.py and content_freshness.py
+# Key Vault: AZURE-OPENAI-DEPLOYMENT-HQA
+AZURE_OPENAI_DEPLOYMENT_HQA=gpt-4o-mini
+
+# Fast response model (gpt-4o — for BROAD queries + general chat)
+# Used by generator.py
+# Key Vault: AZURE-OPENAI-DEPLOYMENT-FAST
+AZURE_OPENAI_DEPLOYMENT_FAST=gpt-4o
+
+
+# ── Azure Blob Storage ────────────────────────────────────────
+# Key Vault: AZURE-STORAGE-CONNECTION
+AZURE_STORAGE_CONNECTION=DefaultEndpointsProtocol=https;AccountName=<account>;AccountKey=<key>;EndpointSuffix=core.windows.net
+
+# Blob container name
+# Key Vault: BLOB-CONTAINER-NAME
+BLOB_CONTAINER_NAME=scraper-data
+
+# Blob path for scraped JSON (written by scraper, read by indexer)
+# Key Vault: BLOB-SCRAPED-FILENAME
+BLOB_SCRAPED_FILENAME=royal_london_faq_latest.json
+
+# Blob path for approved URLs Excel (source of truth)
+# Key Vault: BLOB-APPROVED-EXCEL-NAME
+BLOB_APPROVED_EXCEL_NAME=approved-urls/Approved_URLs.xlsx
+
+# Blob path for content hash state (written after each freshness apply run)
+# Key Vault: BLOB-HASH-STATE-NAME
+BLOB_HASH_STATE_NAME=freshness/content_hashes.json
+
+# Blob prefix for freshness Excel reports
+# Key Vault: BLOB-REPORT-PREFIX
+BLOB_REPORT_PREFIX=freshness/reports/
+
+# Blob prefix for run manifests (one JSON per nightly run)
+# Key Vault: BLOB-MANIFEST-PREFIX
+BLOB_MANIFEST_PREFIX=freshness/manifests/
+
+# Blob prefix for deleted chunk archives (audit trail + rollback)
+# Key Vault: BLOB-ARCHIVE-PREFIX
+BLOB_ARCHIVE_PREFIX=freshness/archive/
+
+
+# ── Redis ─────────────────────────────────────────────────────
+# Local: redis://localhost:6379
+# Production (Azure Cache for Redis TLS): rediss://<host>:6380
+# Key Vault: REDIS-URL
+REDIS_URL=redis://localhost:6379
+
+
+# ── Chunking ──────────────────────────────────────────────────
+# WARNING: changing CHUNK_SIZE or CHUNK_OVERLAP requires --full
+# reindex of chunk_and_index_hqaV4.py. Must match in BOTH
+# chunk_and_index_hqaV4.py and content_freshness.py.
+# Key Vault: CHUNK-SIZE
+CHUNK_SIZE=1600
+# Key Vault: CHUNK-OVERLAP
+CHUNK_OVERLAP=200
+
+
+# ── Embedding batch ───────────────────────────────────────────
+# 50 safe for S0 tier. Increase to 100 for S1+.
+# Key Vault: EMBEDDING-BATCH-SIZE
+EMBEDDING_BATCH_SIZE=50
+
+
+# ── HQA tuning ────────────────────────────────────────────────
+# Must match in chunk_and_index_hqaV4.py and content_freshness.py.
+# Key Vault: HQA-QUESTIONS-FIRST-CHUNK
+HQA_QUESTIONS_FIRST_CHUNK=8
+# Key Vault: HQA-QUESTIONS-OTHER-CHUNKS
+HQA_QUESTIONS_OTHER_CHUNKS=5
+# Key Vault: TITLE-QUESTIONS-COUNT
+TITLE_QUESTIONS_COUNT=3
+# Key Vault: TITLE-QUESTIONS-MAX-WORDS
+TITLE_QUESTIONS_MAX_WORDS=12
+
+
+# ── Deduplication ─────────────────────────────────────────────
+# Max chunks a question may appear in before dedup removes it.
+# Key Vault: MAX-COLLISION-THRESHOLD
+MAX_COLLISION_THRESHOLD=3
+
+
+# ── Retrieval tuning ──────────────────────────────────────────
+# Number of chunks retrieved per query.
+# Key Vault: MAX-RETRIEVED-CHUNKS
+MAX_RETRIEVED_CHUNKS=5
+
+# Minimum relevance score — hybrid search (0.0–1.0 scale).
+# Key Vault: MIN-RELEVANCE-SCORE
+MIN_RELEVANCE_SCORE=0.01
+
+# Minimum semantic reranker score (0.0–4.0 scale).
+# Key Vault: SEMANTIC-MIN-SCORE
+SEMANTIC_MIN_SCORE=0.5
+
+
+# ── Versioning ────────────────────────────────────────────────
+# PIPELINE_VERSION: read by content_freshness.py to stamp delta
+# chunks consistently with full-index chunks.
+# Must match PIPELINE_VERSION constant in chunk_and_index_hqaV4.py.
+# Key Vault: PIPELINE-VERSION
+PIPELINE_VERSION=1.0.0
+
+# SCRAPER_VERSION / METADATA_VERSION / FRESHNESS_JOB_VERSION
+# are NOT env vars — they are hardcoded constants in each script.
+# Bump them directly in the source when logic changes.
+
+
+# ── Freshness job ─────────────────────────────────────────────
+# Default mode for content_freshness.py.
+# "report" = scan only, no writes (safe default for local runs).
+# "apply"  = execute all index + cache changes (nightly job).
+# Key Vault: FRESHNESS-MODE
+FRESHNESS_MODE=report
+
+
+# ── Content Safety (Azure) ────────────────────────────────────
+# Key Vault: AZURE-CONTENT-SAFETY-ENDPOINT
+AZURE_CONTENT_SAFETY_ENDPOINT=https://<your-content-safety>.cognitiveservices.azure.com
+# Key Vault: AZURE-CONTENT-SAFETY-KEY
+AZURE_CONTENT_SAFETY_KEY=<your-content-safety-key>
+
+
+# ── VDI only — DO NOT add to Key Vault ───────────────────────
+# CDP mode: launches system Chrome for Playwright on VDI where
+# ms-playwright chromium download is blocked by SSL restrictions.
+# Leave unset in production — CDP auto-skipped on Linux containers.
+PLAYWRIGHT_EXECUTABLE_PATH=C:\Program Files\Google\Chrome\Application\chrome.exe
+PLAYWRIGHT_CDP_PORT=9222

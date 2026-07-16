@@ -25,7 +25,8 @@ Output fields per page:
   url, title, section, audience, content, scraped_at,
   content_length, content_hash, has_video, content_type,
   product_category, description, thumbnail_url, publish_date,
-  collection_name, read_time_mins, dropdown_state, dropdown_value
+  collection_name, read_time_mins, dropdown_state, dropdown_value,
+  scraper_version, metadata_version, scrape_run_id
 
 ═══════════════════════════════════════════════════════════════
 LOCAL USAGE (VDI)
@@ -633,6 +634,78 @@ v4.5.5 — July 2026 | Mukesh Kund
          routing pages (bereavement, lost pension etc) produce
          contact signals and pass all 3 layers.
 
+v4.6.0 — July 2026 | Mukesh Kund
+         Content versioning and traceability — scraper side.
+
+         TWO NEW VERSION CONSTANTS:
+           SCRAPER_VERSION  = "1.0.0"
+             Bump when scraping logic changes: CDP mode, dropdown
+             detection, content extraction, crawl4ai config.
+           METADATA_VERSION = "1.0.0"
+             Bump when metadata extraction/mapping logic changes:
+             EXCEL_CATEGORY_MAP, SECTION_MAP, extract_page_metadata(),
+             derive_content_type(), has_video detection.
+
+         BOTH are independent — changing crawl4ai config bumps
+         SCRAPER_VERSION but not METADATA_VERSION. Changing how
+         content_type is mapped from Excel Category bumps
+         METADATA_VERSION but not SCRAPER_VERSION.
+
+         OUTPUT JSON — 4 new fields on EVERY page:
+           scraper_version  — which scraping logic produced this page
+           metadata_version — which metadata extraction produced this page
+           scrape_run_id    — UUID generated once per scrape run;
+                              links all pages from the same execution
+           scraped_at       — already existed; now always UTC ISO format
+
+         scrape_run_id is generated at startup (module level) so all
+         pages from one scraper invocation share the same ID.
+         chunk_and_index_hqaV4.py passes scraper_version,
+         metadata_version, and scrape_run_id through to the AI Search
+         index for end-to-end chunk traceability.
+
+         PRINT FIX:
+         Completion next-step print corrected from
+         chunk_and_index_hqaV3.py → chunk_and_index_hqaV4.py.
+
+v4.7.0 — July 2026 | Mukesh Kund
+         Versioning field descriptions added as code comments.
+         No logic changes — documentation only.
+
+         VERSIONING FIELDS PRODUCED BY THIS SCRIPT:
+         ┌─────────────────┬────────┬──────────────────────────────────────────────┐
+         │ Field           │ Type   │ Meaning                                      │
+         ├─────────────────┼────────┼──────────────────────────────────────────────┤
+         │ scraper_version │ String │ Which SCRAPING LOGIC built this page.        │
+         │                 │        │ Bump SCRAPER_VERSION when scrape_page(),     │
+         │                 │        │ CDP mode, dropdown detection, or crawl4ai    │
+         │                 │        │ config changes. Never auto-increments.       │
+         ├─────────────────┼────────┼──────────────────────────────────────────────┤
+         │ metadata_version│ String │ Which METADATA EXTRACTION LOGIC built this.  │
+         │                 │        │ Bump METADATA_VERSION when                   │
+         │                 │        │ extract_page_metadata(), CONTENT_TYPE_MAP,   │
+         │                 │        │ PRODUCT_CATEGORY_MAP, EXCEL_CATEGORY_MAP,   │
+         │                 │        │ or video detection logic changes.            │
+         │                 │        │ Never auto-increments.                       │
+         ├─────────────────┼────────┼──────────────────────────────────────────────┤
+         │ scrape_run_id   │ UUID   │ Groups ALL PAGES from ONE scraper execution. │
+         │                 │        │ All 350 pages from one run share one UUID.   │
+         │                 │        │ Generated once at startup. Lets you query   │
+         │                 │        │ "show me every chunk from scrape run X".    │
+         ├─────────────────┼────────┼──────────────────────────────────────────────┤
+         │ scraped_at      │ ISO ts │ When the page was scraped from the website.  │
+         │                 │        │ UTC ISO format. Distinct from indexed_at     │
+         │                 │        │ (set by indexer when chunk is uploaded).     │
+         └─────────────────┴────────┴──────────────────────────────────────────────┘
+
+         Fields NOT set by this script (set by indexer):
+           pipeline_version, index_run_id, indexed_at, refresh_count
+
+         BUMPING RULES SUMMARY:
+           SCRAPER_VERSION  — bump when HOW we scrape changes
+           METADATA_VERSION — bump when WHAT metadata we extract changes
+           (Both are developer-bumped only — never auto-increment)
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -675,6 +748,44 @@ from dotenv import load_dotenv, find_dotenv
 _dotenv_path = find_dotenv(usecwd=False)
 load_dotenv(_dotenv_path, override=True)
 log = structlog.get_logger()
+
+# ── Versioning (v4.6.0) ───────────────────────────────────────
+#
+# VERSIONING FIELDS — WHAT EACH MEANS:
+#
+#   SCRAPER_VERSION  ("1.0.0" → "1.1.0" → ...)
+#     Tracks WHICH SCRAPING LOGIC produced each page.
+#     Bump when: scrape_page(), CDP mode, dropdown detection,
+#     crawl4ai config, or content extraction logic changes.
+#     Never auto-increments. Developer-bumped only.
+#     Stored as: scraper_version field on every AI Search chunk.
+#
+#   METADATA_VERSION  ("1.0.0" → "1.1.0" → ...)
+#     Tracks WHICH METADATA EXTRACTION LOGIC produced each page.
+#     Bump when: extract_page_metadata(), CONTENT_TYPE_MAP,
+#     PRODUCT_CATEGORY_MAP, EXCEL_CATEGORY_MAP, has_video
+#     detection, or derive_content_type() logic changes.
+#     Never auto-increments. Developer-bumped only.
+#     Stored as: metadata_version field on every AI Search chunk.
+#
+#   SCRAPE_RUN_ID  (UUID per invocation)
+#     Groups ALL PAGES from ONE scraper execution together.
+#     All 350 pages from one run share the same UUID.
+#     Generated fresh at startup — never persisted across runs.
+#     Stored as: scrape_run_id field on every AI Search chunk.
+#
+#   scraped_at  (ISO timestamp, set per page)
+#     When the page was fetched from the Royal London website.
+#     UTC ISO format. Distinct from indexed_at (set by indexer).
+#     Stored as: scraped_at field on every AI Search chunk.
+#
+# Fields NOT set by this script (set by chunk_and_index_hqaV4.py):
+#   pipeline_version, index_run_id, indexed_at, refresh_count
+#
+import uuid as _uuid
+SCRAPER_VERSION  = "1.0.0"
+METADATA_VERSION = "1.0.0"
+SCRAPE_RUN_ID    = str(_uuid.uuid4())
 
 # ── Config ────────────────────────────────────────────
 APPROVED_EXCEL = "scraper/data/royal_london_verification_retried.xlsx"
@@ -2089,6 +2200,10 @@ def _scrape_dropdown_states_playwright(
                                 "content_hash":     hashlib.sha256(
                                     content.encode("utf-8")
                                 ).hexdigest(),
+                                # v4.6.0: versioning — inherited from base page run
+                                "scraper_version":  SCRAPER_VERSION,
+                                "metadata_version": METADATA_VERSION,
+                                "scrape_run_id":    SCRAPE_RUN_ID,
                                 "audience":         base_page_data["audience"],
                                 "has_video":        base_page_data["has_video"],
                                 "content_type":     base_page_data["content_type"],
@@ -2223,6 +2338,14 @@ async def scrape_page(
             "content_hash":   hashlib.sha256(
                 page_content.strip().encode("utf-8")
             ).hexdigest(),
+
+            # ── Versioning fields (v4.6.0) ────────────────────
+            # Passed through to AI Search by chunk_and_index_hqaV4.py
+            # so every chunk can be traced back to which scrape run
+            # and which logic version produced it.
+            "scraper_version":  SCRAPER_VERSION,
+            "metadata_version": METADATA_VERSION,
+            "scrape_run_id":    SCRAPE_RUN_ID,
 
             # ── Enrichment fields (v3.0.0) ────────────────────
             # All extracted from HTML already fetched by crawl4ai.
@@ -2735,8 +2858,8 @@ async def main():
     print(f"\nSaved to: {output_path}")
     print("=" * 60)
     print(f"\n👉 Next step: index the scraped content:")
-    print(f"   python scraper/chunk_and_index_hqaV3.py --full --file {output_path}")
-    print(f"   python scraper/chunk_and_index_hqaV3.py --full --no-hqa --file {output_path}  # baseline")
+    print(f"   python scraper/chunk_and_index_hqaV4.py --full --file {output_path}")
+    print(f"   python scraper/chunk_and_index_hqaV4.py --full --no-hqa --file {output_path}  # baseline")
 
 
 if __name__ == "__main__":

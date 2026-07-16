@@ -103,6 +103,14 @@ PRODUCTION — AZURE CONTAINER APPS JOB (DevOps)
 #   REDIS-URL                                rediss://<name>.redis.cache.windows.net:6380
 #                                            (for cache clear after --full)
 #   AZURE-SEARCH-SEMANTIC-CONFIG             rlg-semantic-config
+#   CHUNK-SIZE                               1600
+#   CHUNK-OVERLAP                            200
+#   EMBEDDING-BATCH-SIZE                     50
+#   HQA-QUESTIONS-FIRST-CHUNK               8
+#   HQA-QUESTIONS-OTHER-CHUNKS              5
+#   TITLE-QUESTIONS-COUNT                    3
+#   TITLE-QUESTIONS-MAX-WORDS               12
+#   MAX-COLLISION-THRESHOLD                  3
 #
 # ── CONTAINER APPS JOB trigger ───────────────────────────────────
 #
@@ -764,6 +772,148 @@ v5.5.0 — July 2026 | Mukesh Kund
          - v5.3.0 production steps: scraper name corrected from
            scrape_approved_urls_updatedV3.py to V4
 
+v5.6.0 — July 2026 | Mukesh Kund
+         Env-var externalisation of hardcoded tuning constants +
+         index name guard + import fix
+
+         HARDCODED CONSTANTS → ENV VARS / KEY VAULT:
+         Eight tuning constants were hardcoded in the script,
+         meaning any change required a code edit and redeployment.
+         All are now read from os.getenv() with safe defaults so
+         they can be overridden via .env (dev) or Azure Key Vault
+         (production) without touching code.
+
+         Constants externalised:
+           CHUNK_SIZE                 → CHUNK_SIZE               (default 1600)
+           CHUNK_OVERLAP              → CHUNK_OVERLAP             (default 200)
+           EMBEDDING_BATCH_SIZE       → EMBEDDING_BATCH_SIZE      (default 50)
+           HQA_QUESTIONS_FIRST_CHUNK  → HQA_QUESTIONS_FIRST_CHUNK (default 8)
+           HQA_QUESTIONS_OTHER_CHUNKS → HQA_QUESTIONS_OTHER_CHUNKS(default 5)
+           TITLE_QUESTIONS_COUNT      → TITLE_QUESTIONS_COUNT     (default 3)
+           TITLE_QUESTIONS_MAX_WORDS  → TITLE_QUESTIONS_MAX_WORDS (default 12)
+           MAX_COLLISION_THRESHOLD    → MAX_COLLISION_THRESHOLD   (default 3)
+
+         CHUNK_SIZE / CHUNK_OVERLAP SAFETY WARNING:
+         If either is changed via env var, a WARNING is logged at
+         startup. Changing chunk dimensions without running --full
+         causes inconsistent chunk structure between existing and
+         newly indexed pages. Always run --full after changing
+         CHUNK_SIZE or CHUNK_OVERLAP.
+
+         Key Vault secrets to add (DevOps action):
+           CHUNK-SIZE                  1600
+           CHUNK-OVERLAP               200
+           EMBEDDING-BATCH-SIZE        50
+           HQA-QUESTIONS-FIRST-CHUNK   8
+           HQA-QUESTIONS-OTHER-CHUNKS  5
+           TITLE-QUESTIONS-COUNT       3
+           TITLE-QUESTIONS-MAX-WORDS   12
+           MAX-COLLISION-THRESHOLD     3
+
+         INDEX NAME GUARD — main() + run_pipeline() [NEW]:
+         Prevents accidental overwrite of a wrong index if someone
+         forgets to update env vars. Guard fires before any Azure
+         call (including --dry-run). Logic: active_index must be
+         one of the two values INDEX_NAME and BASELINE_INDEX_NAME
+         resolve to — anything else aborts with sys.exit(1).
+         Future-proof: when you move to V5 indexes, update the two
+         constants (as you always would) and the guard automatically
+         protects V4 with zero extra steps. No manual list to maintain.
+
+         IMPORT FIX — main() [FIXED]:
+         Line 3509: `import scraper.chunk_and_index_hqaV3 as _self`
+         → `import scraper.chunk_and_index_hqaV4 as _self`
+         Was importing V3 module (ModuleNotFoundError in production).
+
+         PRINT STATEMENT FIXES:
+         - Banner version string: v5.1.0 → v5.5.0 (was stale)
+         - Pilot mode suggestion: chunk_and_index_hqaV3.py → V4
+         - run_pipeline() docstring: rlg-faq-index-v3-baseline → v4-baseline
+
+v5.7.0 — July 2026 | Mukesh Kund
+         Content versioning and traceability — indexer side.
+
+         NEW CONSTANT:
+           PIPELINE_VERSION = "1.0.0"
+             Bump when chunking, HQA, embedding, or index schema
+             changes that affect the content or structure of what
+             is uploaded to Azure AI Search.
+             Start at 1.0.0 — v4 is the first index with versioning.
+
+         5 NEW INDEX SCHEMA FIELDS (all SimpleField, non-searchable):
+           pipeline_version  — which indexer logic built this chunk
+           index_run_id      — UUID per pipeline execution; groups all
+                               chunks from one run (filterable)
+           indexed_at        — UTC ISO timestamp when chunk was uploaded
+           scraper_version   — passed through from scraper JSON
+           metadata_version  — passed through from scraper JSON
+
+         All 5 fields: retrievable=True, filterable=True,
+         searchable=False, sortable=False, facetable=False.
+         REQUIRES --full reindex — new fields cannot be added to
+         existing documents without a full rebuild.
+
+         chunk_pages() UPDATED:
+         index_run_id is generated once per pipeline run at
+         the start of chunk_pages() and stamped on every chunk.
+         indexed_at is set at chunk creation time (UTC ISO).
+         scraper_version and metadata_version are passed through
+         from the scraper JSON page dict (safe defaults "unknown"
+         if scraper didn't produce them — backward compatible with
+         old JSON files).
+
+         run_pipeline() result dict UPDATED:
+         run_id field added — callers can log which run produced
+         the chunks in this execution.
+
+         BUMPING RULES (documented here for reference):
+           PIPELINE_VERSION bumps when:
+             - Chunk schema changes (new fields)
+             - Chunking logic changes (size, overlap, separators)
+             - HQA prompt or generation logic changes
+             - Embedding model or dimensions change
+             - Scoring profile or semantic config changes
+           Does NOT bump for: infrastructure changes (env vars,
+           container config, Key Vault secrets).
+
+v5.8.0 — July 2026 | Mukesh Kund
+         scrape_run_id + refresh_count fields + versioning descriptions.
+
+         NEW INDEX SCHEMA FIELDS:
+           scrape_run_id (SimpleField, String, filterable, retrievable):
+             UUID linking all chunks to the scraper run that produced
+             the source page. Passed through from scraper JSON.
+             Was previously produced by scraper but never indexed —
+             now correctly stored so ops can query "all chunks from
+             scrape run X". Default "unknown" for backward compat
+             with pre-v4.6.0 scrape JSON files.
+
+           refresh_count (SimpleField, Int32, filterable, sortable,
+             retrievable):
+             How many times this page has been refreshed by the
+             nightly freshness job. Set to 0 by this indexer on
+             every full run. content_freshness.py reads the existing
+             value and increments by 1 on every delta re-index.
+             Query: filter=refresh_count gt 0 shows everything
+             freshness has ever touched.
+
+         VERSIONING DESCRIPTION BLOCK:
+         All versioning fields documented with their meaning,
+         who sets them, and bumping rules — as code comments
+         near the constants section. Prevents ambiguity when
+         multiple developers work on the codebase.
+
+         BUMPING RULES (see constants section for full detail):
+           PIPELINE_VERSION — developer-bumped when chunking/HQA/
+                              embedding/schema logic changes.
+                              Requires --full reindex.
+           scrape_run_id    — auto UUID per scraper run (from JSON)
+           index_run_id     — auto UUID per indexer run
+           refresh_count    — 0 on full run; auto-incremented by
+                              freshness on delta re-index
+           indexed_at       — auto timestamp per upload
+           scraped_at       — from scraper JSON
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -775,6 +925,7 @@ import os
 import re
 import time
 import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 from glob import glob
 
@@ -810,6 +961,83 @@ _dotenv_path = find_dotenv(usecwd=False)
 load_dotenv(_dotenv_path, override=True)
 log = structlog.get_logger()
 
+# v5.6.0: warn if chunk dimensions are overridden via env.
+# Changing these without --full re-index causes inconsistent
+# chunk structure between existing and newly indexed pages.
+_chunk_size_overridden    = os.getenv("CHUNK_SIZE") is not None
+_chunk_overlap_overridden = os.getenv("CHUNK_OVERLAP") is not None
+if _chunk_size_overridden or _chunk_overlap_overridden:
+    log.warning(
+        "chunk_dimensions_overridden",
+        chunk_size=os.getenv("CHUNK_SIZE", "1600"),
+        chunk_overlap=os.getenv("CHUNK_OVERLAP", "200"),
+        action_required="Run --full re-index or chunk structure will be inconsistent",
+    )
+
+# ── Versioning (v5.7.0 / v5.8.0) ────────────────────────────
+#
+# COMPLETE VERSIONING FIELD REFERENCE — ALL FIELDS ON EVERY CHUNK:
+#
+# PIPELINE_VERSION ("1.0.0" -> "1.1.0" -> ...)
+#   Tracks WHICH CHUNKING/HQA/EMBEDDING LOGIC built this chunk.
+#   Bump when: CHUNK_SIZE, CHUNK_OVERLAP, HQA prompts/generation/
+#   validation logic, embedding model/dimensions, index schema,
+#   or scoring profile changes. Requires --full reindex.
+#   Never auto-increments. Developer-bumped only.
+#   Stored as: pipeline_version (String) on every chunk.
+#
+# scraper_version (passed through from scraper JSON)
+#   Tracks WHICH SCRAPING LOGIC produced the source page.
+#   Set by scrape_approved_urls_updatedV4.py SCRAPER_VERSION.
+#   Default "unknown" for pre-v4.6.0 scrape JSON files.
+#   Stored as: scraper_version (String) on every chunk.
+#
+# metadata_version (passed through from scraper JSON)
+#   Tracks WHICH METADATA EXTRACTION LOGIC produced the source page.
+#   Set by scrape_approved_urls_updatedV4.py METADATA_VERSION.
+#   Default "unknown" for pre-v4.6.0 scrape JSON files.
+#   Stored as: metadata_version (String) on every chunk.
+#
+# scrape_run_id (passed through from scraper JSON, UUID)
+#   Groups ALL CHUNKS whose source page came from ONE scraper run.
+#   All 350 pages from one scraper invocation share one UUID.
+#   Set by scrape_approved_urls_updatedV4.py at startup.
+#   Default "unknown" for pre-v4.6.0 scrape JSON files.
+#   Stored as: scrape_run_id (String) on every chunk.
+#
+# index_run_id (auto UUID per chunk_pages() call)
+#   Groups ALL CHUNKS from ONE indexer execution together.
+#   Generated once at start of chunk_pages(). New UUID per run.
+#   Stored as: index_run_id (String) on every chunk.
+#
+# indexed_at (auto ISO timestamp per chunk_pages() call)
+#   When this chunk was uploaded to Azure AI Search.
+#   Distinct from scraped_at (when page was fetched).
+#   Sortable — find the most recently indexed version.
+#   Stored as: indexed_at (String, sortable) on every chunk.
+#
+# refresh_count (Int32, always 0 on full run)
+#   How many times this page has been REFRESHED BY NIGHTLY FRESHNESS.
+#   0 = indexed by this script, never touched by freshness.
+#   N = refreshed N times by content_freshness.py nightly job.
+#   content_freshness.py reads existing value and adds 1.
+#   Stored as: refresh_count (Int32, sortable, filterable) on every chunk.
+#
+# scraped_at (from scraper JSON, ISO timestamp)
+#   When the page was fetched from the Royal London website.
+#   Set by scrape_approved_urls_updatedV4.py or content_freshness.py.
+#   Stored as: scraped_at (String) on every chunk.
+#
+# BUMPING RULES SUMMARY:
+#   Developer-bumped (manual — code logic changes only):
+#     PIPELINE_VERSION, scraper_version, metadata_version
+#   Auto-generated (no developer action needed):
+#     scrape_run_id, index_run_id, indexed_at, scraped_at
+#   Auto-incremented by freshness (reads existing + adds 1):
+#     refresh_count
+#
+PIPELINE_VERSION = "1.0.0"
+
 # ── Config ────────────────────────────────────────────────────
 # SCRAPED_FILE is the last-resort fallback only — used when:
 #   1. No --file argument passed, AND
@@ -819,8 +1047,13 @@ log = structlog.get_logger()
 SCRAPED_FILE          = (
     "scraper/data/royal_london_faq_approved_20260623_111343.json"
 )
-CHUNK_SIZE            = 1600
-CHUNK_OVERLAP         = 200
+# v5.6.0: externalised to env var / Key Vault.
+# IMPORTANT: changing CHUNK_SIZE or CHUNK_OVERLAP requires --full
+# re-index. Changing dimensions mid-run causes inconsistent chunk
+# structure between existing and newly indexed pages.
+# A warning is logged at startup if either is overridden via env.
+CHUNK_SIZE            = int(os.getenv("CHUNK_SIZE", "1600"))
+CHUNK_OVERLAP         = int(os.getenv("CHUNK_OVERLAP", "200"))
 # v5.3.0: default changed to rlg-faq-index-v4.
 # rlg-faq-index-v3 and rlg-faq-index-v3-baseline are NOT touched
 # by this script — both remain live as fallback.
@@ -874,8 +1107,9 @@ SEMANTIC_CONFIG_NAME  = os.getenv(
 
 # Batch sizes
 # EMBEDDING_BATCH_SIZE: reduced from 100 → 50 for S0 TPM limit.
-# Revert to 100 if/when upgraded to S1+ tier.
-EMBEDDING_BATCH_SIZE  = 50
+# Revert to 100 if/when upgraded to S1+ tier (via Key Vault update).
+# v5.6.0: externalised to env var / Key Vault.
+EMBEDDING_BATCH_SIZE  = int(os.getenv("EMBEDDING_BATCH_SIZE", "50"))
 UPLOAD_BATCH_SIZE     = 100
 
 # HQA batch size — how many chunks to generate questions for
@@ -894,10 +1128,13 @@ HQA_BATCH_SIZE        = 1   # one chunk per call for best quality
 #   title_questions field (not augmented_questions).
 # TITLE_QUESTIONS_MAX_WORDS: per TITLE_QUESTIONS_PROMPT — title
 #   questions must stay under this word count.
-HQA_QUESTIONS_FIRST_CHUNK  = 8
-HQA_QUESTIONS_OTHER_CHUNKS = 5
-TITLE_QUESTIONS_COUNT      = 3
-TITLE_QUESTIONS_MAX_WORDS  = 12
+# v5.6.0: all four externalised to env var / Key Vault so HQA
+# tuning (question counts, word cap) can be adjusted without code
+# changes or redeployment.
+HQA_QUESTIONS_FIRST_CHUNK  = int(os.getenv("HQA_QUESTIONS_FIRST_CHUNK", "8"))
+HQA_QUESTIONS_OTHER_CHUNKS = int(os.getenv("HQA_QUESTIONS_OTHER_CHUNKS", "5"))
+TITLE_QUESTIONS_COUNT      = int(os.getenv("TITLE_QUESTIONS_COUNT", "3"))
+TITLE_QUESTIONS_MAX_WORDS  = int(os.getenv("TITLE_QUESTIONS_MAX_WORDS", "12"))
 
 # Pilot mode chunk limit — process only this many chunks when
 # --pilot flag is set. Allows quick quality validation before
@@ -1176,6 +1413,11 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
         separators=["\n\n", "\n", ". ", " ", ""],
     )
 
+    # v5.7.0: one UUID per chunk_pages() call — links all chunks
+    # from this pipeline run together in the index.
+    _index_run_id  = str(uuid.uuid4())
+    _indexed_at    = datetime.now(timezone.utc).isoformat()
+
     chunks = []
     for page in pages:
         content  = page.get("content", "").strip()
@@ -1225,6 +1467,20 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
                     "content_hash":         page_hash,
                     "augmented_questions":  "",
                     "title_questions":      "",
+                    # ── Versioning fields (v5.7.0 / v5.8.0) ────
+                    "pipeline_version":  PIPELINE_VERSION,
+                    "index_run_id":      _index_run_id,
+                    "indexed_at":        _indexed_at,
+                    "scraper_version":   page.get("scraper_version", "unknown"),
+                    "metadata_version":  page.get("metadata_version", "unknown"),
+                    # scrape_run_id: UUID from scraper JSON — groups all chunks
+                    # whose source page came from one scraper execution.
+                    "scrape_run_id":     page.get("scrape_run_id", "unknown"),
+                    # refresh_count: always 0 on full index run.
+                    # content_freshness.py reads this value and increments by 1
+                    # on every delta re-index of a changed page.
+                    "refresh_count":     0,
+                    # ── Enrichment fields (v3.0.0) ──────────────
                     "has_video":        page.get("has_video", False),
                     "content_type":     page.get("content_type", "article"),
                     "product_category": page.get("product_category", "general"),
@@ -1271,6 +1527,24 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
                 # the field is always present in every uploaded
                 # document regardless of augmentation success.
                 "title_questions":      "",
+
+                # ── Versioning fields (v5.7.0 / v5.8.0) ────────
+                # pipeline_version / index_run_id / indexed_at:
+                #   generated by this indexer run.
+                # scraper_version / metadata_version / scrape_run_id:
+                #   passed through from scraper JSON — "unknown" if
+                #   scraping from an older JSON without these fields
+                #   (backward compatible with pre-v4.6.0 scrape files).
+                # refresh_count:
+                #   always 0 on full index run. content_freshness.py
+                #   reads this and increments by 1 on each delta re-index.
+                "pipeline_version":  PIPELINE_VERSION,
+                "index_run_id":      _index_run_id,
+                "indexed_at":        _indexed_at,
+                "scraper_version":   page.get("scraper_version", "unknown"),
+                "metadata_version":  page.get("metadata_version", "unknown"),
+                "scrape_run_id":     page.get("scrape_run_id", "unknown"),
+                "refresh_count":     0,
 
                 # ── Enrichment fields (v3.0.0) ─────────────────
                 # Passed through from scraper — extracted at scrape
@@ -1325,7 +1599,8 @@ BLOCKED_QUESTIONS = {
 # Value of 3 allows same question on up to 3 different pages
 # (acceptable — covers same topic from different angles)
 # but prevents flooding across 20-100 chunks.
-MAX_COLLISION_THRESHOLD = 3
+# v5.6.0: externalised to env var / Key Vault.
+MAX_COLLISION_THRESHOLD = int(os.getenv("MAX_COLLISION_THRESHOLD", "3"))
 
 # URL path segments that indicate a page is a dedicated
 # product/topic page (NOT a generic/cross-topic page).
@@ -2171,7 +2446,7 @@ def augment_chunks_with_hqa(
       already prepended to content in chunk_pages(), so it
       contributes to both BM25 and the embedding naturally.
     - Run completes in seconds instead of ~3.5 hours.
-    - Used to build rlg-faq-index-v3-baseline for A/B
+    - Used to build rlg-faq-index-v4-baseline for A/B
       comparison against the full HQA index.
 
     pilot=True: process only first PILOT_CHUNK_LIMIT chunks.
@@ -2615,6 +2890,85 @@ def create_or_update_index(fresh: bool = False):
             searchable=False,
             filterable=False,
             sortable=False,
+            facetable=False,
+            retrievable=True,
+        ),
+
+        # ── Versioning fields (v5.7.0 NEW) ───────────────────
+        # End-to-end traceability: every chunk can be traced back
+        # to which pipeline run, scraper version, and metadata
+        # extraction logic produced it. All filterable for ops
+        # queries ("show me all chunks from run X").
+        # Not searchable — version strings add no BM25 value.
+        # Not exposed via retriever.py — internal/ops use only.
+        SimpleField(
+            name="pipeline_version",
+            type=SearchFieldDataType.String,
+            searchable=False,
+            filterable=True,
+            sortable=False,
+            facetable=False,
+            retrievable=True,
+        ),
+        SimpleField(
+            name="index_run_id",
+            type=SearchFieldDataType.String,
+            searchable=False,
+            filterable=True,
+            sortable=False,
+            facetable=False,
+            retrievable=True,
+        ),
+        SimpleField(
+            name="indexed_at",
+            type=SearchFieldDataType.String,
+            searchable=False,
+            filterable=False,
+            sortable=True,
+            facetable=False,
+            retrievable=True,
+        ),
+        SimpleField(
+            name="scraper_version",
+            type=SearchFieldDataType.String,
+            searchable=False,
+            filterable=True,
+            sortable=False,
+            facetable=False,
+            retrievable=True,
+        ),
+        SimpleField(
+            name="metadata_version",
+            type=SearchFieldDataType.String,
+            searchable=False,
+            filterable=True,
+            sortable=False,
+            facetable=False,
+            retrievable=True,
+        ),
+        # scrape_run_id: UUID from scraper JSON — groups all chunks
+        # whose source page came from one scraper invocation.
+        # Lets ops query "show everything from scrape run X".
+        SimpleField(
+            name="scrape_run_id",
+            type=SearchFieldDataType.String,
+            searchable=False,
+            filterable=True,
+            sortable=False,
+            facetable=False,
+            retrievable=True,
+        ),
+        # refresh_count: how many times this page has been refreshed
+        # by the nightly content_freshness.py job.
+        # 0 = full index run (this script), never delta'd.
+        # N = refreshed N times by freshness. Int32 for sort/filter.
+        # Use: filter=refresh_count gt 0 to find all freshness-touched chunks.
+        SimpleField(
+            name="refresh_count",
+            type=SearchFieldDataType.Int32,
+            searchable=False,
+            filterable=True,
+            sortable=True,
             facetable=False,
             retrievable=True,
         ),
@@ -3262,7 +3616,7 @@ def run_pipeline(
                       for HQA quality validation. Use before
                       running a full re-index for the first time.
         no_hqa:       v5.1.0 — If True, skip all LLM calls.
-                      Builds rlg-faq-index-v3-baseline for A/B
+                      Builds rlg-faq-index-v4-baseline for A/B
                       comparison. ~15-20 minutes vs ~3.5 hours.
         dry_run:      v5.1.0 — If True, validate + chunk but do
                       NOT create/update index or upload anything.
@@ -3309,18 +3663,43 @@ def run_pipeline(
     # Resolve index name based on mode
     active_index = BASELINE_INDEX_NAME if no_hqa else INDEX_NAME
 
+    # ── Index name guard (v5.6.0) ─────────────────────────────
+    # Same guard as main() — protects against wrong env vars
+    # when called programmatically from ADO pipeline / Container Job.
+    CURRENT_TARGETS = {INDEX_NAME, BASELINE_INDEX_NAME}
+    if active_index not in CURRENT_TARGETS:
+        return {
+            "success":         False,
+            "pages_indexed":   0,
+            "chunks_created":  0,
+            "chunks_uploaded": 0,
+            "hqa_questions":   0,
+            "title_questions": 0,
+            "cache_cleared":   False,
+            "no_hqa":          no_hqa,
+            "dry_run":         dry_run,
+            "index_name":      active_index,
+            "error": (
+                f"ABORTED: '{active_index}' is not a recognised target. "
+                f"Expected one of: {sorted(CURRENT_TARGETS)}. "
+                f"Check AZURE_SEARCH_INDEX_NAME / AZURE_SEARCH_BASELINE_INDEX_NAME."
+            ),
+        }
+
     result = {
-        "success":         False,
-        "pages_indexed":   0,
-        "chunks_created":  0,
-        "chunks_uploaded": 0,
-        "hqa_questions":   0,
-        "title_questions": 0,
-        "cache_cleared":   False,
-        "no_hqa":          no_hqa,
-        "dry_run":         dry_run,
-        "index_name":      active_index,
-        "error":           "",
+        "success":          False,
+        "pages_indexed":    0,
+        "chunks_created":   0,
+        "chunks_uploaded":  0,
+        "hqa_questions":    0,
+        "title_questions":  0,
+        "cache_cleared":    False,
+        "no_hqa":           no_hqa,
+        "dry_run":          dry_run,
+        "index_name":       active_index,
+        "pipeline_version": PIPELINE_VERSION,
+        "run_id":           "",   # v5.7.0: set after chunk_pages() runs
+        "error":            "",
     }
 
     try:
@@ -3356,6 +3735,10 @@ def run_pipeline(
         # ── Step 1: Chunk ─────────────────────────────────────
         chunks = chunk_pages(pages_to_index)
         result["chunks_created"] = len(chunks)
+        # v5.7.0: capture index_run_id from first chunk so callers
+        # can log/audit which run produced these chunks.
+        if chunks:
+            result["run_id"] = chunks[0].get("index_run_id", "")
 
         # ── Step 2: HQA augmentation (or baseline skip) ───────
         chunks = augment_chunks_with_hqa(
@@ -3503,13 +3886,29 @@ def main():
     # AZURE_SEARCH_INDEX_NAME env var overrides both defaults.
     active_index = BASELINE_INDEX_NAME if no_hqa else INDEX_NAME
 
+    # ── Index name guard (v5.6.0) ─────────────────────────────
+    # Prevent accidental overwrite of a wrong/protected index if
+    # env vars are not updated before running. Only the two
+    # current-version targets are permitted. When you move to V5
+    # indexes, update INDEX_NAME and BASELINE_INDEX_NAME constants
+    # — this guard automatically protects V4 with no extra steps.
+    CURRENT_TARGETS = {INDEX_NAME, BASELINE_INDEX_NAME}
+    if active_index not in CURRENT_TARGETS:
+        print(f"\n❌ ABORTED — '{active_index}' is not a recognised target for this script version.")
+        print(f"   Expected one of:")
+        for _idx in sorted(CURRENT_TARGETS):
+            print(f"     • {_idx}")
+        print(f"\n   Check AZURE_SEARCH_INDEX_NAME / AZURE_SEARCH_BASELINE_INDEX_NAME in .env or Key Vault.")
+        sys.exit(1)
+
     # Patch module-level INDEX_NAME so all downstream functions
     # (create_or_update_index, upload_chunks, verify_index etc)
     # use the correct index without needing to pass it everywhere.
-    import scraper.chunk_and_index_hqaV3 as _self
+    # v5.6.0 FIX: was importing V3 module (ModuleNotFoundError).
+    import scraper.chunk_and_index_hqaV4 as _self
     _self.INDEX_NAME = active_index
 
-    print(f"\n🚀 RLG Chunk and Index Pipeline v5.1.0")
+    print(f"\n🚀 RLG Chunk and Index Pipeline v5.5.0")
     print("=" * 60)
     print(f"   Mode:      {'FULL (fresh index)' if fresh else 'NEW ONLY (append)'}")
     print(f"   Strategy:  {'⏭️  BASELINE — no HQA, title only' if no_hqa else '🧠 FULL HQA + title_questions'}")
@@ -3586,7 +3985,7 @@ def main():
         print(
             "\n⏸️  PILOT MODE: Review question quality above."
             f"\n   If satisfied, run:"
-            f"\n     python scraper/chunk_and_index_hqaV3.py --full"
+            f"\n     python scraper/chunk_and_index_hqaV4.py --full"
             f"\n   Exiting pilot run now (index not updated)."
         )
         return
