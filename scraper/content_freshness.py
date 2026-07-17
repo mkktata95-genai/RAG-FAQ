@@ -301,12 +301,29 @@ v1.5.0 — July 2026 | Mukesh Kund
            BLOB-ARCHIVE-PREFIX   freshness/archive/
 
 v1.5.1 — July 2026 | Mukesh Kund
-         GPT-5 compatibility: max_tokens → max_completion_tokens.
+         GPT-5 compatibility: max_tokens → max_completion_tokens,
+         temperature removed.
 
          generate_title_questions() [MODIFIED]:
          generate_hqa_questions()   [MODIFIED]:
          - GPT-5 models reject max_tokens with HTTP 400.
            Renamed to max_completion_tokens in both HQA call sites.
+         - GPT-5 models reject temperature=0.3 with HTTP 400
+           ("only default value 1 is supported"). Removed entirely
+           from both HQA call sites.
+
+         ── ROLLBACK TO gpt-4o-mini ──────────────────────────────
+         If reverting HQA_DEPLOYMENT back to gpt-4o-mini:
+         1. .env / Key Vault: set AZURE_OPENAI_DEPLOYMENT_HQA
+            back to your gpt-4o-mini deployment name.
+         2. generate_title_questions(): restore
+              max_completion_tokens=200  →  max_tokens=200
+              add back: temperature=0.3
+         3. generate_hqa_questions(): restore
+              max_completion_tokens=max_tokens  →  max_tokens=max_tokens
+              add back: temperature=0.3
+         No other changes needed — all other logic is model-agnostic.
+         ─────────────────────────────────────────────────────────
 
 """
 
@@ -2083,7 +2100,6 @@ def generate_title_questions(chunk: dict, retry_count: int = 3) -> str:
                     )},
                 ],
                 max_completion_tokens=200,
-                temperature=0.3,
             )
             raw = response.choices[0].message.content or ""
             raw = raw.strip()
@@ -2145,7 +2161,6 @@ def generate_hqa_questions(
                     )},
                 ],
                 max_completion_tokens=max_tokens,
-                temperature=0.3,
             )
             raw = response.choices[0].message.content or ""
             raw = raw.strip()
