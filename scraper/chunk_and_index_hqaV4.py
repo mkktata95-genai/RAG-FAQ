@@ -914,6 +914,58 @@ v5.8.0 — July 2026 | Mukesh Kund
            indexed_at       — auto timestamp per upload
            scraped_at       — from scraper JSON
 
+v5.8.5 — July 2026 | Mukesh Kund
+         HQA cost tracking for budgeting.
+
+         MODEL_PRICING [NEW DICT]:
+         - Pricing registry (input/output $/1M tokens) for all
+           current models: gpt-5-mini, gpt-5-nano, gpt-5.1, gpt-5,
+           gpt-4o-mini, gpt-4o, gpt-4.1. Update when Azure pricing
+           changes. Safe fallback for unknown models ($2/$8).
+
+         CostTracker [NEW CLASS]:
+         - Accumulates input_tokens, output_tokens, reasoning_tokens
+           and estimated cost across an entire HQA run.
+         - reasoning_tokens extracted from
+           completion_tokens_details (GPT-5 only — zero on gpt-4o-mini).
+         - .summary() prints full cost breakdown: tokens by type,
+           cost by type, model pricing used, and a note to check
+           Azure portal for actuals.
+
+         augment_chunks_with_hqa() [MODIFIED]:
+         - Initialises CostTracker at start of run with model name
+           and run_mode (pilot / full/new-only).
+         - Prints cost summary after completion (full and pilot mode).
+
+         generate_title_questions() [MODIFIED]:
+         generate_hqa_questions()   [MODIFIED]:
+         - Call _cost_tracker.record(response.usage) on every
+           successful API call to accumulate real token counts.
+
+         ── ROLLBACK TO gpt-4o-mini ──────────────────────────────
+         Cost tracker works for both models — no revert needed.
+         reasoning_tokens will be 0 for gpt-4o-mini (expected).
+         ─────────────────────────────────────────────────────────
+
+v5.8.4 — July 2026 | Mukesh Kund
+         GPT-5 compatibility: max_completion_tokens floor raised to 4000.
+
+         generate_title_questions() [MODIFIED]:
+         generate_hqa_questions()   [MODIFIED]:
+         - Diagnostic logging revealed finish_reason=length with
+           content='' on every chunk. GPT-5-mini exhausts the token
+           budget on internal reasoning tokens before generating output,
+           leaving nothing for the JSON response.
+         - title_questions: 200 → 4000
+         - hqa_questions: int(num_questions*55+50) → max(..., 4000)
+         - gpt-4o-mini is unaffected (non-reasoning model; only billed
+           for actual output tokens regardless of the limit set).
+
+         ── ROLLBACK TO gpt-4o-mini ──────────────────────────────
+         Safe to leave 4000 in place — gpt-4o-mini only uses what
+         it needs. No revert required for this change.
+         ─────────────────────────────────────────────────────────
+
 v5.8.3 — July 2026 | Mukesh Kund
          GPT-5 compatibility: robust JSON array extraction.
 
@@ -1201,6 +1253,105 @@ HQA_QUESTIONS_FIRST_CHUNK  = int(os.getenv("HQA_QUESTIONS_FIRST_CHUNK", "8"))
 HQA_QUESTIONS_OTHER_CHUNKS = int(os.getenv("HQA_QUESTIONS_OTHER_CHUNKS", "5"))
 TITLE_QUESTIONS_COUNT      = int(os.getenv("TITLE_QUESTIONS_COUNT", "3"))
 TITLE_QUESTIONS_MAX_WORDS  = int(os.getenv("TITLE_QUESTIONS_MAX_WORDS", "12"))
+
+# ── v5.8.5: Cost tracking ─────────────────────────────────────
+# Pricing per 1M tokens (USD). Update when Azure pricing changes.
+# Source: Azure OpenAI pricing page.
+# reasoning_tokens are billed at the output token rate for GPT-5.
+MODEL_PRICING = {
+    # model name substring → (input $/1M, output $/1M)
+    "gpt-5-mini":  (1.25,  5.00),
+    "gpt-5-nano":  (0.50,  2.00),
+    "gpt-5.1":     (2.00,  8.00),
+    "gpt-5":       (2.00,  8.00),
+    "gpt-4o-mini": (0.15,  0.60),
+    "gpt-4o":      (2.50, 10.00),
+    "gpt-4.1":     (2.00,  8.00),
+}
+
+def _get_model_pricing(model_name: str) -> tuple[float, float]:
+    """Return (input_price, output_price) per 1M tokens for model."""
+    name = model_name.lower()
+    for key, prices in MODEL_PRICING.items():
+        if key in name:
+            return prices
+    return (2.00, 8.00)  # safe fallback — don't undercount
+
+
+class CostTracker:
+    """
+    Accumulates token usage and estimated cost across an entire run.
+    Thread-safe enough for sequential HQA generation.
+    Call .record() after each successful API call.
+    Call .summary() at end of run to print the cost report.
+    """
+    def __init__(self, model: str, run_mode: str):
+        self.model          = model
+        self.run_mode       = run_mode  # full / new-only / pilot / dry-run
+        self.input_tokens   = 0
+        self.output_tokens  = 0
+        self.reasoning_tokens = 0
+        self.calls          = 0
+        self.input_price, self.output_price = _get_model_pricing(model)
+
+    def record(self, usage) -> None:
+        """Pass response.usage object from any chat.completions call."""
+        if usage is None:
+            return
+        self.input_tokens  += getattr(usage, "prompt_tokens", 0)
+        out                 = getattr(usage, "completion_tokens", 0)
+        self.output_tokens += out
+        # GPT-5: reasoning_tokens are inside completion_tokens_details
+        details = getattr(usage, "completion_tokens_details", None)
+        if details:
+            self.reasoning_tokens += getattr(details, "reasoning_tokens", 0)
+        self.calls += 1
+
+    @property
+    def input_cost(self)  -> float:
+        return self.input_tokens  / 1_000_000 * self.input_price
+
+    @property
+    def output_cost(self) -> float:
+        return self.output_tokens / 1_000_000 * self.output_price
+
+    @property
+    def total_cost(self)  -> float:
+        return self.input_cost + self.output_cost
+
+    def summary(self) -> str:
+        lines = [
+            "",
+            "=" * 60,
+            "💰 HQA COST SUMMARY",
+            "=" * 60,
+            f"   Run mode:          {self.run_mode}",
+            f"   Model:             {self.model}",
+            f"   API calls:         {self.calls:,}",
+            f"   Input tokens:      {self.input_tokens:,}   (${self.input_cost:.4f})",
+            f"   Output tokens:     {self.output_tokens:,}   (${self.output_cost:.4f})",
+        ]
+        if self.reasoning_tokens:
+            lines.append(
+                f"   Reasoning tokens:  {self.reasoning_tokens:,}   "
+                f"(included in output cost)"
+            )
+        lines += [
+            f"   ─────────────────────────────────────────────────",
+            f"   TOTAL ESTIMATED:   ${self.total_cost:.4f}",
+            f"",
+            f"   Pricing used:      ${self.input_price}/1M input, "
+            f"${self.output_price}/1M output",
+            f"   Note: Azure pricing may differ slightly from OpenAI "
+            f"direct. Check Azure portal for actuals.",
+            "=" * 60,
+        ]
+        return "\n".join(lines)
+
+
+# Module-level tracker — initialised in augment_chunks_with_hqa()
+# so run_mode is known. Reset on each new run.
+_cost_tracker: CostTracker | None = None
 
 # Pilot mode chunk limit — process only this many chunks when
 # --pilot flag is set. Allows quick quality validation before
@@ -2057,7 +2208,7 @@ def generate_title_questions(
                         ),
                     },
                 ],
-                max_completion_tokens=200,
+                max_completion_tokens=4000,  # v5.8.4: GPT-5 needs reasoning headroom; 200 caused finish_reason=length with empty content
             )
 
             raw = response.choices[0].message.content or ""
@@ -2098,6 +2249,9 @@ def generate_title_questions(
                 generated=len(questions),
                 accepted=len(accepted),
             )
+            # v5.8.5: record token usage for cost tracking
+            if _cost_tracker:
+                _cost_tracker.record(response.usage)
             return "\n".join(accepted)
 
         except json.JSONDecodeError:
@@ -2206,7 +2360,13 @@ def generate_hqa_questions(
     # v5.0.0: max_tokens scales with num_questions — 300 was
     # tuned for 5 questions; 8 questions need more headroom or
     # responses risk truncating mid-JSON-array.
-    max_tokens = int(num_questions * 55 + 50)
+    # v5.8.4: GPT-5 reasoning models consume internal reasoning
+    # tokens before generating output. finish_reason=length with
+    # empty content confirmed reasoning exhausted the budget.
+    # Floor raised to 4000 to give GPT-5 sufficient headroom for
+    # reasoning + JSON output. gpt-4o-mini ignores the extra budget
+    # (non-reasoning model — only billed for actual output tokens).
+    max_tokens = max(int(num_questions * 55 + 50), 4000)
 
     for attempt in range(retry_count):
         try:
@@ -2286,6 +2446,9 @@ def generate_hqa_questions(
                 generated=len(questions),
                 accepted=len(accepted),
             )
+            # v5.8.5: record token usage for cost tracking
+            if _cost_tracker:
+                _cost_tracker.record(response.usage)
             return accepted
 
         except json.JSONDecodeError:
@@ -2586,6 +2749,11 @@ def augment_chunks_with_hqa(
         + first_chunk_count * (HQA_QUESTIONS_FIRST_CHUNK + TITLE_QUESTIONS_COUNT)
     )
 
+    # v5.8.5: initialise cost tracker for this run
+    run_mode = "pilot" if pilot else "full/new-only"
+    global _cost_tracker
+    _cost_tracker = CostTracker(model=HQA_DEPLOYMENT, run_mode=run_mode)
+
     print(
         f"\n🧠 HQA: Generating questions for "
         f"{total:,} chunks"
@@ -2704,6 +2872,9 @@ def augment_chunks_with_hqa(
         # are augmented so deduplication would be incomplete
         print(f"\n   ℹ️  Pilot mode: deduplication skipped")
         print(f"      Deduplication runs on full chunk set only")
+        # v5.8.5: print cost summary for pilot run budgeting
+        if _cost_tracker and _cost_tracker.calls > 0:
+            print(_cost_tracker.summary())
         return chunks
 
     # v4.0.0 Fix 3 (v5.0.0: now cross-field) — cross-chunk
@@ -2713,6 +2884,10 @@ def augment_chunks_with_hqa(
     # title_questions and augmented_questions, keeping only the
     # most relevant occurrence.
     chunks = deduplicate_questions_across_chunks(chunks)
+
+    # v5.8.5: print cost summary for budgeting
+    if _cost_tracker and _cost_tracker.calls > 0:
+        print(_cost_tracker.summary())
 
     return chunks
 
