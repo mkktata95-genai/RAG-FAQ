@@ -300,6 +300,14 @@ v1.5.0 — July 2026 | Mukesh Kund
          New Blob path (Andy action):
            BLOB-ARCHIVE-PREFIX   freshness/archive/
 
+v1.5.1 — July 2026 | Mukesh Kund
+         GPT-5 compatibility: max_tokens → max_completion_tokens.
+
+         generate_title_questions() [MODIFIED]:
+         generate_hqa_questions()   [MODIFIED]:
+         - GPT-5 models reject max_tokens with HTTP 400.
+           Renamed to max_completion_tokens in both HQA call sites.
+
 """
 
 from __future__ import annotations
@@ -2074,7 +2082,7 @@ def generate_title_questions(chunk: dict, retry_count: int = 3) -> str:
                         f"entry-point questions for this page's first chunk:\n\n{content_for_hqa}"
                     )},
                 ],
-                max_tokens=200,
+                max_completion_tokens=200,
                 temperature=0.3,
             )
             raw = response.choices[0].message.content or ""
@@ -2136,7 +2144,7 @@ def generate_hqa_questions(
                         f"Generate {num_questions} questions for this chunk:\n\n{content_for_hqa}"
                     )},
                 ],
-                max_tokens=max_tokens,
+                max_completion_tokens=max_tokens,
                 temperature=0.3,
             )
             raw = response.choices[0].message.content or ""

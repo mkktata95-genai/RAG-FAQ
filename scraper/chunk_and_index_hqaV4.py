@@ -914,6 +914,16 @@ v5.8.0 — July 2026 | Mukesh Kund
            indexed_at       — auto timestamp per upload
            scraped_at       — from scraper JSON
 
+v5.8.2 — July 2026 | Mukesh Kund
+         GPT-5 compatibility: max_tokens → max_completion_tokens.
+
+         generate_title_questions() [MODIFIED]:
+         generate_hqa_questions()   [MODIFIED]:
+         - GPT-5 models reject max_tokens with HTTP 400.
+           Renamed to max_completion_tokens in both HQA call sites.
+         - temperature and other params unchanged (fix separately
+           if a temperature 400 error surfaces on GPT-5).
+
 v5.8.1 — July 2026 | Mukesh Kund
          Self-import fix in main() [CRITICAL BUGFIX].
 
@@ -2012,7 +2022,7 @@ def generate_title_questions(
                         ),
                     },
                 ],
-                max_tokens=200,
+                max_completion_tokens=200,
                 temperature=0.3,
             )
 
@@ -2173,7 +2183,7 @@ def generate_hqa_questions(
                         ),
                     },
                 ],
-                max_tokens=max_tokens,
+                max_completion_tokens=max_tokens,
                 temperature=0.3,   # Low temp = consistent, focused output
             )
 
