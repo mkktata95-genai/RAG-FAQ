@@ -2219,7 +2219,8 @@ def generate_title_questions(
                         ),
                     },
                 ],
-                max_completion_tokens=4000,  # v5.8.4: GPT-5 needs reasoning headroom; 200 caused finish_reason=length with empty content
+                max_tokens=200,
+                temperature=0.3,
             )
 
             raw = response.choices[0].message.content or ""
@@ -2377,7 +2378,7 @@ def generate_hqa_questions(
     # Floor raised to 4000 to give GPT-5 sufficient headroom for
     # reasoning + JSON output. gpt-4o-mini ignores the extra budget
     # (non-reasoning model — only billed for actual output tokens).
-    max_tokens = max(int(num_questions * 55 + 50), 4000)
+    max_tokens = int(num_questions * 55 + 50)
 
     for attempt in range(retry_count):
         try:
@@ -2396,7 +2397,8 @@ def generate_hqa_questions(
                         ),
                     },
                 ],
-                max_completion_tokens=max_tokens,
+                max_tokens=max_tokens,
+                temperature=0.3,   # Low temp = consistent, focused output
             )
 
             msg = response.choices[0].message

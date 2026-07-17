@@ -2236,7 +2236,8 @@ def generate_title_questions(chunk: dict, retry_count: int = 3) -> str:
                         f"entry-point questions for this page's first chunk:\n\n{content_for_hqa}"
                     )},
                 ],
-                max_completion_tokens=4000,  # v1.5.3: GPT-5 needs reasoning headroom; 200 caused finish_reason=length with empty content
+                max_tokens=200,
+                temperature=0.3,
             )
             raw = response.choices[0].message.content or ""
             raw = raw.strip()
@@ -2298,7 +2299,7 @@ def generate_hqa_questions(
     # before generating output. finish_reason=length with empty content
     # confirmed reasoning exhausted the budget. Floor raised to 4000.
     # gpt-4o-mini ignores extra budget (non-reasoning model).
-    max_tokens      = max(int(num_questions * 55 + 50), 4000)
+    max_tokens      = int(num_questions * 55 + 50)
 
     for attempt in range(retry_count):
         try:
@@ -2310,7 +2311,8 @@ def generate_hqa_questions(
                         f"Generate {num_questions} questions for this chunk:\n\n{content_for_hqa}"
                     )},
                 ],
-                max_completion_tokens=max_tokens,
+                max_tokens=max_tokens,
+                temperature=0.3,
             )
             raw = response.choices[0].message.content or ""
             raw = raw.strip()
