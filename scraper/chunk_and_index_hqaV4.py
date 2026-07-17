@@ -914,6 +914,26 @@ v5.8.0 — July 2026 | Mukesh Kund
            indexed_at       — auto timestamp per upload
            scraped_at       — from scraper JSON
 
+v5.8.3 — July 2026 | Mukesh Kund
+         GPT-5 compatibility: robust JSON array extraction.
+
+         generate_title_questions() [MODIFIED]:
+         generate_hqa_questions()   [MODIFIED]:
+         - GPT-5 reasoning models return prose preamble or postamble
+           around the JSON array (e.g. "Here are the questions: [...]").
+           The previous startswith("```") fence-strip failed on these,
+           causing hqa_json_parse_failed on every chunk.
+         - FIX: extract JSON by finding the outermost [ ... ] span
+           in the raw response before attempting json.loads(). The
+           markdown fence strip is kept as a secondary fallback.
+
+         ── ROLLBACK TO gpt-4o-mini ──────────────────────────────
+         If reverting HQA_DEPLOYMENT back to gpt-4o-mini, the JSON
+         extraction change is safe to leave in place — gpt-4o-mini
+         returns bare JSON arrays so find("[") / rfind("]") still
+         works correctly. No code revert needed for this change.
+         ─────────────────────────────────────────────────────────
+
 v5.8.2 — July 2026 | Mukesh Kund
          GPT-5 compatibility: max_tokens → max_completion_tokens,
          temperature removed.
@@ -2043,7 +2063,14 @@ def generate_title_questions(
             raw = response.choices[0].message.content or ""
             raw = raw.strip()
 
-            if raw.startswith("```"):
+            # GPT-5 reasoning models may prepend/append prose or
+            # wrap JSON in markdown fences. Extract the JSON array
+            # directly by finding the outermost [ ... ] span.
+            start = raw.find("[")
+            end   = raw.rfind("]")
+            if start != -1 and end != -1 and end > start:
+                raw = raw[start:end + 1]
+            elif raw.startswith("```"):
                 raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
                 raw = raw.rstrip("`").strip()
 
@@ -2203,8 +2230,14 @@ def generate_hqa_questions(
             raw = response.choices[0].message.content or ""
             raw = raw.strip()
 
-            # Strip markdown code fences if model added them
-            if raw.startswith("```"):
+            # GPT-5 reasoning models may prepend/append prose or
+            # wrap JSON in markdown fences. Extract the JSON array
+            # directly by finding the outermost [ ... ] span.
+            start = raw.find("[")
+            end   = raw.rfind("]")
+            if start != -1 and end != -1 and end > start:
+                raw = raw[start:end + 1]
+            elif raw.startswith("```"):
                 raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
                 raw = raw.rstrip("`").strip()
 
