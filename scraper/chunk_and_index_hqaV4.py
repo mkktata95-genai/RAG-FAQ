@@ -914,6 +914,18 @@ v5.8.0 — July 2026 | Mukesh Kund
            indexed_at       — auto timestamp per upload
            scraped_at       — from scraper JSON
 
+v5.8.7 — July 2026 | Mukesh Kund
+         Bugfix: read_time_mins int → str cast (upload failure).
+
+         chunk_pages() [MODIFIED — both dropdown and regular paths]:
+         - Azure AI Search rejected upload with:
+           "Cannot convert the literal '9' to the expected type
+           'Edm.String'". The schema defines read_time_mins as
+           String but scraper sends it as int.
+         - Fixed: str(page.get("read_time_mins", "5")) at both
+           chunk-building sites. Safe for any input type —
+           str(5) == "5", str("5") == "5".
+
 v5.8.6 — July 2026 | Mukesh Kund
          Model-aware time/cost estimate in augment_chunks_with_hqa().
 
@@ -1716,7 +1728,7 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
                     "thumbnail_url":    page.get("thumbnail_url", ""),
                     "publish_date":     page.get("publish_date", ""),
                     "collection_name":  page.get("collection_name", ""),
-                    "read_time_mins":   page.get("read_time_mins", "5"),
+                    "read_time_mins":   str(page.get("read_time_mins", "5")),
                 })
                 log.info(
                     "dropdown_atomic_chunk",
@@ -1785,7 +1797,7 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
                 "thumbnail_url":    page.get("thumbnail_url", ""),
                 "publish_date":     page.get("publish_date", ""),
                 "collection_name":  page.get("collection_name", ""),
-                "read_time_mins":   page.get("read_time_mins", "5"),
+                "read_time_mins":   str(page.get("read_time_mins", "5")),
             })
 
     log.info("chunking_complete", total_chunks=len(chunks))

@@ -706,6 +706,21 @@ v4.7.0 — July 2026 | Mukesh Kund
            METADATA_VERSION — bump when WHAT metadata we extract changes
            (Both are developer-bumped only — never auto-increment)
 
+v4.7.1 — July 2026 | Mukesh Kund
+         Bugfix: read_time_mins stored as str not int (schema audit).
+
+         extract_page_metadata() [MODIFIED]:
+         - Default dict: 5 (int) → "5" (str)
+         - Calculation: int(read_time) → str(max(1, round(...)))
+         _scrape_dropdown_states_playwright() [MODIFIED]:
+         - max(1, len(...)) → str(max(1, len(...)))
+         Root cause: Azure AI Search schema declares read_time_mins
+         as Edm.String. Scraper v4.4.0 changed it to int — this went
+         undetected until upload failed with "Cannot convert the
+         literal '9' to the expected type 'Edm.String'".
+         A schema type audit script (audit_schema_types.py) has been
+         added to the project to catch this class of bug early.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -1286,7 +1301,7 @@ def extract_page_metadata(html: str, url: str) -> dict:
         "thumbnail_url":    "",
         "publish_date":     "",
         "collection_name":  "",
-        "read_time_mins":   5,    # default 5 min if calculation fails (int, not str)
+        "read_time_mins":   "5",  # default 5 min if calculation fails
     }
 
     # Video detection — uses URL + HTML signals
@@ -1363,7 +1378,7 @@ def extract_page_metadata(html: str, url: str) -> dict:
         body_text = soup.get_text(separator=" ", strip=True)
         word_count = len(body_text.split())
         read_time = max(1, round(word_count / 200))
-        metadata["read_time_mins"] = int(read_time)  # v4.4.0: int not str
+        metadata["read_time_mins"] = str(max(1, round(word_count / 200)))  # str: schema is Edm.String
 
     except Exception as e:
         log.warning(
@@ -2212,7 +2227,7 @@ def _scrape_dropdown_states_playwright(
                                 "thumbnail_url":    base_page_data["thumbnail_url"],
                                 "publish_date":     base_page_data["publish_date"],
                                 "collection_name":  base_page_data["collection_name"],
-                                "read_time_mins":   max(1, len(content.split()) // 200),
+                                "read_time_mins":   str(max(1, len(content.split()) // 200)),
                                 "dropdown_state":   opt_text,
                                 "dropdown_value":   opt_value or "",
                             })

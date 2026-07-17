@@ -300,6 +300,17 @@ v1.5.0 — July 2026 | Mukesh Kund
          New Blob path (Andy action):
            BLOB-ARCHIVE-PREFIX   freshness/archive/
 
+v1.5.5 — July 2026 | Mukesh Kund
+         Bugfix: read_time_mins int → str cast (upload failure).
+
+         extract_metadata_from_html() [MODIFIED]:
+         chunk_page() dropdown path [MODIFIED]:
+         chunk_page() regular path [MODIFIED]:
+         - Same root cause as indexer v5.8.7 — read_time_mins
+           stored/passed as int but schema expects Edm.String.
+         - Fixed at all 4 sites: default dict, metadata calc,
+           dropdown scrape path, and page.get() pass-through.
+
 v1.5.4 — July 2026 | Mukesh Kund
          HQA cost tracking + model-aware estimates (mirrors indexer v5.8.5/5.8.6).
 
@@ -1321,7 +1332,7 @@ def extract_page_metadata(html: str, url: str) -> dict:
         "thumbnail_url":    "",
         "publish_date":     "",
         "collection_name":  "",
-        "read_time_mins":   5,
+        "read_time_mins":   "5",
     }
     if not html or not _BS4_AVAILABLE:
         return metadata
@@ -1357,7 +1368,7 @@ def extract_page_metadata(html: str, url: str) -> dict:
         if collection_tag and collection_tag.get("content", "").strip():
             metadata["collection_name"] = collection_tag["content"].strip()[:100]
         body_text = soup.get_text(separator=" ", strip=True)
-        metadata["read_time_mins"] = max(1, round(len(body_text.split()) / 200))
+        metadata["read_time_mins"] = str(max(1, round(len(body_text.split()) / 200)))
     except Exception as e:
         log.warning("metadata_extraction_error", url=url, error=str(e))
     return metadata
@@ -1575,7 +1586,7 @@ def _scrape_dropdown_states_playwright(
                                 "thumbnail_url":    base_page_data["thumbnail_url"],
                                 "publish_date":     base_page_data["publish_date"],
                                 "collection_name":  base_page_data["collection_name"],
-                                "read_time_mins":   max(1, len(content.split()) // 200),
+                                "read_time_mins":   str(max(1, len(content.split()) // 200)),
                                 "dropdown_state":   opt_text,
                                 "dropdown_value":   opt_value or "",
                             })
@@ -1978,7 +1989,7 @@ async def scrape_url_with_dropdowns(
                 "thumbnail_url":    metadata["thumbnail_url"],
                 "publish_date":     metadata["publish_date"],
                 "collection_name":  metadata["collection_name"],
-                "read_time_mins":   metadata["read_time_mins"],
+                "read_time_mins":   str(metadata["read_time_mins"]),
                 # Dropdown — empty for base page
                 "dropdown_state":   "",
                 "dropdown_value":   "",
@@ -2091,7 +2102,7 @@ def chunk_page(
             "thumbnail_url":    page.get("thumbnail_url", ""),
             "publish_date":     page.get("publish_date", ""),
             "collection_name":  page.get("collection_name", ""),
-            "read_time_mins":   page.get("read_time_mins", 5),
+            "read_time_mins":   str(page.get("read_time_mins", "5")),
         }
 
     # Atomic chunking for dropdown state pages
