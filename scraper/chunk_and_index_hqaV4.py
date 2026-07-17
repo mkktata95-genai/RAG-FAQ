@@ -914,6 +914,27 @@ v5.8.0 — July 2026 | Mukesh Kund
            indexed_at       — auto timestamp per upload
            scraped_at       — from scraper JSON
 
+v5.8.1 — July 2026 | Mukesh Kund
+         Self-import fix in main() [CRITICAL BUGFIX].
+
+         PROBLEM:
+         `import scraper.chunk_and_index_hqaV4 as _self` raises
+         ModuleNotFoundError: No module named 'scraper' when the
+         script is run as __main__ (python scraper/chunk_and_index_hqaV4.py
+         from project root). The package import path only works when
+         the module is imported by another module — not when run
+         directly as a script entry point, even with __init__.py present.
+
+         FIX:
+         Replaced package import with sys.modules["__main__"] lookup.
+         When a script is run directly, Python registers it as __main__
+         in sys.modules. This always resolves correctly regardless of
+         how the script is invoked (direct run, package import, or
+         Container Apps Job entrypoint).
+
+         Old: import scraper.chunk_and_index_hqaV4 as _self
+         New: _self = sys.modules["__main__"]
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -3904,8 +3925,10 @@ def main():
     # Patch module-level INDEX_NAME so all downstream functions
     # (create_or_update_index, upload_chunks, verify_index etc)
     # use the correct index without needing to pass it everywhere.
-    # v5.6.0 FIX: was importing V3 module (ModuleNotFoundError).
-    import scraper.chunk_and_index_hqaV4 as _self
+    # v5.8.1 FIX: sys already imported globally — no local import needed.
+    # sys.modules["__main__"] always resolves to the running script
+    # regardless of invocation method (direct run or package import).
+    _self = sys.modules["__main__"]
     _self.INDEX_NAME = active_index
 
     print(f"\n🚀 RLG Chunk and Index Pipeline v5.5.0")
