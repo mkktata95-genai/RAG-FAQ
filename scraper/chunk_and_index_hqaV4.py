@@ -2105,6 +2105,7 @@ def generate_title_questions(
                 "title_questions_json_parse_failed",
                 chunk_id=chunk["chunk_id"],
                 attempt=attempt + 1,
+                raw_response=raw[:300],  # first 300 chars to diagnose GPT-5 format
             )
             if attempt < retry_count - 1:
                 time.sleep(2)
@@ -2275,6 +2276,7 @@ def generate_hqa_questions(
                 "hqa_json_parse_failed",
                 chunk_id=chunk["chunk_id"],
                 attempt=attempt + 1,
+                raw_response=raw[:300],  # first 300 chars to diagnose GPT-5 format
             )
             if attempt < retry_count - 1:
                 time.sleep(2)
