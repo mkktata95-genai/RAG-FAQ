@@ -2228,7 +2228,24 @@ def generate_hqa_questions(
                 max_completion_tokens=max_tokens,
             )
 
-            raw = response.choices[0].message.content or ""
+            msg = response.choices[0].message
+            raw = msg.content or ""
+
+            # GPT-5 on Azure: content can be None/empty when the
+            # model puts output in reasoning_content instead.
+            # Log full message structure on first attempt to diagnose.
+            if not raw and attempt == 0:
+                log.warning(
+                    "hqa_empty_content",
+                    chunk_id=chunk["chunk_id"],
+                    finish_reason=response.choices[0].finish_reason,
+                    has_reasoning=bool(getattr(msg, "reasoning_content", None)),
+                    reasoning_preview=str(getattr(msg, "reasoning_content", ""))[:200],
+                    raw_message=str(msg)[:400],
+                )
+                # Try reasoning_content as fallback
+                raw = getattr(msg, "reasoning_content", None) or ""
+
             raw = raw.strip()
 
             # GPT-5 reasoning models may prepend/append prose or
