@@ -34,6 +34,11 @@ USAGE:
 
 CHANGELOG
 ---------
+v1.0.1 (2026-07-20) - Mukesh Kund
+    FIX — script paths. All scripts live in RAG\scraper\ but
+    run_pipeline_with_checks.py is invoked from RAG\ root.
+    Added SCRAPER_DIR = Path(__file__).parent / "scraper" and
+    prefixed all subprocess script paths with it.
 v1.0.0 (2026-07-20) - Mukesh Kund
     Initial version. Stepwise orchestration with 3 gated checks.
     Check 1: scrape JSON QA (doc count, URL dedup, parent_url on dropdown entries).
@@ -54,6 +59,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
+# Scripts live in RAG\scraper\ ; this file is run from RAG\ root.
+# SCRAPER_DIR lets subprocess calls find them regardless of cwd.
+SCRAPER_DIR = Path(__file__).parent / "scraper"
 INDEX_NAME = os.getenv("AZURE_SEARCH_INDEX_NAME", "rlg-faq-index-v4")
 ENDPOINT   = os.getenv("AZURE_SEARCH_ENDPOINT", "")
 API_KEY    = os.getenv("AZURE_SEARCH_API_KEY") or os.getenv("AZURE_SEARCH_KEY", "")
@@ -258,9 +266,9 @@ def check3_retrieval_qa(broad: bool = True):
     """
     _print_sep("CHECK 3 — RETRIEVAL QA (semantic mode)")
 
-    script = Path("debug_retrievalV2.py")
+    script = SCRAPER_DIR / "debug_retrievalV2.py"
     if not script.exists():
-        _warn("debug_retrievalV2.py not found in cwd — skipping Check 3.")
+        _warn(f"debug_retrievalV2.py not found at {script} — skipping Check 3.")
         return
 
     hits   = 0
@@ -331,7 +339,8 @@ def main():
             parser.error("Provide --file <excel> or --json <json> or --checks-only")
 
         _print_sep("STEP 1 — SCRAPE")
-        scrape_cmd = [sys.executable, "scrape_approved_urls_updatedV4.py",
+        scrape_cmd = [sys.executable,
+                      str(SCRAPER_DIR / "scrape_approved_urls_updatedV4.py"),
                       "--file", args.file]
         print(f"  CMD: {' '.join(scrape_cmd)}")
 
@@ -341,7 +350,7 @@ def main():
                 stop("Scraper exited with non-zero code.")
 
             # Find the most recently written JSON in scraper/data/
-            data_dir = Path("scraper/data")
+            data_dir = SCRAPER_DIR / "data"
             jsons    = sorted(data_dir.glob("royal_london_faq_approved_*.json"),
                               key=lambda p: p.stat().st_mtime, reverse=True)
             if not jsons:
@@ -361,7 +370,8 @@ def main():
 
     # ── Step 2: Index ─────────────────────────────────────────
     _print_sep("STEP 2 — INDEX")
-    index_cmd = [sys.executable, "chunk_and_index_hqaV4.py",
+    index_cmd = [sys.executable,
+                 str(SCRAPER_DIR / "chunk_and_index_hqaV4.py"),
                  "--full", "--file", json_path]
     if args.no_hqa:
         index_cmd.append("--no-hqa")
