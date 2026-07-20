@@ -7,6 +7,17 @@ content previews, and diagnoses why the wrong chunks win.
 
 CHANGELOG
 ---------
+v2.1.0 (2026-07-20) - Mukesh Kund
+    HQA FIELD INSPECTION IN URL CHECK.
+    Why: v4 (HQA) ranked the expected page WORSE than v4-baseline
+    for the pension-types query — suspected cause is
+    deduplicate_questions_across_chunks() assigning the key
+    question to a competing page. To confirm, the URL presence
+    check now surfaces each chunk's HQA fields.
+    - url_search() selects augmented_questions + title_questions
+      (base-select fallback for non-v4 indexes).
+    - URL-chunks output prints HQA Qs / TitleQs previews per chunk,
+      "(empty)" when a chunk carries no augmented questions.
 v2.0.0 (2026-07-20) - Mukesh Kund
     PRODUCTION-EQUIVALENT SEMANTIC MODE ADDED.
     Why: v1 only tested plain RRF hybrid / vector / BM25 —
@@ -286,21 +297,39 @@ def semantic_search(client: SearchClient, query: str, embedding: list[float],
 
 
 def url_search(client: SearchClient, url_fragment: str, top: int = 20) -> list[dict]:
-    """Check if any chunks from a specific URL exist in the index."""
-    results = client.search(
+    """
+    Check if any chunks from a specific URL exist in the index.
+    v2.1.0: also selects augmented_questions + title_questions so the
+    HQA coverage for the expected page can be inspected directly —
+    diagnoses HQA gaps (e.g. dedup stripping a key question) vs
+    chunk-size issues. Falls back to base select on non-v4 indexes.
+    """
+    base_select = ["chunk_id", "content", "source_url", "section", "title"]
+    hqa_select  = base_select + ["augmented_questions", "title_questions"]
+    kwargs = dict(
         search_text="*",
         filter=f"search.ismatch('{url_fragment}', 'source_url')",
-        select=["chunk_id", "content", "source_url", "section", "title"],
+        select=hqa_select,
         top=top,
     )
+    try:
+        results = list(client.search(**kwargs))
+    except Exception as err:
+        if "augmented_questions" in str(err) or "title_questions" in str(err):
+            kwargs["select"] = base_select
+            results = list(client.search(**kwargs))
+        else:
+            raise
     return [
         {
-            "chunk_id":   r["chunk_id"],
-            "content":    r["content"],
-            "source_url": r["source_url"],
-            "section":    r.get("section", ""),
-            "title":      r.get("title", ""),
-            "score":      r.get("@search.score", 0.0),
+            "chunk_id":            r["chunk_id"],
+            "content":             r["content"],
+            "source_url":          r["source_url"],
+            "section":             r.get("section", ""),
+            "title":               r.get("title", ""),
+            "augmented_questions": r.get("augmented_questions", ""),
+            "title_questions":     r.get("title_questions", ""),
+            "score":               r.get("@search.score", 0.0),
         }
         for r in results
     ]
@@ -531,6 +560,17 @@ def main():
             print(f"  Content:")
             for line in wrapped:
                 print(f"    {line}")
+            # v2.1.0 — HQA field inspection
+            if r.get("augmented_questions"):
+                print(f"  HQA Qs :")
+                for line in textwrap.wrap(preview(r["augmented_questions"], 300), width=65):
+                    print(f"    {line}")
+            else:
+                print(f"  HQA Qs : (empty)")
+            if r.get("title_questions"):
+                print(f"  TitleQs:")
+                for line in textwrap.wrap(preview(r["title_questions"], 300), width=65):
+                    print(f"    {line}")
     else:
         section(f"CHUNKS FROM '{EXPECTED_URL_FRAGMENT}' IN INDEX")
         print(f"\n  ❌ NONE FOUND — this page is NOT in your index.")
