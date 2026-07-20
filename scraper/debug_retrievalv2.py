@@ -7,6 +7,16 @@ content previews, and diagnoses why the wrong chunks win.
 
 CHANGELOG
 ---------
+v2.2.0 (2026-07-20) - Mukesh Kund
+    URL PRESENCE CHECK BUG FIX.
+    Why: unquoted search.ismatch tokenized the URL fragment
+    ('what-is-a-pension' → what/is/a/pension) and matched any URL
+    sharing any token — the check returned 20 bereavement dropdown
+    chunks and reported "Page in index? YES" incorrectly in every
+    prior run (v1 and v2.x).
+    - Fragment now phrase-quoted inside search.ismatch.
+    - Client-side substring guard: only chunks whose source_url
+      contains the fragment are returned/counted.
 v2.1.0 (2026-07-20) - Mukesh Kund
     HQA FIELD INSPECTION IN URL CHECK.
     Why: v4 (HQA) ranked the expected page WORSE than v4-baseline
@@ -306,9 +316,13 @@ def url_search(client: SearchClient, url_fragment: str, top: int = 20) -> list[d
     """
     base_select = ["chunk_id", "content", "source_url", "section", "title"]
     hqa_select  = base_select + ["augmented_questions", "title_questions"]
+    # v2.2.0: phrase-quoted match. Unquoted ismatch tokenizes the
+    # fragment ('what-is-a-pension' → what/is/a/pension) and matches
+    # ANY url sharing ANY token — returned bereavement pages and made
+    # "Page in index? YES (N chunks)" wrong in every prior run.
     kwargs = dict(
         search_text="*",
-        filter=f"search.ismatch('{url_fragment}', 'source_url')",
+        filter=f"search.ismatch('\"{url_fragment}\"', 'source_url')",
         select=hqa_select,
         top=top,
     )
@@ -320,6 +334,9 @@ def url_search(client: SearchClient, url_fragment: str, top: int = 20) -> list[d
             results = list(client.search(**kwargs))
         else:
             raise
+    # v2.2.0: client-side substring guard — belt and braces even
+    # with the phrase query, only chunks whose source_url actually
+    # contains the fragment are counted.
     return [
         {
             "chunk_id":            r["chunk_id"],
@@ -332,6 +349,7 @@ def url_search(client: SearchClient, url_fragment: str, top: int = 20) -> list[d
             "score":               r.get("@search.score", 0.0),
         }
         for r in results
+        if url_fragment in r["source_url"]
     ]
 
 
