@@ -33,7 +33,7 @@ while True:
         select=["chunk_id", "source_url", "content_hash"],
         top=PAGE,
         skip=skip,
-        order_by=["chunk_id asc"],
+        order_by=["indexed_at asc"],
     ))
     docs.extend(batch)
     if len(batch) < PAGE:
