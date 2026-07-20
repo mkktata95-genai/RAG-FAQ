@@ -300,6 +300,17 @@ v1.5.0 — July 2026 | Mukesh Kund
          New Blob path (Andy action):
            BLOB-ARCHIVE-PREFIX   freshness/archive/
 
+v1.6.0 — July 2026 | Mukesh Kund
+    FIX 1 — parent_url on dropdown state dicts in _scrape_dropdown_states_playwright().
+    Mirrors scraper v4.8.0 fix. Dropdown state entries built here
+    during delta re-index were also missing parent_url, so re-indexed
+    dropdown chunks would still have dead #state= citation URLs.
+    - Added "parent_url": url to every dropdown state dict.
+    FIX 2 — parent_url pass-through in chunk_page().
+    chunk_page() builds the final index document. parent_url must be
+    carried from the page dict into the chunk dict (both atomic and
+    regular paths) so the field reaches the index and retriever.py
+    can resolve the clean citation URL. Mirrors indexer v5.9.0 fix.
 v1.5.5 — July 2026 | Mukesh Kund
          Bugfix: read_time_mins int → str cast (upload failure).
 
@@ -1570,6 +1581,9 @@ def _scrape_dropdown_states_playwright(
 
                             results.append({
                                 "url":              state_url,
+                                # v1.6.0: clean parent URL (no #state= fragment)
+                                # mirrors scraper v4.8.0 fix.
+                                "parent_url":       url,
                                 "title":            f"{base_title} — {opt_text}",
                                 "section":          base_page_data["section"],
                                 "content":          content,
@@ -2124,6 +2138,8 @@ def chunk_page(
             "content_hash":        page.get("content_hash", compute_content_hash(content)),
             "augmented_questions": "",
             "title_questions":     "",
+            # v1.6.0: clean parent URL for dropdown state chunks
+            "parent_url":          page.get("parent_url", ""),
             **_versioning(),
             **_enrichment(),
         }]
@@ -2147,6 +2163,8 @@ def chunk_page(
             "content_hash":        page.get("content_hash", compute_content_hash(content)),
             "augmented_questions": "",
             "title_questions":     "",
+            # v1.6.0: clean parent URL for dropdown state chunks
+            "parent_url":          page.get("parent_url", ""),
             **_versioning(),
             **_enrichment(),
         })

@@ -133,6 +133,18 @@ v1.3.0 — July 2026 | Mukesh Kund
          - was: load_dotenv() — no args, no override
          - now: load_dotenv(find_dotenv(usecwd=False), override=True)
 
+v1.5.0 — July 2026 | Mukesh Kund
+    FIX — parent_url-aware citation URL.
+    Dropdown state pages are indexed with source_url=#state=... fragment.
+    retriever.py was passing this fragment directly into RetrievedChunk.source_url
+    → citation chips showed dead links to customers.
+    - V4_SELECT now includes "parent_url".
+    - Every RetrievedChunk construction uses:
+        source_url = r.get("parent_url") or r["source_url"]
+      so dropdown chunks cite the real navigable page; standard chunks
+      are unaffected (parent_url is "" → falls back to source_url).
+    - BASE_SELECT fallback does not include parent_url (old indexes
+      won't have the field) — safe, falls back to source_url as before.
 v1.4.0 — July 2026 | Mukesh Kund
          V3_SELECT renamed to V4_SELECT. All stale v3 references
          updated to v4. Comments corrected to reflect that the
@@ -365,7 +377,7 @@ def retriever_node(state: AgentState) -> AgentState:
         BASE_SELECT = [
             "chunk_id", "content", "source_url", "section", "title",
         ]
-        V4_SELECT = BASE_SELECT + ["title_questions"]
+        V4_SELECT = BASE_SELECT + ["title_questions", "parent_url"]
 
         search_kwargs = dict(
             search_text=state.query,
@@ -460,7 +472,9 @@ def retriever_node(state: AgentState) -> AgentState:
                 chunk_by_key[cid] = RetrievedChunk(
                     chunk_id=cid,
                     content=r["content"],
-                    source_url=r["source_url"],
+                    # v1.5.0: prefer parent_url for dropdown state chunks
+                    # so citation chips never show dead #state= fragments.
+                    source_url=r.get("parent_url") or r["source_url"],
                     section=r.get("section", ""),
                     title=r.get("title", ""),
                     score=s,
@@ -516,16 +530,18 @@ def retriever_node(state: AgentState) -> AgentState:
                 result.get("@search.rerankerScore")
                 or result.get("@search.score", 0.0)
             )
-            if url not in seen_urls:
+            # v1.5.0: use parent_url if set (dropdown state chunks)
+            citation_url = result.get("parent_url") or url
+            if citation_url not in seen_urls:
                 candidates.append(RetrievedChunk(
                     chunk_id=result["chunk_id"],
                     content=result["content"],
-                    source_url=url,
+                    source_url=citation_url,
                     section=result.get("section", ""),
                     title=result.get("title", ""),
                     score=score,
                 ))
-                seen_urls.add(url)
+                seen_urls.add(citation_url)
 
         # ── Relevance score filter ────────────────────────────
         if candidates:

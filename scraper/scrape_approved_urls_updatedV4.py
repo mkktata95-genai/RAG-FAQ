@@ -706,6 +706,26 @@ v4.7.0 — July 2026 | Mukesh Kund
            METADATA_VERSION — bump when WHAT metadata we extract changes
            (Both are developer-bumped only — never auto-increment)
 
+v4.8.0 — July 2026 | Mukesh Kund
+    FIX 1 — parent_url on dropdown state dicts.
+    Dropdown state entries were stored with url=state_url (#state=...)
+    only. No clean parent URL was persisted, so retriever.py passed
+    fragment URLs straight into citation chips — dead links for customers.
+    - Added "parent_url": url to every dropdown state dict in
+      _scrape_dropdown_states_playwright(). url here is already the
+      clean base URL (no fragment).
+    FIX 2 — URL dedup before JSON save (main scrape loop).
+    The scraper accumulated all results and called save_scraped_pages()
+    with no URL uniqueness check. If the Excel had duplicate URL rows
+    (different Category column), or normalize_url() resolved two entries
+    to the same URL, both were written to JSON → indexer doubled every
+    chunk for that page (confirmed: 5548 removable duplicates in v4 index
+    from 5911 total docs, single run_id). Fix: deduplicate results by
+    "url" key before saving; suppressed duplicates are logged as warnings.
+    NOTE: load_approved_pages() already deduplicates the Excel input by
+    normalised URL. This is a belt-and-braces guard for post-normalisation
+    collisions (e.g. http vs https, trailing slash) and for dropdown state
+    entries sharing a parent URL fragment key.
 v4.7.1 — July 2026 | Mukesh Kund
          Bugfix: read_time_mins stored as str not int (schema audit).
 
@@ -2207,6 +2227,10 @@ def _scrape_dropdown_states_playwright(
 
                             results.append({
                                 "url":              state_url,
+                                # v4.8.0: clean parent URL (no #state= fragment)
+                                # passed through to indexer → retriever so
+                                # citation chips show the real page URL.
+                                "parent_url":       url,
                                 "title":            f"{base_title} — {opt_text}",
                                 "section":          base_page_data["section"],
                                 "content":          content,
@@ -2818,6 +2842,29 @@ async def main():
     finally:
         # Always stop Chrome CDP subprocess if we started it
         _stop_chrome_cdp()
+
+    # ── v4.8.0: Dedup results by URL before save ────────
+    # Belt-and-braces guard: load_approved_pages() already deduplicates
+    # the Excel input by normalised URL, but post-normalisation collisions
+    # (http/https, trailing slash) or scraper retries can still produce
+    # duplicate entries. Keeps first occurrence; logs warnings for dropped.
+    _seen_urls: set = set()
+    _deduped:   list = []
+    for _entry in results:
+        _key = _entry.get("url", "")
+        if _key and _key not in _seen_urls:
+            _seen_urls.add(_key)
+            _deduped.append(_entry)
+        elif _key:
+            log.warning("duplicate_url_suppressed_before_save", url=_key)
+    if len(_deduped) < len(results):
+        log.info(
+            "dedup_results_summary",
+            original=len(results),
+            kept=len(_deduped),
+            removed=len(results) - len(_deduped),
+        )
+    results = _deduped
 
     # ── Save output ─────────────────────────────────────
     # v2.0.0: save_scraped_pages() abstracts local file vs

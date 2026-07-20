@@ -914,6 +914,24 @@ v5.8.0 — July 2026 | Mukesh Kund
            indexed_at       — auto timestamp per upload
            scraped_at       — from scraper JSON
 
+v5.9.0 — July 2026 | Mukesh Kund
+         FIX 1 — parent_url schema field + chunk pass-through.
+         Dropdown state pages were indexed with source_url=#state=...
+         fragment URL. retriever.py then passed this straight into
+         citation chips → dead links for customers.
+         - Added parent_url SimpleField (filterable, retrievable) to schema.
+         - chunk_pages(): both dropdown-atomic and regular paths now include
+           "parent_url": page.get("parent_url", "") in every chunk dict.
+         - For standard pages parent_url is always "" (field present but empty).
+         - retriever.py reads parent_url; if non-empty uses it as source_url
+           for the RetrievedChunk → citation chip shows clean parent URL.
+         FIX 2 — URL dedup guard in chunk_pages().
+         Belt-and-braces: if scraper JSON contains duplicate URL entries
+         (e.g. from a retry or normalisation collision not caught upstream),
+         chunk_pages() now deduplicates by page["url"] before chunking.
+         Keeps first occurrence; logs warnings for dropped pages.
+         Mirrors the same guard added to scraper v4.8.0 so the constraint
+         is enforced at both layers.
 v5.8.7 — July 2026 | Mukesh Kund
          Bugfix: read_time_mins int → str cast (upload failure).
 
@@ -1658,6 +1676,22 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
     _index_run_id  = str(uuid.uuid4())
     _indexed_at    = datetime.now(timezone.utc).isoformat()
 
+    # v5.9.0: URL dedup guard
+    _seen_pu: set = set()
+    _dedup_pages: list = []
+    for _p in pages:
+        _pu = _p.get("url", "")
+        if _pu and _pu not in _seen_pu:
+            _seen_pu.add(_pu)
+            _dedup_pages.append(_p)
+        elif _pu:
+            log.warning("chunk_pages_duplicate_url_skipped", url=_pu)
+    if len(_dedup_pages) < len(pages):
+        log.info("chunk_pages_dedup_summary",
+                 original=len(pages), kept=len(_dedup_pages),
+                 removed=len(pages)-len(_dedup_pages))
+    pages = _dedup_pages
+
     chunks = []
     for page in pages:
         content  = page.get("content", "").strip()
@@ -1707,6 +1741,8 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
                     "content_hash":         page_hash,
                     "augmented_questions":  "",
                     "title_questions":      "",
+                    # v5.9.0: clean parent URL for dropdown state chunks
+                    "parent_url":           page.get("parent_url", ""),
                     # ── Versioning fields (v5.7.0 / v5.8.0) ────
                     "pipeline_version":  PIPELINE_VERSION,
                     "index_run_id":      _index_run_id,
@@ -1767,6 +1803,8 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
                 # the field is always present in every uploaded
                 # document regardless of augmentation success.
                 "title_questions":      "",
+                # v5.9.0: clean parent URL for dropdown state chunks
+                "parent_url":           page.get("parent_url", ""),
 
                 # ── Versioning fields (v5.7.0 / v5.8.0) ────────
                 # pipeline_version / index_run_id / indexed_at:
@@ -3395,6 +3433,19 @@ def create_or_update_index(fresh: bool = False):
             type=SearchFieldDataType.String,
             searchable=False,
             filterable=True,   # v4.0.0: UI can filter by read time
+            sortable=False,
+            facetable=False,
+            retrievable=True,
+        ),
+        # v5.9.0: clean base URL for dropdown state pages.
+        # "" for all standard pages. retriever.py prefers this
+        # over source_url when non-empty so citation chips never
+        # show dead #state= fragment links.
+        SimpleField(
+            name="parent_url",
+            type=SearchFieldDataType.String,
+            searchable=False,
+            filterable=True,
             sortable=False,
             facetable=False,
             retrievable=True,
