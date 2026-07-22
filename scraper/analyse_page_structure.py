@@ -239,10 +239,12 @@ def summarise(elements: list[dict], url: str, content_length: int):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url",  default="fund-changes",
-                        help="URL fragment to match (default: fund-changes)")
+    parser.add_argument("--url",  default=None,
+                        help="URL fragment to match (default: all oversized pages)")
     parser.add_argument("--json", default=None,
                         help="Path to scraper JSON (default: latest in scraper/data/)")
+    parser.add_argument("--min-chunks", type=int, default=50,
+                        help="Min estimated chunks to include (default: 50)")
     args = parser.parse_args()
 
     # Find JSON
@@ -258,16 +260,36 @@ def main():
 
     data = json.loads(json_path.read_text(encoding="utf-8"))
 
+    CHUNK_SIZE, CHUNK_OVERLAP = 1600, 200
+    effective = CHUNK_SIZE - CHUNK_OVERLAP
+
+    def est_chunks(content_len):
+        return max(1, (content_len - CHUNK_OVERLAP) // effective)
+
     # Filter pages
-    pages = [d for d in data
-             if args.url in d.get("url", "")
-             and not d.get("dropdown_state", "")]
+    pages = []
+    for d in data:
+        if d.get("dropdown_state", ""):
+            continue
+        url     = d.get("url", "")
+        content = d.get("content", "")
+        clen    = d.get("content_length", len(content))
+        if args.url and args.url not in url:
+            continue
+        if not args.url and est_chunks(clen) < args.min_chunks:
+            continue
+        pages.append(d)
+
+    # Sort by content length descending
+    pages.sort(key=lambda d: -d.get("content_length", len(d.get("content",""))))
 
     if not pages:
-        print(f"No pages matching '{args.url}' found.")
+        print(f"No pages found matching criteria.")
         return
 
-    print(f"Found {len(pages)} page(s) matching '{args.url}'\n")
+    label = f"'{args.url}'" if args.url else f"est_chunks >= {args.min_chunks}"
+    print(f"Found {len(pages)} page(s) matching {label}\n")
+
     for page in pages:
         content = page.get("content", "")
         elements = analyse_content(content)
