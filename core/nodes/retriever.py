@@ -133,6 +133,33 @@ v1.3.0 — July 2026 | Mukesh Kund
          - was: load_dotenv() — no args, no override
          - now: load_dotenv(find_dotenv(usecwd=False), override=True)
 
+v1.6.0 — July 2026 | Mukesh Kund
+         Selective semantic reranker gate — should_use_semantic().
+
+         PROBLEM:
+         - use_semantic = bool(SEMANTIC_CONFIG) fired on every query.
+         - Free tier (1,000 queries/month) exhausted immediately.
+         - Simple factual queries ("What is a Stocks and Shares ISA?")
+           were classified BROAD (due to "what is a" signal) and
+           passed through the semantic reranker unnecessarily.
+
+         FIX:
+         - Added should_use_semantic(state) function with 7-rule
+           priority chain. Semantic ON for: safety-critical queries,
+           classifier failures, conversational follow-ups, complex/
+           comparative signals, low confidence (<0.85). Semantic OFF
+           for short simple SPECIFIC queries (≤8 words). Default ON.
+         - Replaces use_semantic = bool(SEMANTIC_CONFIG) (always on).
+         - Expected ~60-70% reduction in semantic reranker calls.
+
+         RELATED CHANGES:
+         - schemas.py: Added confidence: float = 1.0 to AgentState.
+         - classifier_node.py: state.confidence set on both normal
+           path and exception fallback (0.0 → semantic defaults ON).
+
+         ROLLBACK:
+         - Revert use_semantic line to: use_semantic = bool(SEMANTIC_CONFIG)
+
 v1.5.0 — July 2026 | Mukesh Kund
     FIX — parent_url-aware citation URL.
     Dropdown state pages are indexed with source_url=#state=... fragment.
@@ -253,6 +280,63 @@ def get_search_client() -> SearchClient:
     return _search_client
 
 
+def should_use_semantic(state) -> bool:
+    """
+    v1.6.0 — Selective semantic reranker gate.
+
+    Azure semantic reranker (L2) is expensive and quota-limited.
+    Only activate it when hybrid search genuinely needs help:
+    complex, ambiguous, or multi-concept queries.
+
+    Priority order (first match wins):
+    1. Safety-critical queries → always ON (hard invariant).
+    2. Classifier failed (confidence=0.0) → ON (safe default).
+    3. Conversation follow-up (history present) → ON (needs context).
+    4. Complex/comparative signals in query text → ON.
+    5. Low classifier confidence (<0.85) → ON (ambiguous intent).
+    6. Short simple queries (≤8 words, SPECIFIC) → OFF.
+    7. Default → ON (safe fallback for anything uncategorised).
+    """
+    if not SEMANTIC_CONFIG:
+        return False
+
+    # 1. Safety-critical — always use semantic for best retrieval
+    if state.needs_disclaimer or getattr(state, "_bereavement", False):
+        return True
+
+    # 2. Classifier failed — unknown complexity, default to ON
+    if getattr(state, "confidence", 1.0) == 0.0:
+        return True
+
+    # 3. Conversational follow-up — context-dependent, needs semantic
+    if state.conversation_history:
+        return True
+
+    # 4. Complex/comparative/conditional signals
+    COMPLEX_SIGNALS = [
+        "difference between", "compare", "versus", " vs ",
+        "what happens if", "what would", "if i ", "when i ",
+        "and also", "as well as", "both", "all types",
+        "better", "should i", "which is best", "which is better",
+        "how does", "why does", "why would",
+    ]
+    query_lower = state.query.lower()
+    if any(sig in query_lower for sig in COMPLEX_SIGNALS):
+        return True
+
+    # 5. Low confidence — ambiguous intent, semantic adds value
+    if getattr(state, "confidence", 1.0) < 0.85:
+        return True
+
+    # 6. Short simple queries — hybrid alone is sufficient
+    word_count = len(query_lower.split())
+    if word_count <= 8 and (state.query_type or "SPECIFIC") == "SPECIFIC":
+        return False
+
+    # 7. Default — ON
+    return True
+
+
 def rerank_chunks(
     chunks: list[RetrievedChunk],
     query: str,
@@ -365,7 +449,7 @@ def retriever_node(state: AgentState) -> AgentState:
             fields="embedding",
         )
 
-        use_semantic = bool(SEMANTIC_CONFIG)
+        use_semantic = should_use_semantic(state)   # v1.6.0 — selective gate
         query_type   = state.query_type or "SPECIFIC"
 
         # ── Select fields ─────────────────────────────────────

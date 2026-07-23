@@ -135,6 +135,7 @@ class AgentState(BaseModel):
     # Classification (v1.2.0 — set by classifier_node)
     intent: str = ""
     query_type: str = ""
+    confidence: float = 1.0  # v1.3.0 — classifier confidence (0.0–1.0)
     # Generation
     raw_response: str | None = None
     model_used: str | None = None

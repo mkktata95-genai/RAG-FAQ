@@ -77,23 +77,6 @@ v1.0.0 — July 2026 | Mukesh Kund
          - AZURE_OPENAI_DEPLOYMENT_CLASSIFICATION = gpt-4o-mini
            (separate env var, separate from DEPLOYMENT_FAST)
 
-v1.2.0 — July 2026 | Mukesh Kund
-         GPT-5 compatibility + model-agnostic API call helper.
-
-         WHAT CHANGED:
-         - Added _build_create_kwargs(model, max_tokens, temperature)
-           helper that returns correct OpenAI kwargs for both model
-           families:
-             GPT-4 family → max_tokens + temperature
-             GPT-5 family → max_completion_tokens only (no temperature)
-         - classify_intent() now calls **_build_create_kwargs(...)
-           instead of hardcoded max_tokens / temperature kwargs.
-         - Backwards compatible: env var swap to any gpt-4* model
-           continues to work without code change.
-
-         ROLLBACK: revert to v1.1.0 — restore max_tokens=50,
-         temperature=0.0 directly in the completions.create() call.
-
 v1.1.0 — July 2026 | Mukesh Kund
          Expanded OBVIOUS_GREETINGS / FAREWELLS / THANKS sets
          (companion change to supervisor.py v1.8.0)
@@ -128,38 +111,6 @@ DEPLOYMENT_CLASSIFICATION = os.getenv(
     "AZURE_OPENAI_DEPLOYMENT_CLASSIFICATION",
     "gpt-4o-mini",
 )
-
-# ── Model-agnostic API kwargs helper ─────────────────────────
-def _build_create_kwargs(
-    model: str,
-    max_tokens: int,
-    temperature: float | None = None,
-) -> dict:
-    """Return OpenAI completions.create() kwargs compatible with both
-    GPT-4 and GPT-5 model families.
-
-    GPT-4 family (gpt-4*): supports max_tokens and temperature.
-    GPT-5 family (gpt-5*, o*, etc.): uses max_completion_tokens;
-        temperature is not supported and must be omitted.
-
-    Usage:
-        client.chat.completions.create(
-            model=deployment,
-            messages=[...],
-            **_build_create_kwargs(deployment, 50, 0.0),
-        )
-    """
-    is_gpt4 = "gpt-4" in model.lower()
-    kwargs: dict = {}
-    if is_gpt4:
-        kwargs["max_tokens"] = max_tokens
-        if temperature is not None:
-            kwargs["temperature"] = temperature
-    else:
-        kwargs["max_completion_tokens"] = max_tokens
-        # GPT-5 / reasoning models do not accept temperature
-    return kwargs
-
 
 # ── Singleton client ──────────────────────────────────────────
 _credential:    DefaultAzureCredential | None = None
@@ -520,7 +471,8 @@ def classify_intent(query: str) -> tuple[str, float]:
                 {"role": "system", "content": INTENT_SYSTEM_PROMPT},
                 {"role": "user",   "content": query},
             ],
-            **_build_create_kwargs(DEPLOYMENT_CLASSIFICATION, 50, 0.0),
+            max_tokens=50,
+            temperature=0.0,
         )
         raw   = response.choices[0].message.content.strip()
         clean = raw
@@ -706,8 +658,9 @@ def classifier_node(state: AgentState) -> AgentState:
         query_type = classify_query_type(state.query)
 
         # ── Step 5: Set state fields ──────────────────────────
-        state.intent     = intent
-        state.query_type = query_type
+        state.intent      = intent
+        state.query_type  = query_type
+        state.confidence  = confidence  # v1.x.0 — used by retriever semantic gate
 
         latency = (time.time() - start) * 1000
         state.latency_ms["classifier"] = latency
@@ -733,7 +686,8 @@ def classifier_node(state: AgentState) -> AgentState:
             request_id=state.request_id,
             fallback="INSURANCE/SPECIFIC",
         )
-        state.intent     = "INSURANCE"
-        state.query_type = "SPECIFIC"
+        state.intent      = "INSURANCE"
+        state.query_type  = "SPECIFIC"
+        state.confidence  = 0.0  # unknown — semantic gate will default to ON
 
     return state
