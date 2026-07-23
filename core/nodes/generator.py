@@ -541,6 +541,26 @@ v2.2.0 — July 2026 | Mukesh Kund
            patterns added (e.g. "will my pension be enough",
            "enough to retire", "am i on track", "better than").
 
+v2.4.0 — July 2026 | Mukesh Kund
+         GPT-5 compatibility + model-agnostic API call helper.
+
+         WHAT CHANGED:
+         - Added _build_create_kwargs(model, max_tokens, temperature)
+           helper (same pattern as classifier_node.py v1.2.0,
+           cache_check.py v1.6.0).
+         - generator_node() streaming call now uses
+           **_build_create_kwargs(deployment, max_tokens, 0.1)
+           replacing hardcoded max_tokens / temperature kwargs.
+         - GPT-4 family → max_tokens + temperature.
+           GPT-5 family → max_completion_tokens, no temperature.
+         - Dynamic max_tokens variable (BROAD=1200, SPECIFIC=800)
+           is passed into helper unchanged — routing logic unaffected.
+         - Backwards compatible: DEPLOYMENT_MAIN / DEPLOYMENT_FAST
+           env var swap to any gpt-4* restores original behaviour.
+
+         ROLLBACK: revert to v2.3.0 — restore max_tokens=max_tokens,
+         temperature=0.1 directly in the streaming create() call.
+
 v2.3.0 — July 2026 | Mukesh Kund
          True token streaming + KV cache observability
 
@@ -617,6 +637,34 @@ DEPLOYMENT_MAIN       = os.getenv("AZURE_OPENAI_DEPLOYMENT_MAIN", "gpt-4.1")
 # DEPLOYMENT_FAST = gpt-4o throughout the pipeline per the
 # finalised model assignment decision (FCA disclaimer consistency).
 DEPLOYMENT_FAST       = os.getenv("AZURE_OPENAI_DEPLOYMENT_FAST", "gpt-4o")
+
+
+# ── Model-agnostic API kwargs helper ─────────────────────────
+def _build_create_kwargs(
+    model: str,
+    max_tokens: int,
+    temperature: float | None = None,
+) -> dict:
+    """Return OpenAI completions.create() kwargs compatible with both
+    GPT-4 and GPT-5 model families.
+
+    GPT-4 family (gpt-4*): supports max_tokens and temperature.
+    GPT-5 family (gpt-5*, o*, etc.): uses max_completion_tokens;
+        temperature is not supported and must be omitted.
+
+    The dynamic max_tokens value (BROAD=1200, SPECIFIC=800) is
+    passed through unchanged — routing logic is unaffected.
+    """
+    is_gpt4 = "gpt-4" in model.lower()
+    kwargs: dict = {}
+    if is_gpt4:
+        kwargs["max_tokens"] = max_tokens
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+    else:
+        kwargs["max_completion_tokens"] = max_tokens
+    return kwargs
+
 
 # ── Singleton client ──────────────────────────────────────────
 _credential:    DefaultAzureCredential | None = None
@@ -1014,8 +1062,7 @@ def generator_node(state: AgentState) -> AgentState:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": user_prompt},
             ],
-            max_tokens=max_tokens,
-            temperature=0.1,
+            **_build_create_kwargs(deployment, max_tokens, 0.1),
             stream=True,
             stream_options={"include_usage": True},
         )

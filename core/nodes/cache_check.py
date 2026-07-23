@@ -80,6 +80,21 @@ v1.4.0 — June 2026 | Mukesh Kund
          - The embedding generated in Step 1 is still stored on
            state._query_embedding for retriever reuse
 
+v1.6.0 — July 2026 | Mukesh Kund
+         GPT-5 compatibility + model-agnostic API call helper.
+
+         WHAT CHANGED:
+         - Added _build_create_kwargs(model, max_tokens, temperature)
+           helper (same pattern as classifier_node.py v1.2.0).
+         - canonical_rewrite() now uses **_build_create_kwargs(...)
+           replacing hardcoded max_tokens=30 / temperature=0.0.
+         - GPT-4 family → max_tokens + temperature.
+           GPT-5 family → max_completion_tokens, no temperature.
+         - Backwards compatible across model families via env var.
+
+         ROLLBACK: revert to v1.5.0 — restore max_tokens=30,
+         temperature=0.0 directly in the completions.create() call.
+
 v1.5.0 — June 2026 | Mukesh Kund
          Skip semantic cache entirely for sensitive disclosures
          (needs_empathy queries)
@@ -151,6 +166,31 @@ log = structlog.get_logger()
 # ── Config ────────────────────────────────────────────────────
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
 DEPLOYMENT_FAST       = os.getenv("AZURE_OPENAI_DEPLOYMENT_FAST", "gpt-4o-mini")
+
+
+# ── Model-agnostic API kwargs helper ─────────────────────────
+def _build_create_kwargs(
+    model: str,
+    max_tokens: int,
+    temperature: float | None = None,
+) -> dict:
+    """Return OpenAI completions.create() kwargs compatible with both
+    GPT-4 and GPT-5 model families.
+
+    GPT-4 family (gpt-4*): supports max_tokens and temperature.
+    GPT-5 family (gpt-5*, o*, etc.): uses max_completion_tokens;
+        temperature is not supported and must be omitted.
+    """
+    is_gpt4 = "gpt-4" in model.lower()
+    kwargs: dict = {}
+    if is_gpt4:
+        kwargs["max_tokens"] = max_tokens
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+    else:
+        kwargs["max_completion_tokens"] = max_tokens
+    return kwargs
+
 
 # ── Singleton client ──────────────────────────────────────────
 _credential:    DefaultAzureCredential | None = None
@@ -410,8 +450,7 @@ def get_canonical_form(query: str) -> str | None:
                     "content": query,
                 },
             ],
-            max_tokens=30,
-            temperature=0.0,
+            **_build_create_kwargs(DEPLOYMENT_FAST, 30, 0.0),
         )
         canonical = response.choices[0].message.content.strip()
 
