@@ -15,6 +15,38 @@ Pipeline position:
 CHANGE LOG
 ═══════════════════════════════════════════════════════════════
 
+v1.2.0 — July 2026 | Mukesh Kund
+         GPT-5 compatibility + BROAD_SIGNALS fix.
+
+         FIX 1 — max_tokens → max_completion_tokens, temperature removed:
+         - GPT-5.1 (and gpt-5-nano) reject max_tokens and temperature
+           with HTTP 400 invalid_request_error.
+         - Every classifier call was failing with intent_classification_failed
+           and falling back to INSURANCE/confidence=1.0.
+         - Fix: max_tokens=50 → max_completion_tokens=50, temperature removed.
+
+         FIX 2 — "what is a/an/the" removed from BROAD_SIGNALS:
+         - "What is a Stocks and Shares ISA?" was matching "what is a"
+           → classified BROAD → semantic reranker fired unnecessarily.
+         - These are simple single-concept definition queries — hybrid
+           search handles them perfectly without semantic reranker.
+         - Removed: "what is a", "what is an", "what is the"
+         - Kept: "what are" (multi-item overview — genuinely BROAD)
+
+         ALSO: state.confidence now set on both normal and fallback paths
+         (see schemas.py v1.3.0 — confidence field added to AgentState).
+
+         ROLLBACK:
+         - Revert max_completion_tokens → max_tokens, add temperature=0.0
+         - Re-add "what is a", "what is an", "what is the" to BROAD_SIGNALS
+
+v1.1.0 — July 2026 | Mukesh Kund
+         Expanded OBVIOUS_GREETINGS / FAREWELLS / THANKS sets
+         (companion change to supervisor.py v1.8.0)
+
+         Sets kept in sync with supervisor.py. See supervisor.py
+         v1.8.0 CHANGE LOG for full rationale and phrase list.
+
 v1.0.0 — July 2026 | Mukesh Kund
          New node — extracted from supervisor.py (v1.6.0) as
          part of Sprint 1 pipeline refactor.
@@ -76,13 +108,6 @@ v1.0.0 — July 2026 | Mukesh Kund
          DEPLOYMENT:
          - AZURE_OPENAI_DEPLOYMENT_CLASSIFICATION = gpt-4o-mini
            (separate env var, separate from DEPLOYMENT_FAST)
-
-v1.1.0 — July 2026 | Mukesh Kund
-         Expanded OBVIOUS_GREETINGS / FAREWELLS / THANKS sets
-         (companion change to supervisor.py v1.8.0)
-
-         Sets kept in sync with supervisor.py. See supervisor.py
-         v1.8.0 CHANGE LOG for full rationale and phrase list.
 
 ═══════════════════════════════════════════════════════════════
 """
@@ -369,7 +394,7 @@ BROAD_SIGNALS = [
     # Overview / types questions
     "what types", "what type of", "what are the",
     "what kinds", "what kind of",
-    "what are", "what is a", "what is an", "what is the",
+    "what are",
     # Explanation / comparison
     "overview", "explain", "tell me",
     "difference between", "compare", "comparison",
@@ -471,8 +496,7 @@ def classify_intent(query: str) -> tuple[str, float]:
                 {"role": "system", "content": INTENT_SYSTEM_PROMPT},
                 {"role": "user",   "content": query},
             ],
-            max_tokens=50,
-            temperature=0.0,
+            max_completion_tokens=50,
         )
         raw   = response.choices[0].message.content.strip()
         clean = raw

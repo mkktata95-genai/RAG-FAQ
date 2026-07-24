@@ -133,33 +133,6 @@ v1.3.0 — July 2026 | Mukesh Kund
          - was: load_dotenv() — no args, no override
          - now: load_dotenv(find_dotenv(usecwd=False), override=True)
 
-v1.6.0 — July 2026 | Mukesh Kund
-         Selective semantic reranker gate — should_use_semantic().
-
-         PROBLEM:
-         - use_semantic = bool(SEMANTIC_CONFIG) fired on every query.
-         - Free tier (1,000 queries/month) exhausted immediately.
-         - Simple factual queries ("What is a Stocks and Shares ISA?")
-           were classified BROAD (due to "what is a" signal) and
-           passed through the semantic reranker unnecessarily.
-
-         FIX:
-         - Added should_use_semantic(state) function with 7-rule
-           priority chain. Semantic ON for: safety-critical queries,
-           classifier failures, conversational follow-ups, complex/
-           comparative signals, low confidence (<0.85). Semantic OFF
-           for short simple SPECIFIC queries (≤8 words). Default ON.
-         - Replaces use_semantic = bool(SEMANTIC_CONFIG) (always on).
-         - Expected ~60-70% reduction in semantic reranker calls.
-
-         RELATED CHANGES:
-         - schemas.py: Added confidence: float = 1.0 to AgentState.
-         - classifier_node.py: state.confidence set on both normal
-           path and exception fallback (0.0 → semantic defaults ON).
-
-         ROLLBACK:
-         - Revert use_semantic line to: use_semantic = bool(SEMANTIC_CONFIG)
-
 v1.5.0 — July 2026 | Mukesh Kund
     FIX — parent_url-aware citation URL.
     Dropdown state pages are indexed with source_url=#state=... fragment.
@@ -187,6 +160,33 @@ v1.4.0 — July 2026 | Mukesh Kund
            changelog v1.3.0 scoring_profile reference updated
 
          NO logic changes — retrieval behaviour identical.
+
+v1.6.0 — July 2026 | Mukesh Kund
+         Selective semantic reranker gate — should_use_semantic().
+
+         PROBLEM:
+         - use_semantic = bool(SEMANTIC_CONFIG) fired on every query.
+         - Free tier (1,000 queries/month) exhausted immediately.
+         - Simple factual queries ("What is a Stocks and Shares ISA?")
+           were classified BROAD (due to "what is a" signal) and
+           passed through the semantic reranker unnecessarily.
+
+         FIX:
+         - Added should_use_semantic(state) function with 7-rule
+           priority chain. Semantic ON for: safety-critical queries,
+           classifier failures, conversational follow-ups, complex/
+           comparative signals, low confidence (<0.85). Semantic OFF
+           for short simple SPECIFIC queries (≤8 words). Default ON.
+         - Replaces use_semantic = bool(SEMANTIC_CONFIG) (always on).
+         - Expected ~60-70% reduction in semantic reranker calls.
+
+         RELATED CHANGES:
+         - schemas.py: Added confidence: float = 1.0 to AgentState.
+         - classifier_node.py: state.confidence set on both normal
+           path and exception fallback (0.0 → semantic defaults ON).
+
+         ROLLBACK:
+         - Revert use_semantic line to: use_semantic = bool(SEMANTIC_CONFIG)
 
 ═══════════════════════════════════════════════════════════════
 """
