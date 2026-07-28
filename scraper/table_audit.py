@@ -249,12 +249,37 @@ def print_step1(results: list):
 
 # ── STEP 2: JS interaction scan ────────────────────────────────────────────────
 
+_COOKIE_LABEL_SIGNALS = {
+    "your privacy", "strictly necessary", "strictly necessary cookies",
+    "performance cookies", "functional cookies", "targeting cookies",
+    "always active", "cookie", "consent",
+}
+_COOKIE_PARENT_SIGNALS = ("cookie", "consent", "privacy", "gdpr", "cmp", "onetrust")
+
+
+def _is_cookie_tablist(tablist_el) -> bool:
+    parent = tablist_el
+    for _ in range(6):
+        parent = getattr(parent, "parent", None)
+        if parent is None:
+            break
+        cls = " ".join(parent.get("class", []) or []).lower()
+        pid = (parent.get("id") or "").lower()
+        if any(sig in cls + " " + pid for sig in _COOKIE_PARENT_SIGNALS):
+            return True
+    return False
+
+
+def _is_cookie_label(label: str) -> bool:
+    lower = label.lower()
+    return any(sig in lower for sig in _COOKIE_LABEL_SIGNALS)
+
+
 def _detect_from_html(html: str) -> dict:
     """
     Detect JS-paginated tables and content tabs from rendered HTML.
-    Uses BeautifulSoup — no js_return_value dependency, works on all
-    crawl4ai versions. Reads the fully-rendered DOM crawl4ai already
-    fetched, so no extra network call.
+    Uses BeautifulSoup — no js_return_value dependency.
+    Filters cookie/consent banner tablists.
     """
     det = {
         "btable": False, "btable_pages": 0,
@@ -267,14 +292,12 @@ def _detect_from_html(html: str) -> dict:
         soup = BeautifulSoup(html, "html.parser")
 
         # ── Bootstrap-Vue b-table (JS-paginated) ─────────────────────────────
-        btables = soup.find_all(
-            "table",
-            attrs={"initialpagesize": True}
-        ) or soup.find_all("table", class_=lambda c: c and "b-table" in c)
-
+        btables = (
+            soup.find_all("table", attrs={"initialpagesize": True}) or
+            soup.find_all("table", class_=lambda c: c and "b-table" in c)
+        )
         if btables:
             det["btable"] = True
-            # Count numeric pagination buttons
             page_btns = soup.find_all(
                 lambda tag: tag.name in ("button", "li", "a")
                 and tag.get_text(strip=True).isdigit()
@@ -283,20 +306,25 @@ def _detect_from_html(html: str) -> dict:
             nums = [int(b.get_text(strip=True)) for b in page_btns]
             det["btable_pages"] = max(nums) if nums else 1
 
-        # ── Content tabs (role=tablist / nav-tabs) ────────────────────────────
-        tab_lists = (
-            soup.find_all(attrs={"role": "tablist"}) or
+        # ── Content tabs — exclude cookie/consent banner tablists ─────────────
+        all_tab_lists = (
+            soup.find_all(attrs={"role": "tablist"}) +
             soup.find_all(class_=lambda c: c and "nav-tabs" in c)
         )
-        if tab_lists:
-            tab_items = (
-                soup.find_all(attrs={"role": "tab"}) or
-                soup.select(".nav-tabs .nav-link") or
-                soup.select(".nav-tabs li a")
-            )
+        content_tab_lists = [tl for tl in all_tab_lists if not _is_cookie_tablist(tl)]
+
+        if content_tab_lists:
+            tab_items = []
+            for tl in content_tab_lists:
+                tab_items += (
+                    tl.find_all(attrs={"role": "tab"}) or
+                    tl.select(".nav-link") or
+                    tl.find_all("a")
+                )
             labels = [
                 t.get_text(strip=True) for t in tab_items
                 if 5 < len(t.get_text(strip=True)) < 100
+                and not _is_cookie_label(t.get_text(strip=True))
             ]
             if len(labels) >= 2:
                 det["tabs"]       = True

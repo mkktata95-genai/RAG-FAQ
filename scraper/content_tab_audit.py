@@ -75,6 +75,36 @@ SEP = "=" * 70
 
 _NAV_LABELS = {"home", "about", "contact", "menu", "next", "back", "more"}
 
+# Cookie/consent banner label signals — skip any tablist with these labels
+_COOKIE_LABEL_SIGNALS = {
+    "your privacy", "strictly necessary", "strictly necessary cookies",
+    "performance cookies", "functional cookies", "targeting cookies",
+    "always active", "cookie", "consent",
+}
+
+# Cookie/consent parent class/id signals
+_COOKIE_PARENT_SIGNALS = ("cookie", "consent", "privacy", "gdpr", "cmp", "onetrust")
+
+
+def _is_cookie_tablist(tablist_el) -> bool:
+    """Return True if tablist lives inside a cookie/consent banner."""
+    parent = tablist_el
+    for _ in range(6):
+        parent = getattr(parent, "parent", None)
+        if parent is None:
+            break
+        cls  = " ".join(parent.get("class", []) or []).lower()
+        pid  = (parent.get("id") or "").lower()
+        if any(sig in cls + " " + pid for sig in _COOKIE_PARENT_SIGNALS):
+            return True
+    return False
+
+
+def _is_cookie_label(label: str) -> bool:
+    """Return True if label is a cookie/consent label."""
+    lower = label.lower()
+    return any(sig in lower for sig in _COOKIE_LABEL_SIGNALS)
+
 
 # ── BeautifulSoup tab detection (replaces JS injection) ───────────────────────
 
@@ -82,6 +112,7 @@ def _detect_tabs_from_html(html: str) -> dict:
     """
     Detect content tabs from rendered HTML using BeautifulSoup.
     Uses result.html which crawl4ai always populates — no js_return_value.
+    Filters out cookie/consent banner tablists.
     """
     det = {
         "has_content_tabs":       False,
@@ -97,24 +128,33 @@ def _detect_tabs_from_html(html: str) -> dict:
     try:
         soup = BeautifulSoup(html, "html.parser")
 
-        # Find tab lists
-        tab_lists = (
-            soup.find_all(attrs={"role": "tablist"}) or
+        # Find tab lists — exclude cookie/consent banner tablists
+        all_tab_lists = (
+            soup.find_all(attrs={"role": "tablist"}) +
             soup.find_all(class_=lambda c: c and "nav-tabs" in c)
         )
-        if not tab_lists:
+        content_tab_lists = [
+            tl for tl in all_tab_lists
+            if not _is_cookie_tablist(tl)
+        ]
+        if not content_tab_lists:
             return det
 
-        # Collect tab labels
-        tab_items = (
-            soup.find_all(attrs={"role": "tab"}) or
-            soup.select(".nav-tabs .nav-link") or
-            soup.select(".nav-tabs li a")
-        )
+        # Collect tab items only from content tablists
+        tab_items = []
+        for tl in content_tab_lists:
+            tab_items += (
+                tl.find_all(attrs={"role": "tab"}) or
+                tl.select(".nav-link") or
+                tl.find_all("a")
+            )
+
+        # Filter labels — exclude cookie labels and nav labels
         labels = [
             t.get_text(strip=True) for t in tab_items
             if 5 < len(t.get_text(strip=True)) < 100
             and t.get_text(strip=True).lower() not in _NAV_LABELS
+            and not _is_cookie_label(t.get_text(strip=True))
         ]
         if len(labels) < 2:
             return det
@@ -125,8 +165,11 @@ def _detect_tabs_from_html(html: str) -> dict:
             soup.select_one(".nav-tabs .nav-link.active") or
             soup.select_one(".nav-link.active")
         )
+        active_label = active.get_text(strip=True) if active else ""
+        # Only use active label if it's not a cookie label
         det["default_tab_label"] = (
-            active.get_text(strip=True) if active else labels[0]
+            active_label if active_label and not _is_cookie_label(active_label)
+            else labels[0]
         )
 
         # Hidden tab panels + estimate content size
@@ -136,7 +179,6 @@ def _detect_tabs_from_html(html: str) -> dict:
             [p for p in soup.select(".tab-pane")
              if "active" not in (p.get("class") or [])]
         )
-        # Deduplicate by object id
         seen, unique_hidden = set(), []
         for p in hidden_panels:
             if id(p) not in seen:
