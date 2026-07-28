@@ -82,6 +82,8 @@ def get_safety_client() -> ContentSafetyClient:
         _safety_client = ContentSafetyClient(
             endpoint=SAFETY_ENDPOINT,
             credential=get_credential(),
+            retry_total=0,           # no retries — timeout=10 on
+            retry_on_status_codes=(),# analyze_text() is the hard cap
         )
         log.info(
             "safety_client_created",
