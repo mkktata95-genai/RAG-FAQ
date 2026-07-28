@@ -16,28 +16,33 @@ CHANGE LOG
 ═══════════════════════════════════════════════════════════════
 
 v1.2.0 — July 2026 | Mukesh Kund
-         GPT-5 compatibility + BROAD_SIGNALS fix.
+         GPT-5 compatibility + BROAD_SIGNALS fix + model-agnostic helper.
 
-         FIX 1 — max_tokens → max_completion_tokens, temperature removed:
-         - GPT-5.1 (and gpt-5-nano) reject max_tokens and temperature
-           with HTTP 400 invalid_request_error.
-         - Every classifier call was failing with intent_classification_failed
-           and falling back to INSURANCE/confidence=1.0.
-         - Fix: max_tokens=50 → max_completion_tokens=50, temperature removed.
+         FIX 1 — _build_create_kwargs() added (model-agnostic):
+         - Same implementation as generator.py and cache_check.py
+           for uniformity across all pipeline node files.
+         - GPT-4 family: max_tokens + temperature supported.
+         - GPT-5 family: max_completion_tokens, no temperature.
+         - classify_intent() now uses **_build_create_kwargs(...).
 
-         FIX 2 — "what is a/an/the" removed from BROAD_SIGNALS:
-         - "What is a Stocks and Shares ISA?" was matching "what is a"
-           → classified BROAD → semantic reranker fired unnecessarily.
-         - These are simple single-concept definition queries — hybrid
-           search handles them perfectly without semantic reranker.
-         - Removed: "what is a", "what is an", "what is the"
-         - Kept: "what are" (multi-item overview — genuinely BROAD)
+         FIX 2 — Robust JSON extraction for GPT-5 reasoning models:
+         - GPT-5 reasoning models prepend prose before JSON output.
+         - Old parser only handled backtick fences — broke on prose.
+         - New: find("{") / rfind("}") extraction — handles all cases:
+           plain JSON, backtick fenced, prose-prepended, reasoning chain.
+
+         FIX 3 — "what is a/an/the" removed from BROAD_SIGNALS:
+         - Simple definition queries classified BROAD unnecessarily.
+         - Caused semantic reranker to fire on trivial lookups.
+         - Removed: "what is a", "what is an", "what is the".
+         - Kept: "what are" (multi-item overview — genuinely BROAD).
 
          ALSO: state.confidence now set on both normal and fallback paths
          (see schemas.py v1.3.0 — confidence field added to AgentState).
 
          ROLLBACK:
-         - Revert max_completion_tokens → max_tokens, add temperature=0.0
+         - Replace **_build_create_kwargs(...) with max_completion_tokens=50
+         - Revert JSON extraction to backtick-only parser
          - Re-add "what is a", "what is an", "what is the" to BROAD_SIGNALS
 
 v1.1.0 — July 2026 | Mukesh Kund
@@ -140,6 +145,32 @@ DEPLOYMENT_CLASSIFICATION = os.getenv(
 # ── Singleton client ──────────────────────────────────────────
 _credential:    DefaultAzureCredential | None = None
 _openai_client: AzureOpenAI | None            = None
+
+
+def _build_create_kwargs(
+    model: str,
+    max_tokens: int,
+    temperature: float | None = None,
+) -> dict:
+    """Return OpenAI completions.create() kwargs compatible with both
+    GPT-4 and GPT-5 model families.
+
+    GPT-4 family (gpt-4*): supports max_tokens and temperature.
+    GPT-5 family (gpt-5*, o*, etc.): uses max_completion_tokens;
+        temperature is not supported and must be omitted.
+
+    Matches implementation in generator.py and cache_check.py
+    for uniformity across all pipeline node files.
+    """
+    is_gpt4 = "gpt-4" in model.lower()
+    kwargs: dict = {}
+    if is_gpt4:
+        kwargs["max_tokens"] = max_tokens
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+    else:
+        kwargs["max_completion_tokens"] = max_tokens
+    return kwargs
 
 
 def get_credential() -> DefaultAzureCredential:
@@ -496,16 +527,19 @@ def classify_intent(query: str) -> tuple[str, float]:
                 {"role": "system", "content": INTENT_SYSTEM_PROMPT},
                 {"role": "user",   "content": query},
             ],
-            max_completion_tokens=50,
+            **_build_create_kwargs(DEPLOYMENT_CLASSIFICATION, 50),
         )
         raw   = response.choices[0].message.content.strip()
-        clean = raw
-        if clean.startswith("```"):
-            clean = clean.split("```")[1]
-            if clean.startswith("json"):
-                clean = clean[4:]
 
-        result     = json.loads(clean.strip())
+        # GPT-5 reasoning models prepend prose before JSON.
+        # Extract via brace positions — robust across all model families.
+        start = raw.find("{")
+        end   = raw.rfind("}") + 1
+        if start == -1 or end == 0:
+            raise ValueError(f"No JSON object found in response: {raw[:100]}")
+        clean = raw[start:end]
+
+        result     = json.loads(clean)
         intent     = result.get("intent", "INSURANCE").upper()
         confidence = float(result.get("confidence", 1.0))
 
