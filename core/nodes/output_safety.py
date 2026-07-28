@@ -41,12 +41,14 @@ def output_safety_node(state: AgentState) -> AgentState:
                 latency_ms=latency,
             )
         else:
-            state.output_safe = True
+            state.output_safe   = True
+            state.final_response = state.raw_response  # promote to final
             log.info("output_safe", latency_ms=latency)
 
     except Exception as e:
-        # Fail open
+        # Fail open — don't block user on safety error
         log.error("output_safety_error", error=str(e))
-        state.output_safe = True
+        state.output_safe    = True
+        state.final_response = state.raw_response  # promote even on error
 
     return state
