@@ -268,7 +268,16 @@ def check_azure_content_safety(
     Layer 5: Azure Content Safety.
     Uses singleton client with DefaultAzureCredential.
     Fails open on error — never blocks user on API failure.
+
+    Timeout: 10s hard cap — prevents 32s+ hangs when RBAC is
+    misconfigured or endpoint is unreachable (confirmed via
+    check_content_safety.py diagnostic).
     """
+    # Guard: skip Layer 5 entirely if endpoint not configured
+    if not SAFETY_ENDPOINT:
+        log.debug("content_safety_skipped", reason="endpoint_not_configured")
+        return True, None
+
     if not text or not text.strip():
         return True, None
 
@@ -284,7 +293,7 @@ def check_azure_content_safety(
             ],
         )
 
-        response = client.analyze_text(request)
+        response = client.analyze_text(request, timeout=10)
 
         for result in response.categories_analysis:
             if result.severity >= BLOCK_THRESHOLD:
