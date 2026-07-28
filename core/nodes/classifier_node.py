@@ -527,7 +527,7 @@ def classify_intent(query: str) -> tuple[str, float]:
                 {"role": "system", "content": INTENT_SYSTEM_PROMPT},
                 {"role": "user",   "content": query},
             ],
-            **_build_create_kwargs(DEPLOYMENT_CLASSIFICATION, 50),
+            **_build_create_kwargs(DEPLOYMENT_CLASSIFICATION, 500),
         )
         raw   = response.choices[0].message.content.strip()
 
