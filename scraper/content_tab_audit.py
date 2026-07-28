@@ -1,5 +1,5 @@
 """
-content_tab_audit.py  v1.0.0
+content_tab_audit.py  v1.1.0
 ==============================
 Scans all approved URLs and detects pages where PROSE CONTENT
 is hidden behind content tabs (not contact-routing dropdowns,
@@ -8,7 +8,6 @@ not JS-paginated tables — purely tab-switched prose sections).
 Examples:
   equity-release  → 4 tabs: Equity release explained | Interest roll-up |
                              Payment options | Long-term impacts
-  webinar pages   → may have transcript tabs
 
 WHY THIS MATTERS
 ----------------
@@ -20,8 +19,8 @@ WHAT THIS SCRIPT DETECTS
 -------------------------
   - Pages with role="tablist" or .nav-tabs containing CONTENT (not nav)
   - Tab labels (so we know what content is hidden)
-  - Estimated content size per hidden tab (JS injection)
-  - Whether default tab is the only content captured currently
+  - Estimated content size per hidden tab (BeautifulSoup on rendered HTML)
+  - Default tab label (what IS currently captured)
 
 WHAT THIS SCRIPT DOES NOT FLAG
 -------------------------------
@@ -42,8 +41,11 @@ USAGE
 
 CHANGELOG
 ---------
-v1.0.0 — Initial content tab auditor. Detects prose-content tabs,
-          estimates hidden content size, JSON + CSV output.
+v1.1.0 — Replaced JS injection + js_return_value with BeautifulSoup HTML
+          parsing on result.html — works on all crawl4ai versions. Moved
+          imports to top level for fast failure. Fixed CDP already-running
+          handling.
+v1.0.0 — Initial content tab auditor.
 """
 
 import argparse
@@ -55,92 +57,115 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-SEP  = "=" * 70
-SEP2 = "-" * 50
+# ── Top-level imports (fail fast, not silently inside async) ──────────────────
+try:
+    from bs4 import BeautifulSoup
+    from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
+    from scraper.scrape_approved_urls_updatedV4 import (
+        _make_browser_config,
+        _start_chrome_cdp,
+        load_approved_pages,
+    )
+    _SCRAPER_OK = True
+except ImportError as e:
+    _SCRAPER_OK = False
+    _IMPORT_ERR = str(e)
 
-# ── JS detection ───────────────────────────────────────────────────────────────
+SEP = "=" * 70
 
-_JS_TAB_DETECT = """
-() => {
-    const result = {
-        has_content_tabs: false,
-        tab_count: 0,
-        tab_labels: [],
-        hidden_tab_count: 0,
-        default_tab_label: '',
-        estimated_hidden_chars: 0,
-        evidence: ''
-    };
+_NAV_LABELS = {"home", "about", "contact", "menu", "next", "back", "more"}
 
-    // Find all tab lists
-    const tabLists = document.querySelectorAll(
-        '[role="tablist"], .nav-tabs, ul.tabs'
-    );
-    if (tabLists.length === 0) return result;
 
-    // Collect all tab items
-    const tabItems = document.querySelectorAll(
-        '[role="tab"], .nav-tabs .nav-link, .nav-tabs li a'
-    );
-    if (tabItems.length === 0) return result;
+# ── BeautifulSoup tab detection (replaces JS injection) ───────────────────────
 
-    const labels = Array.from(tabItems)
-        .map(t => t.textContent.trim())
-        .filter(t => t.length > 0 && t.length < 100);
+def _detect_tabs_from_html(html: str) -> dict:
+    """
+    Detect content tabs from rendered HTML using BeautifulSoup.
+    Uses result.html which crawl4ai always populates — no js_return_value.
+    """
+    det = {
+        "has_content_tabs":       False,
+        "tab_count":              0,
+        "tab_labels":             [],
+        "default_tab_label":      "",
+        "hidden_tab_count":       0,
+        "estimated_hidden_chars": 0,
+    }
+    if not html:
+        return det
 
-    // Filter out navigation-style tabs (too short/generic or all-caps nav items)
-    // Content tabs have descriptive labels like "Equity release explained"
-    const contentLike = labels.filter(l =>
-        l.length > 5 &&
-        !['home','about','contact','menu','next','back','more'].includes(l.toLowerCase())
-    );
+    try:
+        soup = BeautifulSoup(html, "html.parser")
 
-    if (contentLike.length < 2) return result;
+        # Find tab lists
+        tab_lists = (
+            soup.find_all(attrs={"role": "tablist"}) or
+            soup.find_all(class_=lambda c: c and "nav-tabs" in c)
+        )
+        if not tab_lists:
+            return det
 
-    // Find active (default) tab
-    const activeTab = document.querySelector(
-        '[role="tab"][aria-selected="true"], .nav-tabs .nav-link.active, .nav-link.active'
-    );
-    result.default_tab_label = activeTab
-        ? activeTab.textContent.trim()
-        : (contentLike[0] || '');
+        # Collect tab labels
+        tab_items = (
+            soup.find_all(attrs={"role": "tab"}) or
+            soup.select(".nav-tabs .nav-link") or
+            soup.select(".nav-tabs li a")
+        )
+        labels = [
+            t.get_text(strip=True) for t in tab_items
+            if 5 < len(t.get_text(strip=True)) < 100
+            and t.get_text(strip=True).lower() not in _NAV_LABELS
+        ]
+        if len(labels) < 2:
+            return det
 
-    // Find hidden tab panels — content not visible on page load
-    const hiddenPanels = document.querySelectorAll(
-        '[role="tabpanel"][hidden], [role="tabpanel"][aria-hidden="true"], ' +
-        '.tab-pane:not(.active), .tab-content .tab-pane[style*="display: none"]'
-    );
+        # Default (active) tab
+        active = (
+            soup.find(attrs={"role": "tab", "aria-selected": "true"}) or
+            soup.select_one(".nav-tabs .nav-link.active") or
+            soup.select_one(".nav-link.active")
+        )
+        det["default_tab_label"] = (
+            active.get_text(strip=True) if active else labels[0]
+        )
 
-    // Estimate chars in hidden panels
-    let hiddenChars = 0;
-    hiddenPanels.forEach(panel => {
-        hiddenChars += (panel.textContent || '').trim().length;
-    });
+        # Hidden tab panels + estimate content size
+        hidden_panels = (
+            soup.find_all(attrs={"role": "tabpanel", "hidden": True}) +
+            soup.find_all(attrs={"role": "tabpanel", "aria-hidden": "true"}) +
+            [p for p in soup.select(".tab-pane")
+             if "active" not in (p.get("class") or [])]
+        )
+        # Deduplicate by object id
+        seen, unique_hidden = set(), []
+        for p in hidden_panels:
+            if id(p) not in seen:
+                seen.add(id(p))
+                unique_hidden.append(p)
 
-    result.has_content_tabs    = true;
-    result.tab_count           = contentLike.length;
-    result.tab_labels          = contentLike.slice(0, 8);
-    result.hidden_tab_count    = hiddenPanels.length;
-    result.estimated_hidden_chars = hiddenChars;
-    result.evidence            = `${contentLike.length} content tabs found`;
+        hidden_chars = sum(len(p.get_text(strip=True)) for p in unique_hidden)
 
-    return result;
-}
-"""
+        det["has_content_tabs"]       = True
+        det["tab_count"]              = len(labels)
+        det["tab_labels"]             = labels[:8]
+        det["hidden_tab_count"]       = len(unique_hidden)
+        det["estimated_hidden_chars"] = hidden_chars
+
+    except Exception:
+        pass
+
+    return det
 
 
 # ── Scanner ────────────────────────────────────────────────────────────────────
 
 async def scan_page(crawler, page_info: dict) -> dict:
-    from crawl4ai import CrawlerRunConfig
-
     url   = page_info["url"]
     title = page_info.get("title", "")
 
     run_config = CrawlerRunConfig(
         wait_until="domcontentloaded",
         page_timeout=25000,
-        js_code=_JS_TAB_DETECT,
         verbose=False,
         excluded_tags=["script", "style"],
     )
@@ -154,29 +179,18 @@ async def scan_page(crawler, page_info: dict) -> dict:
                 "error": result.error_message,
             }
 
-        raw = (getattr(result, "js_return_value", None) or
-               getattr(result, "extracted_content", None))
-
-        if isinstance(raw, str):
-            try:
-                det = json.loads(raw)
-            except Exception:
-                det = {}
-        elif isinstance(raw, dict):
-            det = raw
-        else:
-            det = {}
+        html = getattr(result, "html", "") or ""
+        det  = _detect_tabs_from_html(html)
 
         return {
             "url":                     url,
             "title":                   title,
-            "has_content_tabs":        det.get("has_content_tabs", False),
-            "tab_count":               det.get("tab_count", 0),
-            "tab_labels":              det.get("tab_labels", []),
-            "default_tab_label":       det.get("default_tab_label", ""),
-            "hidden_tab_count":        det.get("hidden_tab_count", 0),
-            "estimated_hidden_chars":  det.get("estimated_hidden_chars", 0),
-            "evidence":                det.get("evidence", ""),
+            "has_content_tabs":        det["has_content_tabs"],
+            "tab_count":               det["tab_count"],
+            "tab_labels":              det["tab_labels"],
+            "default_tab_label":       det["default_tab_label"],
+            "hidden_tab_count":        det["hidden_tab_count"],
+            "estimated_hidden_chars":  det["estimated_hidden_chars"],
         }
 
     except Exception as e:
@@ -188,18 +202,12 @@ async def scan_page(crawler, page_info: dict) -> dict:
 
 
 async def run_scan(pages: list) -> list:
-    try:
-        from scraper.scrape_approved_urls_updatedV4 import (
-            _make_browser_config,
-            _start_chrome_cdp,
-        )
-        from crawl4ai import AsyncWebCrawler
-    except ImportError as e:
-        print(f"[ERROR] Cannot import scraper: {e}")
+    if not _SCRAPER_OK:
+        print(f"[ERROR] Import failed: {_IMPORT_ERR}")
         sys.exit(1)
 
     print("Starting Chrome CDP ...")
-    _start_chrome_cdp()
+    _start_chrome_cdp()  # no-op if already running
     browser_config = _make_browser_config()
 
     results = []
@@ -218,16 +226,14 @@ async def run_scan(pages: list) -> list:
 # ── Reporters ──────────────────────────────────────────────────────────────────
 
 def print_report(results: list):
-    tab_pages  = [r for r in results if r.get("has_content_tabs")]
-    clean      = [r for r in results if not r.get("has_content_tabs")
-                  and not r.get("error")]
-    errors     = [r for r in results if r.get("error")]
+    tab_pages = [r for r in results if r.get("has_content_tabs")]
+    clean     = [r for r in results if not r.get("has_content_tabs") and not r.get("error")]
+    errors    = [r for r in results if r.get("error")]
 
-    # Sort by hidden content size
     tab_pages_sorted = sorted(
         tab_pages,
         key=lambda x: x.get("estimated_hidden_chars", 0),
-        reverse=True
+        reverse=True,
     )
 
     print(f"\n{SEP}")
@@ -240,21 +246,19 @@ def print_report(results: list):
 
     if tab_pages_sorted:
         print(f"\n  PAGES WITH CONTENT TABS ({len(tab_pages_sorted)})")
-        print(f"  (sorted by hidden content size)\n")
+        print(f"  Sorted by hidden content size\n")
         print(f"  {'Hidden chars':>12}  {'Tabs':>4}  {'Default tab':<30}  URL")
         print(f"  {'-'*12}  {'-'*4}  {'-'*30}  {'-'*40}")
         for r in tab_pages_sorted:
-            hidden  = r.get("estimated_hidden_chars", 0)
-            n_tabs  = r.get("tab_count", 0)
-            default = r.get("default_tab_label", "")[:28]
-            url     = r["url"][:60]
-            print(f"  {hidden:>12,}  {n_tabs:>4}  {default:<30}  {url}")
+            print(f"  {r.get('estimated_hidden_chars',0):>12,}  "
+                  f"{r.get('tab_count',0):>4}  "
+                  f"{r.get('default_tab_label','')[:28]:<30}  "
+                  f"{r['url'][:60]}")
 
         print(f"\n  TAB LABELS per page:")
         for r in tab_pages_sorted[:10]:
-            labels = " | ".join(r.get("tab_labels", []))
-            print(f"    {r['url'][:60]}")
-            print(f"      Tabs: {labels}")
+            print(f"    {r['url'][:70]}")
+            print(f"      Tabs: {' | '.join(r.get('tab_labels', []))}")
 
     if errors:
         print(f"\n  ERRORS ({len(errors)}):")
@@ -265,7 +269,6 @@ def print_report(results: list):
 
 
 def print_impact(tab_pages: list):
-    """Show what ARIA is currently missing."""
     total_hidden = sum(r.get("estimated_hidden_chars", 0) for r in tab_pages)
     print(f"\n{SEP}")
     print("  CURRENT ARIA IMPACT — WHAT IS MISSING FROM INDEX")
@@ -274,8 +277,7 @@ def print_impact(tab_pages: list):
     print(f"  Total hidden content (est.) : {total_hidden:,} chars")
     print(f"  Avg hidden per page         : "
           f"{total_hidden // max(1, len(tab_pages)):,} chars")
-    print(f"\n  Scraper currently captures  : DEFAULT tab only per page")
-    print(f"  Content missed              : all non-default tabs")
+    print(f"\n  Scraper currently captures  : DEFAULT tab only")
     print(f"  Fix required                : click each tab, scrape, merge content")
     print(SEP)
 
@@ -320,21 +322,17 @@ async def main():
         print(f"[ERROR] {excel_path} not found")
         sys.exit(1)
 
+    if not _SCRAPER_OK:
+        print(f"[ERROR] Import failed: {_IMPORT_ERR}")
+        sys.exit(1)
+
     print(f"\n{SEP}")
     print("  CONTENT TAB AUDIT")
     print(SEP)
-
-    try:
-        from scraper.scrape_approved_urls_updatedV4 import load_approved_pages
-    except ImportError as e:
-        print(f"[ERROR] {e}")
-        sys.exit(1)
-
     print(f"\nLoading approved URLs from {excel_path} ...")
     pages = load_approved_pages(str(excel_path))
     pages = [p for p in pages if not p.get("dropdown_state", "")]
-    print(f"URLs to scan: {len(pages)}")
-    print("\nScanning (Chrome CDP required) ...\n")
+    print(f"URLs to scan: {len(pages)}\n")
 
     results   = await run_scan(pages)
     tab_pages = [r for r in results if r.get("has_content_tabs")]

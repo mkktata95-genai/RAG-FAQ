@@ -51,6 +51,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+# ── Top-level imports (fail fast, not silently inside async) ──────────────────
+try:
+    from bs4 import BeautifulSoup
+    from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
+    from scraper.scrape_approved_urls_updatedV4 import (
+        _make_browser_config,
+        _start_chrome_cdp,
+    )
+    _SCRAPER_OK = True
+except ImportError as e:
+    _SCRAPER_OK = False
+    _IMPORT_ERR = str(e)
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 CHUNK_SIZE    = 1600
@@ -236,71 +249,84 @@ def print_step1(results: list):
 
 # ── STEP 2: JS interaction scan ────────────────────────────────────────────────
 
-_JS_DETECT = """
-() => {
-    const r = {
-        btable: false,
-        btable_pages: 0,
-        tabs: false,
-        tab_count: 0,
-        tab_labels: [],
-        evidence: []
-    };
-
-    // Bootstrap-Vue b-table with pagination
-    const btables = document.querySelectorAll(
-        'table[initialpagesize], table.b-table, .fl-fund-list__table'
-    );
-    if (btables.length > 0) {
-        r.btable = true;
-        const numericPages = Array.from(
-            document.querySelectorAll('[aria-label*="page"], nav[aria-label*="pagination"] li')
-        ).map(b => b.textContent.trim()).filter(t => /^\\d+$/.test(t));
-        r.btable_pages = numericPages.length > 0
-            ? Math.max(...numericPages.map(Number)) : 1;
-        r.evidence.push(`b-table: ${btables.length} table(s), ~${r.btable_pages} pages`);
+def _detect_from_html(html: str) -> dict:
+    """
+    Detect JS-paginated tables and content tabs from rendered HTML.
+    Uses BeautifulSoup — no js_return_value dependency, works on all
+    crawl4ai versions. Reads the fully-rendered DOM crawl4ai already
+    fetched, so no extra network call.
+    """
+    det = {
+        "btable": False, "btable_pages": 0,
+        "tabs": False, "tab_count": 0, "tab_labels": [],
     }
+    if not html:
+        return det
 
-    // Content tabs (role=tablist, nav-tabs)
-    const tabLists = document.querySelectorAll(
-        '[role="tablist"], .nav-tabs, ul.tabs'
-    );
-    if (tabLists.length > 0) {
-        r.tabs = true;
-        const tabItems = document.querySelectorAll('[role="tab"], .nav-tabs .nav-link');
-        r.tab_count = tabItems.length;
-        r.tab_labels = Array.from(tabItems)
-            .map(t => t.textContent.trim())
-            .filter(t => t.length > 0 && t.length < 80)
-            .slice(0, 8);
-        r.evidence.push(`Tabs: ${r.tab_count} — [${r.tab_labels.join(' | ')}]`);
-    }
+    try:
+        soup = BeautifulSoup(html, "html.parser")
 
-    return r;
-}
-"""
+        # ── Bootstrap-Vue b-table (JS-paginated) ─────────────────────────────
+        btables = soup.find_all(
+            "table",
+            attrs={"initialpagesize": True}
+        ) or soup.find_all("table", class_=lambda c: c and "b-table" in c)
+
+        if btables:
+            det["btable"] = True
+            # Count numeric pagination buttons
+            page_btns = soup.find_all(
+                lambda tag: tag.name in ("button", "li", "a")
+                and tag.get_text(strip=True).isdigit()
+                and int(tag.get_text(strip=True)) > 1
+            )
+            nums = [int(b.get_text(strip=True)) for b in page_btns]
+            det["btable_pages"] = max(nums) if nums else 1
+
+        # ── Content tabs (role=tablist / nav-tabs) ────────────────────────────
+        tab_lists = (
+            soup.find_all(attrs={"role": "tablist"}) or
+            soup.find_all(class_=lambda c: c and "nav-tabs" in c)
+        )
+        if tab_lists:
+            tab_items = (
+                soup.find_all(attrs={"role": "tab"}) or
+                soup.select(".nav-tabs .nav-link") or
+                soup.select(".nav-tabs li a")
+            )
+            labels = [
+                t.get_text(strip=True) for t in tab_items
+                if 5 < len(t.get_text(strip=True)) < 100
+            ]
+            if len(labels) >= 2:
+                det["tabs"]       = True
+                det["tab_count"]  = len(labels)
+                det["tab_labels"] = labels[:8]
+
+    except Exception:
+        pass
+
+    return det
 
 
 async def step2_js_scan(table_pages: list) -> list:
     """
-    Run JS detection only on pages that have tables (from Step 1).
+    Run detection only on pages flagged as having tables (from Step 1).
+    Uses BeautifulSoup on crawl4ai's rendered HTML — no js_return_value.
     Returns updated results with js_type filled.
     """
-    try:
-        from scraper.scrape_approved_urls_updatedV4 import (
-            _make_browser_config,
-            _start_chrome_cdp,
-        )
-        from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
-    except ImportError as e:
-        print(f"[ERROR] Cannot import scraper: {e}")
+    if not _SCRAPER_OK:
+        print(f"[ERROR] Cannot run Step 2 — import failed: {_IMPORT_ERR}")
+        for page in table_pages:
+            page["js_type"] = "SCAN_ERROR"
         return table_pages
 
     print(f"  Starting Chrome CDP ...")
-    _start_chrome_cdp()
+    _start_chrome_cdp()  # no-op if already running
 
     browser_config = _make_browser_config()
     total = len(table_pages)
+    print(f"  Scanning {total} table pages via CDP ...\n")
 
     async with AsyncWebCrawler(config=browser_config) as crawler:
         for i, page in enumerate(table_pages, 1):
@@ -309,31 +335,23 @@ async def step2_js_scan(table_pages: list) -> list:
             run_config = CrawlerRunConfig(
                 wait_until="domcontentloaded",
                 page_timeout=25000,
-                js_code=_JS_DETECT,
                 verbose=False,
-                excluded_tags=["script", "style", "nav", "footer", "header"],
+                excluded_tags=["script", "style"],
             )
 
             try:
                 result = await crawler.arun(url=page["url"], config=run_config)
                 if not result.success:
                     page["js_type"] = "SCAN_ERROR"
+                    page["error"]   = result.error_message
                     continue
 
-                raw = (getattr(result, "js_return_value", None) or
-                       getattr(result, "extracted_content", None))
-                if isinstance(raw, str):
-                    try:
-                        det = json.loads(raw)
-                    except Exception:
-                        det = {}
-                elif isinstance(raw, dict):
-                    det = raw
-                else:
-                    det = {}
+                # Use rendered HTML — available on all crawl4ai versions
+                html = getattr(result, "html", "") or ""
+                det  = _detect_from_html(html)
 
-                btable = det.get("btable", False)
-                tabs   = det.get("tabs", False)
+                btable = det["btable"]
+                tabs   = det["tabs"]
 
                 if btable and tabs:
                     js_type = "JS_PAG_TABBED"
@@ -344,10 +362,10 @@ async def step2_js_scan(table_pages: list) -> list:
                 else:
                     js_type = "STATIC_TABLE"
 
-                page["js_type"]     = js_type
-                page["btable_pages"] = det.get("btable_pages", 0)
-                page["tab_count"]   = det.get("tab_count", 0)
-                page["tab_labels"]  = det.get("tab_labels", [])
+                page["js_type"]      = js_type
+                page["btable_pages"] = det["btable_pages"]
+                page["tab_count"]    = det["tab_count"]
+                page["tab_labels"]   = det["tab_labels"]
 
             except Exception as e:
                 page["js_type"] = "SCAN_ERROR"
