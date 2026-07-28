@@ -602,6 +602,34 @@ v2.3.0 — July 2026 | Mukesh Kund
          - cached_tokens added to state.token_usage dict →
            visible in demo.html meta row token count.
 
+v2.5.0 — July 2026 | Mukesh Kund
+         Non-streaming fallback for gpt-5-mini / gpt-5.6-luna.
+
+         ROOT CAUSE (confirmed via Microsoft Tech Community):
+         - Azure OpenAI gpt-5-mini with stream=True returns
+           empty choices [] — no delta tokens arrive on the
+           SSE stream. Same issue affects gpt-5.6-luna which
+           buffers the full completion as a single chunk.
+         - Result: tokens=[], raw_response="", state.raw_response
+           never set → "No response generated" in UI.
+         - Root cause is Azure-side, not in our code.
+
+         FIX — Non-streaming fallback:
+         - After streaming loop, if raw_response.strip() is empty,
+           retry the same call with stream=False.
+         - Non-streaming call returns full response in a single
+           choices[0].message.content — always works regardless
+           of model streaming support.
+         - stream_tokens set to [raw_response] as single chunk
+           so server.py SSE path still works correctly.
+         - stream_empty_fallback WARNING logged for observability.
+         - Makes generator model-agnostic: any model assigned in
+           .env works regardless of streaming support status.
+
+         ROLLBACK:
+         - Remove the fallback block (lines after raw_response join)
+         - Restore: state.stream_tokens = tokens; state.model_used
+
 ═══════════════════════════════════════════════════════════════
 """
 import os
@@ -1081,9 +1109,35 @@ def generator_node(state: AgentState) -> AgentState:
             if delta and delta.content:
                 tokens.append(delta.content)
 
-        raw_response          = "".join(tokens)
-        state.stream_tokens   = tokens   # server.py reads this
-        state.model_used      = deployment
+        raw_response = "".join(tokens)
+
+        # ── Non-streaming fallback (v2.5.0) ──────────────────
+        # Known Azure OpenAI issue: gpt-5-mini and gpt-5.6-luna
+        # return empty choices [] when stream=True via Chat
+        # Completions API. Confirmed via Microsoft Tech Community.
+        # Fix: retry as stream=False when tokens is empty.
+        if not raw_response.strip():
+            log.warning(
+                "stream_empty_fallback",
+                deployment=deployment,
+                note="stream=True returned empty — retrying non-streaming",
+            )
+            fallback = client.chat.completions.create(
+                model=deployment,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": user_prompt},
+                ],
+                **_build_create_kwargs(deployment, max_tokens, 0.1),
+                stream=False,
+            )
+            raw_response      = fallback.choices[0].message.content or ""
+            usage_data        = fallback.usage
+            state.stream_tokens = [raw_response]  # single chunk
+        else:
+            state.stream_tokens = tokens   # server.py reads this
+
+        state.model_used = deployment
 
         # Clean formatting issues
         raw_response = clean_response_text(raw_response)
