@@ -38,6 +38,7 @@ Auth:       No API key required
 
 import os
 import re
+import concurrent.futures
 from azure.ai.contentsafety import ContentSafetyClient
 from azure.ai.contentsafety.models import (
     AnalyzeTextOptions,
@@ -45,7 +46,6 @@ from azure.ai.contentsafety.models import (
 )
 from azure.identity import DefaultAzureCredential
 from azure.core.exceptions import HttpResponseError
-from azure.core.pipeline.policies import RetryPolicy
 from dotenv import load_dotenv
 import structlog
 
@@ -83,7 +83,6 @@ def get_safety_client() -> ContentSafetyClient:
         _safety_client = ContentSafetyClient(
             endpoint=SAFETY_ENDPOINT,
             credential=get_credential(),
-            retry_policy=RetryPolicy.no_retries(),  # official SDK method — disables all retries
         )
         log.info(
             "safety_client_created",
@@ -295,7 +294,16 @@ def check_azure_content_safety(
             ],
         )
 
-        response = client.analyze_text(request, timeout=10)
+        # Python-level hard timeout — SDK timeout params are ineffective
+        # when Azure backend returns errors slowly (~30s). This guarantees
+        # a 10s cap regardless of SDK or server behaviour.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(client.analyze_text, request)
+            try:
+                response = future.result(timeout=10)
+            except concurrent.futures.TimeoutError:
+                log.warning("content_safety_timeout", timeout_seconds=10)
+                return True, None
 
         for result in response.categories_analysis:
             if result.severity >= BLOCK_THRESHOLD:
