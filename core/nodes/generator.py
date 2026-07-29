@@ -629,6 +629,7 @@ v2.5.0 — July 2026 | Mukesh Kund
          ROLLBACK:
          - Remove the fallback block (lines after raw_response join)
          - Restore: state.stream_tokens = tokens; state.model_used
+         - Revert max_tokens to: 1200 if BROAD else 800
 
 ═══════════════════════════════════════════════════════════════
 """
@@ -1073,7 +1074,16 @@ def generator_node(state: AgentState) -> AgentState:
 
         # BROAD queries (overview, multi-product) need more tokens.
         # SPECIFIC queries: 800 is sufficient for a concise FAQ answer.
-        max_tokens = 1200 if state.query_type == "BROAD" else 800
+        # GPT-5 reasoning models (gpt-5*, not gpt-4*): max_completion_tokens
+        # covers BOTH internal reasoning tokens AND output tokens combined.
+        # If reasoning consumes the full budget, output is empty string.
+        # Fix: raise ceiling significantly for GPT-5 so reasoning has
+        # headroom without starving the actual response content.
+        is_gpt5 = "gpt-4" not in deployment.lower()
+        if is_gpt5:
+            max_tokens = 4000 if state.query_type == "BROAD" else 3000
+        else:
+            max_tokens = 1200 if state.query_type == "BROAD" else 800
 
         # ── True token streaming (v2.3.0) ────────────────────
         # stream=True returns an iterator of chunks immediately.

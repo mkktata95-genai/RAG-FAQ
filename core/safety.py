@@ -45,6 +45,7 @@ from azure.ai.contentsafety.models import (
 )
 from azure.identity import DefaultAzureCredential
 from azure.core.exceptions import HttpResponseError
+from azure.core.pipeline.policies import RetryPolicy
 from dotenv import load_dotenv
 import structlog
 
@@ -82,8 +83,7 @@ def get_safety_client() -> ContentSafetyClient:
         _safety_client = ContentSafetyClient(
             endpoint=SAFETY_ENDPOINT,
             credential=get_credential(),
-            retry_total=0,           # no retries — timeout=10 on
-            retry_on_status_codes=(),# analyze_text() is the hard cap
+            retry_policy=RetryPolicy.no_retries(),  # official SDK method — disables all retries
         )
         log.info(
             "safety_client_created",
