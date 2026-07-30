@@ -15,6 +15,27 @@ Pipeline position (v1.3.0 — updated, Bug #24):
 CHANGE LOG
 ═══════════════════════════════════════════════════════════════
 
+v1.4.0 — July 2026 | Mukesh Kund
+         BUG #8 FIX — bare "before" in HISTORY_REFERENCE_WORDS
+
+         PROBLEM: "before" matched any query containing it
+         regardless of meaning — "what happens before I retire?",
+         "can I withdraw before 55?" — wrongly triggering
+         is_contextual_follow_up() to force-override intent to
+         INSURANCE. Low direct harm (rescue-only, only fires when
+         the LLM already classified non-INSURANCE and history is
+         present) but reduces classification precision on ordinary
+         temporal phrasing.
+
+         FIX: removed bare "before", replaced with idioms that
+         actually reference a prior conversation turn ("said
+         before", "mentioned before", "answered before", "as
+         before", "like before", "asked before"). "you said" etc.
+         already covered the explicit-reference case.
+
+         ROLLBACK: revert to v1.3.0 — restore bare "before" in
+         HISTORY_REFERENCE_WORDS.
+
 v1.3.0 — July 2026 | Mukesh Kund
          Tier 1 batch 2 — Bug #1/#2 fix + pipeline reorder (Bug #24).
 
@@ -350,13 +371,21 @@ GREETING_RESPONSES = {
 
 # Category A: Explicit references to previous conversation
 HISTORY_REFERENCE_WORDS = [
-    "previous", "earlier", "before", "last time",
+    "previous", "earlier", "last time",
     "you said", "didn't answer", "didnt answer",
     "you told", "you mentioned", "already asked",
     "already told", "not what i asked", "not what i said",
     "not what i meant", "misunderstood", "you keep",
     "repeating", "same thing", "try again", "asked you",
     "my question", "my previous", "what i asked",
+    # BUG #8 FIX (July 2026, Mukesh Kund): bare "before" removed —
+    # matched ordinary temporal phrasing with no history-reference
+    # meaning at all ("what happens before I retire?", "can I
+    # withdraw before 55?"), wrongly force-overriding intent to
+    # INSURANCE. Replaced with idioms that actually reference a
+    # prior turn in the conversation.
+    "said before", "mentioned before", "told me before",
+    "answered before", "asked before", "as before", "like before",
 ]
 
 # Category F: Negative responses / disagreement

@@ -343,6 +343,36 @@ v1.10.0 — July 2026 | Mukesh Kund
          - Remove `or state.final_response` from route_after_cache
            and route_after_retriever.
 
+v1.11.0 — July 2026 | Mukesh Kund
+         BUG #9 FIX — bare "tax"/"return"/"choose"/"switch"/
+         "transfer"/"growth"/"performance" in
+         FINANCIAL_DECISION_TRIGGERS
+
+         PROBLEM: these single bare words matched any query
+         containing them, forcing needs_disclaimer=True (the
+         "consult a qualified financial adviser" note appended to
+         the answer) on ordinary factual/admin questions with no
+         personal-decision framing — "how do I choose my
+         beneficiary", "how do I switch my address", "how do I
+         transfer my pension", "what tax do I pay on ISA
+         withdrawals", "how has the fund performed", "what's the
+         fund's growth over 5 years". Not a refusal (low severity)
+         but noisy — an unnecessary disclaimer on plain factual
+         answers.
+
+         FIX: removed the 7 bare words. Kept/added only phrases
+         with genuine personal-decision or liability framing:
+         "should i switch", "should i transfer", "how much tax
+         will/do i", "what tax will/do i". Multi-word decision
+         phrases already in the list ("should i", "which pension",
+         "is it worth", "better to", etc.) are unaffected.
+
+         Does NOT touch RECOMMENDATION_TRIGGERS (separate list,
+         controls cache-bypass + hard refusal, already has its own
+         "worth switching"/"worth transferring" entries).
+
+         ROLLBACK: revert to v1.10.0 — restore the 7 bare words.
+
 v1.9.0 — July 2026 | Mukesh Kund
          RECOMMENDATION_TRIGGERS expanded
 
@@ -501,9 +531,20 @@ FINANCIAL_DECISION_TRIGGERS = [
     "should i", "should i invest", "which pension",
     "best option", "recommend", "advice",
     "what should", "is it worth", "better to",
-    "choose", "decide", "switch", "transfer",
-    "how much should", "when should",
-    "tax", "return", "growth", "performance",
+    "decide", "how much should", "when should",
+    # BUG #9 FIX (July 2026, Mukesh Kund): bare "choose", "switch",
+    # "transfer", "tax", "return", "growth", "performance" removed
+    # — all extremely common in ordinary factual/admin questions
+    # with no personal-decision framing at all ("how do I choose
+    # my beneficiary", "how do I switch my address", "how do I
+    # transfer my pension" [admin move], "what tax do I pay on
+    # ISA withdrawals", "how has the fund performed", "what's the
+    # fund's growth over 5 years") — none need a "consult an
+    # adviser" disclaimer. Replaced with phrases that DO indicate
+    # a genuine personal decision or liability question.
+    "should i switch", "should i transfer",
+    "how much tax will i", "what tax will i",
+    "how much tax do i", "what tax do i",
 ]
 
 
