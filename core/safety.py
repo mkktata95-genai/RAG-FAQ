@@ -11,6 +11,19 @@ Layer 5:  Azure Content Safety (violence/hate/sexual/self-harm)
 Migration: AzureKeyCredential → DefaultAzureCredential
 Auth:       No API key required
 
+BUG #6/#7 FIX (July 2026, Mukesh Kund):
+- #6 JAILBREAK_PATTERNS "i am admin" (no \b) matched as a substring
+  inside "i am administrator" — false-positive on legitimate scheme
+  administrators. Added trailing \b.
+- #7 INJECTION_PATTERNS reveal/show/tell-me pattern included "rules"
+  and "guidelines" as unqualified targets — matched real product
+  queries like "tell me your rules on ISA transfers". Split into two
+  patterns: prompt/instructions/training stay broadly matched
+  (unambiguous meta-request), rules/guidelines now require an
+  explicit "your system" qualifier to fire.
+ROLLBACK: restore the single combined pattern with unqualified
+rules/guidelines, and drop the \b on the "i am admin" alternation.
+
 ═══════════════════════════════════════════════════════════════
 CHANGE LOG
 ═══════════════════════════════════════════════════════════════
@@ -306,7 +319,8 @@ INJECTION_PATTERNS = [
     r"dan\b.*\brestrictions?\b",
     r"do anything now",
     r"no (content |)(policy|filter|restriction|rule)",
-    r"(reveal|show|tell me|expose|print|output|display)\s+(your\s+)?(system\s+)?(prompt|instructions|guidelines|rules|training)",
+    r"(reveal|show|tell me|expose|print|output|display)\s+(your\s+)?(system\s+)?(prompt|instructions|training)",
+    r"(reveal|show|tell me|expose|print|output|display)\s+your\s+system\s+(rules|guidelines)",
     r"</?(s|sys|system|prompt|inst)>",
     r"#\s*(system|override|prompt)",
     r"\[ignor",
@@ -326,7 +340,7 @@ JAILBREAK_PATTERNS = [
     r"hypothetical(ly)?.{0,50}(rules?.{0,10}don.t apply|without rules|no rules)",
     r"alternate universe.{0,30}(answer|respond|tell)",
     r"(security audit|penetration test|red team).{0,30}(disable|bypass|ignore)",
-    r"i am (anthropic|microsoft|openai|developer|admin|engineer)",
+    r"i am (anthropic|microsoft|openai|developer|admin|engineer)\b",
     r"if you were (a |an |)(different|another|unrestricted)",
     r"without (your |any |)(safety |)(training|guidelines|restrictions)",
     r"(letter by letter|spell out|character by character).{0,30}(prompt|instruction|rule)",

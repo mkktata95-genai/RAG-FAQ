@@ -100,7 +100,12 @@ v1.7.0 — July 2026 | Mukesh Kund
          content='' on GPT-5-mini at low token budgets).
 
          FIX:
-         - Token budget 30 → 300 in the get_canonical_form() call.
+         - Token budget 30 → 300 → 1000 (v1.7.1 follow-up: 300 still
+           hit finish_reason=length on some queries — e.g. "Difference
+           between ISA and Income Protection" — GPT-5-mini's reasoning
+           overhead is query-dependent and unpredictable, so a fixed
+           small ceiling will always be able to fail on some input.
+           1000 gives enough headroom; still a cheap, short call).
          - Explicit None/empty check on response content before
            .strip(), with a distinct canonical_rewrite_empty log
            (includes finish_reason) instead of falling through to
@@ -494,7 +499,7 @@ def get_canonical_form(query: str) -> str | None:
                     "content": query,
                 },
             ],
-            **_build_create_kwargs(DEPLOYMENT_FAST, 300, 0.0),
+            **_build_create_kwargs(DEPLOYMENT_FAST, 1000, 0.0),
         )
         canonical = response.choices[0].message.content
         if not canonical:

@@ -700,6 +700,29 @@ v2.6.0 — July 2026 | Mukesh Kund
            final_response=get_refusal(RefusalReason.GENERAL),
            citations=make_static_citations(CONTACT_CITATION).
 
+v2.7.0 — July 2026 | Mukesh Kund
+         BUG #12 FIX — Citation orphan (dangling [n] with no pill)
+
+         PROBLEM: extract_citations() renumbered every marker in
+         the response text FIRST (pure order-of-appearance), then
+         built the citations list second, silently dropping entries
+         whose source_url or chunk index had already been seen.
+         Net effect: rendered text could contain e.g. "[2]" with no
+         matching citation pill — whenever two cited indices pointed
+         to chunks sharing the same source_url (different sections
+         of one page), or the model hallucinated a citation number
+         beyond len(retrieved_chunks).
+
+         FIX: resolve/filter candidate citations FIRST (skip
+         duplicate chunk index, duplicate source_url, out-of-range
+         index), THEN assign final sequential numbers only to
+         survivors. Orphan markers are removed from the text
+         entirely (regex replace → "") instead of being left as a
+         dangling number with nothing behind it.
+
+         ROLLBACK: revert to v2.6.0's extract_citations() —
+         renumber-then-filter instead of filter-then-renumber.
+
 ═══════════════════════════════════════════════════════════════
 """
 import os
@@ -1097,58 +1120,75 @@ def extract_citations(
     Extract citations and renumber sequentially
     by order of first appearance in text.
     Returns updated response text + citations list.
+
+    BUG #12 FIX (July 2026, Mukesh Kund): the previous version
+    renumbered every marker in the text FIRST, then built the
+    citations list, dropping entries whose source_url or chunk
+    index was already seen. That left the text with a rendered
+    [2] (etc.) with no matching citation pill whenever two cited
+    indices shared a source_url, or the model hallucinated a
+    citation number beyond len(retrieved_chunks). Fixed by
+    resolving/filtering candidates FIRST, assigning final
+    sequential numbers only to survivors, and removing orphan
+    markers from the text entirely instead of leaving a dangling
+    number.
     """
     all_markers = re.findall(r'\[(\d+)\]', response_text)
 
     if not all_markers:
         return response_text, []
 
-    # Build mapping: original number → new sequential number
-    seen_order = {}
-    counter    = 1
+    # First-appearance order of original marker numbers.
+    first_seen_order = []
     for num in all_markers:
-        if num not in seen_order:
-            seen_order[num] = counter
-            counter += 1
+        if num not in first_seen_order:
+            first_seen_order.append(num)
 
-    # Renumber in response text
+    # Resolve each original number to a chunk, filtering out
+    # anything invalid (out of range) or a duplicate (same chunk
+    # index or same source_url already used) — BEFORE assigning
+    # final numbers, so only survivors ever get a number in the
+    # rendered text.
+    citations     = []
+    orig_to_final = {}
+    seen_indices  = set()
+    seen_urls     = set()
+    next_num      = 1
+
+    for orig_num in first_seen_order:
+        idx = int(orig_num) - 1
+        if idx in seen_indices:
+            continue  # same chunk cited under a second number
+        if not (0 <= idx < len(state.retrieved_chunks)):
+            continue  # hallucinated citation number — drop marker
+        chunk = state.retrieved_chunks[idx]
+        if chunk.source_url in seen_urls:
+            continue  # different chunk, same page already cited
+        seen_indices.add(idx)
+        seen_urls.add(chunk.source_url)
+        orig_to_final[orig_num] = next_num
+        citations.append(Citation(
+            index=next_num,
+            url=chunk.source_url,
+            section=chunk.section,
+            title=chunk.title,
+        ))
+        next_num += 1
+
+    # Renumber in text — valid markers get their final number,
+    # orphan markers (no surviving citation) are removed entirely
+    # rather than left as a dangling [n].
     def replace_citation(match):
-        orig    = match.group(1)
-        new_num = seen_order.get(orig, orig)
-        return f"[{new_num}]"
+        orig = match.group(1)
+        if orig in orig_to_final:
+            return f"[{orig_to_final[orig]}]"
+        return ""
 
     updated_text = re.sub(
         r'\[(\d+)\]', replace_citation, response_text
     )
-
-    # Build citations list using new numbering.
-    # seen_urls deduplicates by URL — if two chunks share the same
-    # source_url (different sections of the same page), only the
-    # first-cited chunk's title/section is used for the pill label.
-    # seen_indices guards against the same chunk index appearing
-    # under two different original citation numbers (e.g. model
-    # wrote [1] and [3] both mapping to retrieved_chunks[0]).
-    citations   = []
-    seen_urls   = set()
-    seen_indices = set()
-
-    for orig_num, new_num in sorted(
-        seen_order.items(), key=lambda x: x[1]
-    ):
-        idx = int(orig_num) - 1
-        if idx in seen_indices:
-            continue
-        if 0 <= idx < len(state.retrieved_chunks):
-            chunk = state.retrieved_chunks[idx]
-            seen_indices.add(idx)
-            if chunk.source_url not in seen_urls:
-                citations.append(Citation(
-                    index=new_num,
-                    url=chunk.source_url,
-                    section=chunk.section,
-                    title=chunk.title,
-                ))
-                seen_urls.add(chunk.source_url)
+    # Collapse any double space left behind by a removed marker.
+    updated_text = re.sub(r' {2,}', ' ', updated_text)
 
     return updated_text, citations
 
