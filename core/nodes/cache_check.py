@@ -12,6 +12,22 @@ Hybrid approach:
 CHANGE LOG
 ═══════════════════════════════════════════════════════════════
 
+v1.8.0 — July 2026 | Mukesh Kund
+         BUG #25 FIX — "vs" mis-lemmatized to "v"
+
+         PROBLEM: WordNetLemmatizer doesn't recognise "vs" and
+         guesses it's a plural noun, stripping the trailing "s".
+         "pensions vs isa" normalized to "pension v isa" instead
+         of "pension vs isa" — confirmed live in logs. Corrupts
+         the cache key and canonical-rewrite embedding on every
+         comparison-style query, reducing cache-hit precision.
+
+         FIX: "vs" passed through unchanged instead of going
+         through lemmatizer.lemmatize().
+
+         ROLLBACK: revert to v1.7.0 — call lemmatizer.lemmatize()
+         unconditionally on every non-stopword token.
+
 v1.0.0 — Initial version
          Mistral Small, API key auth, basic cache check
 
@@ -444,6 +460,14 @@ def normalize_query(text: str) -> str:
     2. Domain synonym replacement
     3. Stop word removal
     4. Lemmatization
+
+    BUG #25 FIX (July 2026, Mukesh Kund): WordNetLemmatizer doesn't
+    recognise "vs" as a real word and guesses it's a plural, stripping
+    the trailing "s" -> "v" (e.g. "pensions vs isa" -> "pension v isa").
+    This corrupts the normalized cache key and canonical-rewrite
+    embedding on every comparison-style query ("X vs Y"), reducing
+    cache-hit precision. "vs" is passed through the lemmatizer
+    unchanged now, same treatment as any other exempt token.
     """
     text = text.lower().strip()
     text = apply_domain_synonyms(text)
@@ -453,7 +477,7 @@ def normalize_query(text: str) -> str:
     normalized_words   = []
     for word in words:
         if word not in FINAL_STOP_WORDS:
-            lemma = lemmatizer.lemmatize(word)
+            lemma = word if word == "vs" else lemmatizer.lemmatize(word)
             normalized_words.append(lemma)
 
     result = ' '.join(normalized_words)

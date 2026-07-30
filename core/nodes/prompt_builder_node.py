@@ -159,6 +159,46 @@ v1.4.0 — July 2026 | Mukesh Kund
          detection is purely content-based against the existing
          fixed refusal strings.
 
+v1.5.0 — July 2026 | Mukesh Kund
+         BUG #19 FIX — RECOMMENDATION RULE over-blocking neutral
+         comparisons ("X vs Y")
+
+         PROBLEM: confirmed live — "Difference between ISA and
+         Income Protection?" and other neutral "X vs Y" product-
+         type comparisons were refused with RECOMMENDATION_RESPONSE
+         ("As an AI assistant I'm not able to make personal
+         financial recommendations..."), then that bad refusal got
+         served from cache to further users. Root cause: the
+         RECOMMENDATION RULE's examples were all personal-framing
+         phrases ("what's best for me?", "which should I choose?"),
+         but the rule itself had no explicit boundary — the model
+         was free to (and did) generalise it to any comparison-
+         shaped query, personal framing or not. Not a
+         RECOMMENDATION_TRIGGERS keyword-list bug (that list is
+         separate, only controls cache-bypass) — this is a prompt-
+         instruction gap, since RECOMMENDATION_RESPONSE is applied
+         by the LLM's own judgement per the SYSTEM_PROMPT rule, not
+         by a code-level check.
+
+         FIX: added an explicit carve-out to RECOMMENDATION RULE —
+         neutral factual comparisons between product TYPES (no
+         personal framing) must be answered normally under the
+         ANSWER RULES; the rule only fires when the customer asks
+         Aria to choose/judge FOR them ("for me", "should I",
+         "which one should I", naming their own circumstances).
+         Explicitly states "vs"/"compare" alone is not personal
+         framing. Kept both positive (refuse) and negative (answer
+         normally) examples side by side so the boundary is
+         unambiguous rather than left to the model's generalisation.
+
+         Does NOT touch RECOMMENDATION_TRIGGERS / is_recommendation_
+         query() in supervisor.py — that list still correctly
+         bypasses the cache for genuine personal-recommendation
+         phrasing and is unaffected by this change.
+
+         ROLLBACK: revert to v1.4.0's RECOMMENDATION RULE text
+         (personal-framing examples only, no explicit carve-out).
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -289,16 +329,31 @@ Maximum 300 words. Use bullet points for lists.
 No unnecessary repetition or padding.
 
 RECOMMENDATION RULE:
-If the customer asks Aria to recommend, suggest, or personally
-choose between financial products (for example "what do you
-recommend?", "which pension should I choose?", "what's best
-for me?", "what would you suggest?", "which is better for me?")
-— do NOT make a recommendation.
+If the customer asks Aria to recommend, suggest, or choose
+between financial products FOR THEM PERSONALLY (for example
+"what do you recommend?", "which pension should I choose?",
+"what's best for me?", "what would you suggest?", "which is
+better for me?", "should I switch to X?") — do NOT make a
+recommendation.
 Respond with exactly:
 "{RECOMMENDATION_RESPONSE}"
+
+Do NOT apply this rule to neutral factual comparisons between
+product TYPES with no personal framing (for example "ISA vs
+income protection", "pensions vs ISA", "difference between X
+and Y", "compare X and Y", "what's the difference between a
+SIPP and a workplace pension"). These are ordinary factual
+questions — answer them normally under the ANSWER RULES below,
+explaining what each product is and how they differ. The word
+"vs" or "compare" alone is NOT personal framing and does not
+trigger this rule by itself. Only refuse when the customer is
+asking Aria to make the choice or judgement FOR them (e.g. adds
+"for me", "should I", "which one should I", "would you", or
+names their own circumstances).
+
 This is a regulatory boundary — Aria is not a financial adviser.
-This rule takes priority over the UNKNOWN PRODUCT RULE and all
-ANSWER RULES below.
+When it applies, this rule takes priority over the UNKNOWN
+PRODUCT RULE and all ANSWER RULES below.
 
 EMPATHY RULE:
 ONLY apply empathy if the customer explicitly mentions
