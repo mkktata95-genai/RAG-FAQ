@@ -7,6 +7,19 @@ P2 - PII detection/masking
 
 Migration: Mistral model names → gpt-4.1 / gpt-4o-mini in cost tracking
 
+BUG #5/#14 FIX (July 2026, Mukesh Kund): MODEL_COST_PER_1K only had
+gpt-4.1/gpt-4o-mini entries and get_token_stats() summed over that
+dict's keys instead of the models actually used — every GPT-5 call
+(gpt-5-nano, gpt-5-mini, gpt-5.6-luna, i.e. everything post-migration)
+priced at $0, and any real gpt-4.1/gpt-4o-mini cost included even if
+those models were never called that session. Replaced with
+MODEL_PRICING (mirrors chunk_and_index_hqaV4.py v5.8.5 / content_
+freshness.py exactly, $/1M tokens, substring-matched via
+_get_model_pricing()) and cost is now summed over tokens_by_model's
+actual keys, split by input/output token counts (now tracked
+separately per model) rather than a single blended rate.
+ROLLBACK: restore MODEL_COST_PER_1K and the old sum() one-liner.
+
 # ─────────────────────────────────────────────────────────────
 # TODO: PRODUCTION READINESS
 # This implementation is suitable for development/testing only.
@@ -158,17 +171,35 @@ _token_usage: dict = {
     "total_requests":      0,
     "requests_by_model":   defaultdict(int),
     "tokens_by_model":     defaultdict(int),
+    "input_tokens_by_model":  defaultdict(int),
+    "output_tokens_by_model": defaultdict(int),
     "session_start":       datetime.utcnow().isoformat(),
 }
 
-# GPT model pricing (USD per 1K tokens, approximate)
-# gpt-4.1:     $0.002 input / $0.008 output (blended ~$0.005)
-# gpt-4o-mini: $0.00015 input / $0.0006 output (blended ~$0.0003)
+# GPT model pricing — USD per 1,000,000 tokens (input, output).
+# Mirrors chunk_and_index_hqaV4.py v5.8.5 / content_freshness.py
+# MODEL_PRICING exactly — keep in sync when adding new models or
+# pricing changes. Substring-matched via _get_model_pricing() so
+# any deployment name containing the key (e.g. "gpt-5-mini",
+# "gpt-5.6-luna") resolves correctly.
 # TODO: PRODUCTION → Pull actual costs from Azure Cost Management API
-MODEL_COST_PER_1K = {
-    "gpt-4.1":     0.005,
-    "gpt-4o-mini": 0.0003,
+MODEL_PRICING = {
+    "gpt-5-mini":  (1.25,  5.00),
+    "gpt-5-nano":  (0.50,  2.00),
+    "gpt-5.1":     (2.00,  8.00),
+    "gpt-5":       (2.00,  8.00),
+    "gpt-4o-mini": (0.15,  0.60),
+    "gpt-4o":      (2.50, 10.00),
+    "gpt-4.1":     (2.00,  8.00),
 }
+
+
+def _get_model_pricing(model_name: str) -> tuple[float, float]:
+    name = model_name.lower()
+    for key, prices in MODEL_PRICING.items():
+        if key in name:
+            return prices
+    return (2.00, 8.00)
 
 
 def track_token_usage(
@@ -187,6 +218,8 @@ def track_token_usage(
     _token_usage["tokens_by_model"][model]   += (
         input_tokens + output_tokens
     )
+    _token_usage["input_tokens_by_model"][model]  += input_tokens
+    _token_usage["output_tokens_by_model"][model] += output_tokens
 
     log.info(
         "token_usage",
@@ -202,11 +235,15 @@ def get_token_stats() -> dict:
     Get current token usage statistics.
     TODO: PRODUCTION → Query from Application Insights instead.
     """
-    estimated_cost = sum(
-        (_token_usage["tokens_by_model"].get(model, 0) / 1000)
-        * cost_per_1k
-        for model, cost_per_1k in MODEL_COST_PER_1K.items()
-    )
+    estimated_cost = 0.0
+    for model in _token_usage["tokens_by_model"]:
+        input_price, output_price = _get_model_pricing(model)
+        model_input  = _token_usage["input_tokens_by_model"].get(model, 0)
+        model_output = _token_usage["output_tokens_by_model"].get(model, 0)
+        estimated_cost += (
+            (model_input  / 1_000_000) * input_price
+            + (model_output / 1_000_000) * output_price
+        )
 
     return {
         "total_input_tokens":  _token_usage["total_input_tokens"],
@@ -221,6 +258,12 @@ def get_token_stats() -> dict:
         ),
         "tokens_by_model":    dict(
             _token_usage["tokens_by_model"]
+        ),
+        "input_tokens_by_model": dict(
+            _token_usage["input_tokens_by_model"]
+        ),
+        "output_tokens_by_model": dict(
+            _token_usage["output_tokens_by_model"]
         ),
         "session_start":      _token_usage["session_start"],
         "estimated_cost_usd": round(estimated_cost, 4),

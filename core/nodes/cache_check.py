@@ -80,6 +80,36 @@ v1.4.0 — June 2026 | Mukesh Kund
          - The embedding generated in Step 1 is still stored on
            state._query_embedding for retriever reuse
 
+v1.7.0 — July 2026 | Mukesh Kund
+         BUG #4 FIX — get_canonical_form() 30-token GPT-5 truncation
+
+         PROBLEM: max_tokens=30 (now max_completion_tokens=30 for
+         GPT-5 via _build_create_kwargs) was sized for GPT-4's
+         direct token-to-output mapping. GPT-5 reasoning models
+         spend part of that budget on internal reasoning tokens
+         before emitting visible content — at 30 tokens the budget
+         was exhausted by reasoning alone, so
+         response.choices[0].message.content came back None.
+         .strip() on None raised, caught by the broad except, and
+         canonical_rewrite_failed logged silently on every call —
+         Stage 3/4 of cache_check_node (canonical-form cache hit)
+         never actually ran, artificially inflating cache misses.
+
+         Same failure signature already confirmed and fixed in
+         chunk_and_index_hqaV4.py v1.5.3 (finish_reason=length,
+         content='' on GPT-5-mini at low token budgets).
+
+         FIX:
+         - Token budget 30 → 300 in the get_canonical_form() call.
+         - Explicit None/empty check on response content before
+           .strip(), with a distinct canonical_rewrite_empty log
+           (includes finish_reason) instead of falling through to
+           the generic exception path — makes future truncation
+           failures visible instead of silent.
+
+         ROLLBACK: revert to v1.6.0 — restore max_tokens 30,
+         remove the empty-content guard.
+
 v1.6.0 — July 2026 | Mukesh Kund
          GPT-5 compatibility + model-agnostic API call helper.
 
@@ -432,9 +462,23 @@ def normalize_query(text: str) -> str:
 
 def get_canonical_form(query: str) -> str | None:
     """
-    Use gpt-4o-mini to rewrite query into
+    Use the fast deployment to rewrite query into
     canonical insurance domain form.
     Returns canonical query or None on failure.
+
+    v1.x BUG FIX (#4): token budget was 30 — fine for GPT-4 family
+    (no reasoning tokens), but GPT-5 reasoning models consume part
+    of max_completion_tokens on internal reasoning before emitting
+    any visible content. At 30 tokens the reasoning overhead alone
+    exhausted the budget, so response.choices[0].message.content
+    came back empty/None — canonical.strip() then threw, caught by
+    the except block, and the rewrite silently failed every time
+    (logged as canonical_rewrite_failed). Net effect: cache miss
+    rate stayed artificially high because the canonical-form cache
+    lookup (Step 4) never ran with a real rewritten query. Bumped
+    to 300 — same pattern already proven in chunk_and_index_hqaV4.py
+    v1.5.3 (finish_reason=length, content='' on GPT-5-mini at low
+    token budgets). Cheap either way; this call uses DEPLOYMENT_FAST.
     """
     try:
         client   = get_openai_client()
@@ -450,9 +494,19 @@ def get_canonical_form(query: str) -> str | None:
                     "content": query,
                 },
             ],
-            **_build_create_kwargs(DEPLOYMENT_FAST, 30, 0.0),
+            **_build_create_kwargs(DEPLOYMENT_FAST, 300, 0.0),
         )
-        canonical = response.choices[0].message.content.strip()
+        canonical = response.choices[0].message.content
+        if not canonical:
+            log.warning(
+                "canonical_rewrite_empty",
+                model=DEPLOYMENT_FAST,
+                finish_reason=getattr(
+                    response.choices[0], "finish_reason", None
+                ),
+            )
+            return None
+        canonical = canonical.strip()
 
         # Clean up any quotes or extra formatting
         canonical = canonical.strip('"\'')
