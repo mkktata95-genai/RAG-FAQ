@@ -1,13 +1,101 @@
 """
 Multi-layer safety system for Royal London FAQ chatbot.
-Layer 1: Relevance check
-Layer 2: Crime/fraud detection
-Layer 3: Prompt injection detection
-Layer 4: Jailbreak detection
-Layer 5: Azure Content Safety (violence/hate/sexual/self-harm)
+Layer 1:  Relevance check
+Layer 2:  Crime/fraud detection
+Layer 2B: Weapons/explosives detection
+Layer 3A: Prompt Shields (Azure ML — jailbreak + injection)
+Layer 3B: Prompt injection detection (regex fallback)
+Layer 4:  Jailbreak detection (regex fallback)
+Layer 5:  Azure Content Safety (violence/hate/sexual/self-harm)
 
 Migration: AzureKeyCredential → DefaultAzureCredential
 Auth:       No API key required
+
+═══════════════════════════════════════════════════════════════
+CHANGE LOG
+═══════════════════════════════════════════════════════════════
+
+v1.0.0 — Initial version
+         5-layer safety system. Layers 1-4 regex-based, no API
+         cost. Layer 5 Azure Content Safety via DefaultAzureCredential.
+
+v1.1.0 — July 2026 | Mukesh Kund
+         Tier 1 safety hardening — three changes.
+
+         FIX 1 — Layer 2B: weapons/explosives detection [NEW]:
+         - ROOT CAUSE: Layers 1-4 had zero coverage for weapons,
+           explosives, or CBRN-adjacent content. A direct query
+           like "how to make bomb" passed all four regex layers
+           untouched — the only backstops were Azure OpenAI's own
+           built-in content filter (opaque, not under our control)
+           and a coincidental retrieval-relevance failure (chunks=[]
+           on an insurance-only index). Neither is a real, auditable
+           application-level control.
+         - WEAPONS_PATTERNS [NEW CONSTANT] + check_weapons()
+           [NEW FUNCTION]: same shape as check_crime_fraud(),
+           covers explosives, firearms manufacturing, chemical/
+           biological weapon construction language. Zero API cost,
+           always active regardless of Content Safety reachability.
+         - Wired into check_input() as Layer 2B, immediately after
+           Layer 2 (crime/fraud) — same category of always-on,
+           no-cost, no-dependency control.
+
+         FIX 2 — Layer 3A: Prompt Shields integration [NEW]:
+         - Azure Content Safety's dedicated jailbreak + prompt
+           injection detection API (POST /contentsafety/text:
+           shieldPrompt) — ML-based, catches novel phrasing our
+           regex inevitably misses. Was TODO since v1.0.0.
+         - Uses the Foundry multi-service endpoint (confirmed
+           working for both analyze_text and shieldPrompt via
+           test2.py / test3.py verification — see CLAUDE.md).
+         - check_prompt_shields() [NEW FUNCTION]: Bearer token via
+           DefaultAzureCredential (get_token, cognitiveservices
+           audience) — no API key. Python-level ThreadPoolExecutor
+           timeout (10s), matching the pattern already proven in
+           check_azure_content_safety(). Three return states:
+             (False, "harmful") → attack detected, block immediately
+             (True, None)       → ML confirmed clean, skip regex
+                                   Layers 3B+4 entirely
+             (None, None)       → endpoint unreachable/error, fall
+                                   through to regex Layers 3B+4
+         - Regex Layers 3B (injection) and 4 (jailbreak) are NOT
+           removed — they remain the always-on fallback per the
+           agreed design ("AI-detection with regex fallback",
+           same pattern already used for Content Safety vs regex
+           elsewhere in this file). This also means Prompt Shields
+           unreachability (e.g. from VDI without the Foundry
+           endpoint configured) degrades gracefully to exactly
+           today's behaviour — no regression risk.
+
+         FIX 3 — ThreadPoolExecutor shutdown bug in
+         check_azure_content_safety() [BUG FIX]:
+         - ROOT CAUSE: `with concurrent.futures.ThreadPoolExecutor(...)
+           as executor:` calls executor.shutdown(wait=True) on
+           context exit — which BLOCKS until the background thread
+           finishes, even after future.result(timeout=10) has
+           already raised TimeoutError and been caught. Confirmed
+           live: content_safety_timeout logged at ~15s but
+           input_safe/output_safe latency still showed ~30-129s —
+           the "hard 10s cap" was never actually a hard cap because
+           the with-block silently waited for the abandoned thread
+           anyway.
+         - FIX: replaced `with ... as executor:` with manual
+           executor = ThreadPoolExecutor(...); executor.shutdown(
+           wait=False) after both the success and timeout paths —
+           abandons the background thread immediately instead of
+           blocking on it. Same fix applied to the new
+           check_prompt_shields() function from the start.
+
+         ROLLBACK:
+         - Remove WEAPONS_PATTERNS, check_weapons(), and its call
+           in check_input().
+         - Remove check_prompt_shields() and its call in
+           check_input(); Layers 3B+4 alone are safe to run as
+           before (this was existing behaviour).
+         - Revert check_azure_content_safety()'s executor block to
+           `with concurrent.futures.ThreadPoolExecutor(...) as
+           executor:` (re-introduces the shutdown-blocking bug —
+           not recommended).
 
 # ─────────────────────────────────────────────────────────────
 # TODO: PRODUCTION READINESS
@@ -17,12 +105,17 @@ Auth:       No API key required
 #      Current  → keyword matching (may over-block edge cases)
 #      Enhance  → Use gpt-4o-mini for smarter relevance scoring
 #
-# Layer 2-4 - Crime/Fraud/Injection/Jailbreak:
-#      Current  → regex patterns (good but not exhaustive)
-#      Enhance  → Azure AI Content Safety Prompt Shield API
-#                 Specifically designed for prompt injection
-#                 and jailbreak detection
-#                 POST /contentsafety/text:shieldPrompt
+# Layer 2B - Weapons/Explosives:
+#      Current  → regex patterns (v1.1.0 — good but not exhaustive)
+#      Enhance  → Consider Azure Content Safety custom categories
+#                 if the regex list shows gaps in production.
+#
+# Layer 3A - Prompt Shields:
+#      Current  → LIVE as of v1.1.0, using Foundry multi-service
+#                 endpoint. Regex Layers 3B+4 remain as fallback.
+#      Ensure   → Foundry endpoint RBAC (Cognitive Services User)
+#                 stays granted; monitor prompt_shields_timeout /
+#                 prompt_shields_failed logs for reachability drift.
 #
 # Layer 5 - Azure Content Safety:
 #      Current  → DefaultAzureCredential (production ready ✅)
@@ -39,6 +132,7 @@ Auth:       No API key required
 import os
 import re
 import concurrent.futures
+import requests
 from azure.ai.contentsafety import ContentSafetyClient
 from azure.ai.contentsafety.models import (
     AnalyzeTextOptions,
@@ -55,6 +149,11 @@ log = structlog.get_logger()
 # ── Config ────────────────────────────────────────────────────
 SAFETY_ENDPOINT = os.getenv("CONTENT_SAFETY_ENDPOINT", "")
 BLOCK_THRESHOLD = 2
+
+# Prompt Shields uses the same Content Safety resource/endpoint
+# as Layer 5 (analyze_text) — different API path on the same
+# multi-service Foundry endpoint. Confirmed working via test3.py.
+PROMPT_SHIELDS_API_VERSION = "2024-09-01"
 
 # ── Singleton Client ──────────────────────────────────────────
 _credential:     DefaultAzureCredential | None = None
@@ -167,6 +266,30 @@ CRIME_FRAUD_PATTERNS = [
     r"(bankrupt|insolvent|collapse).{0,20}(never|won.t|will not)",
 ]
 
+# ── Layer 2B: Weapons/Explosives (v1.1.0 — NEW) ───────────────
+# Covers explosives, firearms manufacturing, and chemical/
+# biological weapon construction language. Deliberately broad
+# on "how to make/build X" + weapon-noun combinations — false
+# positives here (blocking a legitimate weapons question, which
+# has no business being asked of an insurance chatbot anyway)
+# are far cheaper than false negatives on this category.
+WEAPONS_PATTERNS = [
+    r"how (to|do i|can i) (make|build|create|construct).{0,30}"
+    r"(bomb|explosive|detonat|grenade|molotov)",
+    r"\bbomb\b.{0,20}(instruction|recipe|make|build|how to)",
+    r"(make|build|create|construct).{0,20}"
+    r"(explosive|detonator|ied|pipe bomb)",
+    r"\b(tnt|c4|semtex|nitroglycerin)\b",
+    r"how (to|do i|can i) (make|build|3d print|convert).{0,30}"
+    r"(gun|firearm|rifle|pistol).{0,20}(untraceable|illegal|silencer|automatic)",
+    r"(build|make|create).{0,20}(chemical|biological|nerve).{0,20}"
+    r"(weapon|agent|toxin)",
+    r"how (to|do i).{0,20}(synthesi[sz]e|make).{0,20}"
+    r"(sarin|ricin|anthrax|nerve gas)",
+    r"(untraceable|homemade|improvised).{0,20}"
+    r"(weapon|firearm|explosive|bomb)",
+]
+
 # ── Layer 3: Prompt Injection ─────────────────────────────────
 INJECTION_PATTERNS = [
     r"ignore (all |previous |your )?(instructions|rules|guidelines|constraints|prompt)",
@@ -236,8 +359,24 @@ def check_crime_fraud(text: str) -> tuple[bool, str | None]:
     return True, None
 
 
+def check_weapons(text: str) -> tuple[bool, str | None]:
+    """
+    Layer 2B (v1.1.0): Detect weapons/explosives construction
+    language. No API call — regex only, always active regardless
+    of Content Safety/Prompt Shields reachability.
+    """
+    text_lower = text.lower()
+
+    for pattern in WEAPONS_PATTERNS:
+        if re.search(pattern, text_lower, re.IGNORECASE):
+            log.warning("weapons_content_detected", pattern=pattern)
+            return False, "harmful"
+
+    return True, None
+
+
 def check_prompt_injection(text: str) -> tuple[bool, str | None]:
-    """Layer 3: Detect prompt injection attempts."""
+    """Layer 3B: Detect prompt injection attempts (regex fallback)."""
     text_lower = text.lower()
 
     for pattern in INJECTION_PATTERNS:
@@ -251,7 +390,7 @@ def check_prompt_injection(text: str) -> tuple[bool, str | None]:
 
 
 def check_jailbreak(text: str) -> tuple[bool, str | None]:
-    """Layer 4: Detect jailbreak attempts."""
+    """Layer 4: Detect jailbreak attempts (regex fallback)."""
     text_lower = text.lower()
 
     for pattern in JAILBREAK_PATTERNS:
@@ -262,6 +401,92 @@ def check_jailbreak(text: str) -> tuple[bool, str | None]:
     return True, None
 
 
+def check_prompt_shields(text: str) -> tuple[bool | None, str | None]:
+    """
+    Layer 3A (v1.1.0): Azure Prompt Shields — ML-based jailbreak
+    and prompt injection detection. Covers what Layers 3B+4 regex
+    inevitably miss (novel phrasing, no keyword match).
+
+    Uses the same Foundry multi-service endpoint as Layer 5
+    (analyze_text) — different API path (shieldPrompt), confirmed
+    working via test3.py verification.
+
+    Returns THREE possible states (note: bool | None, not bool):
+        (False, "harmful") → attack detected — block immediately
+        (True, None)       → ML confirmed clean — caller should
+                              skip regex Layers 3B+4 entirely
+        (None, None)       → endpoint not configured, unreachable,
+                              or errored — caller falls through to
+                              regex Layers 3B+4 as normal fallback
+
+    Fails open to (None, None) on any error — never blocks a
+    user due to Prompt Shields being unavailable; regex layers
+    provide the safety net.
+    """
+    if not SAFETY_ENDPOINT:
+        return None, None
+
+    if not text or not text.strip():
+        return True, None
+
+    try:
+        credential = get_credential()
+        token = credential.get_token(
+            "https://cognitiveservices.azure.com/.default"
+        ).token
+
+        url = (
+            f"{SAFETY_ENDPOINT.rstrip('/')}"
+            f"/contentsafety/text:shieldPrompt"
+            f"?api-version={PROMPT_SHIELDS_API_VERSION}"
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "userPrompt": text[:10000],
+            "documents": [],
+        }
+
+        # Same Python-level hard timeout pattern as Layer 5 — and
+        # the SAME fix (shutdown(wait=False)) applied from the
+        # start, unlike the original check_azure_content_safety()
+        # which had this bug until v1.1.0.
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(
+            requests.post, url, headers=headers, json=body, timeout=10
+        )
+        try:
+            response = future.result(timeout=10)
+        except concurrent.futures.TimeoutError:
+            executor.shutdown(wait=False)
+            log.warning("prompt_shields_timeout", timeout_seconds=10)
+            return None, None
+        executor.shutdown(wait=False)
+
+        if response.status_code != 200:
+            log.warning(
+                "prompt_shields_error",
+                status=response.status_code,
+            )
+            return None, None
+
+        result = response.json()
+        attack = result.get("userPromptAnalysis", {}).get(
+            "attackDetected", False
+        )
+        if attack:
+            log.warning("prompt_shields_attack_detected")
+            return False, "harmful"
+
+        return True, None
+
+    except Exception as e:
+        log.warning("prompt_shields_failed", error=str(e))
+        return None, None
+
+
 def check_azure_content_safety(
     text: str,
 ) -> tuple[bool, str | None]:
@@ -270,9 +495,12 @@ def check_azure_content_safety(
     Uses singleton client with DefaultAzureCredential.
     Fails open on error — never blocks user on API failure.
 
-    Timeout: 10s hard cap — prevents 32s+ hangs when RBAC is
-    misconfigured or endpoint is unreachable (confirmed via
-    check_content_safety.py diagnostic).
+    Timeout: 10s hard cap (v1.1.0 — fixed: executor.shutdown(
+    wait=False) after both success and timeout paths, replacing
+    the `with ... as executor:` pattern whose __exit__ was
+    silently blocking on the abandoned thread and making the
+    "hard cap" not actually hard — confirmed live at 15s logged
+    timeout but 30-129s actual latency before this fix).
     """
     # Guard: skip Layer 5 entirely if endpoint not configured
     if not SAFETY_ENDPOINT:
@@ -294,16 +522,19 @@ def check_azure_content_safety(
             ],
         )
 
-        # Python-level hard timeout — SDK timeout params are ineffective
-        # when Azure backend returns errors slowly (~30s). This guarantees
-        # a 10s cap regardless of SDK or server behaviour.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(client.analyze_text, request)
-            try:
-                response = future.result(timeout=10)
-            except concurrent.futures.TimeoutError:
-                log.warning("content_safety_timeout", timeout_seconds=10)
-                return True, None
+        # Python-level hard timeout — SDK timeout params are
+        # ineffective when Azure backend returns errors slowly
+        # (~30s). shutdown(wait=False) — not a `with` block — is
+        # what actually enforces the 10s cap (v1.1.0 fix).
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(client.analyze_text, request)
+        try:
+            response = future.result(timeout=10)
+        except concurrent.futures.TimeoutError:
+            executor.shutdown(wait=False)
+            log.warning("content_safety_timeout", timeout_seconds=10)
+            return True, None
+        executor.shutdown(wait=False)
 
         for result in response.categories_analysis:
             if result.severity >= BLOCK_THRESHOLD:
@@ -330,6 +561,16 @@ def check_input(text: str) -> tuple[bool, str | None]:
     """
     Full multi-layer input check.
     Returns (is_safe, reason) where reason is None if safe.
+
+    Layer order (v1.1.0):
+    1.  Relevance (regex, no API)
+    2.  Crime/Fraud (regex, no API)
+    2B. Weapons/Explosives (regex, no API)
+    3A. Prompt Shields (Azure ML) — skips 3B+4 if it returns a
+        decisive True; falls through to 3B+4 if unreachable/error
+    3B. Prompt Injection (regex fallback)
+    4.  Jailbreak (regex fallback)
+    5.  Azure Content Safety (API call — singleton client)
     """
     if not text or not text.strip():
         return False, "irrelevant"
@@ -344,15 +585,30 @@ def check_input(text: str) -> tuple[bool, str | None]:
     if not safe:
         return False, reason
 
-    # Layer 3: Prompt Injection (no API call)
-    safe, reason = check_prompt_injection(text)
+    # Layer 2B: Weapons/Explosives (no API call) — v1.1.0
+    safe, reason = check_weapons(text)
     if not safe:
         return False, reason
 
-    # Layer 4: Jailbreak (no API call)
-    safe, reason = check_jailbreak(text)
-    if not safe:
-        return False, reason
+    # Layer 3A: Prompt Shields (ML-based, covers 3B+4) — v1.1.0
+    shields_safe, shields_reason = check_prompt_shields(text)
+    if shields_safe is False:
+        return False, shields_reason  # ML-confirmed attack — block
+    if shields_safe is True:
+        # ML confirmed clean — skip regex Layers 3B+4 entirely
+        pass
+    else:
+        # shields_safe is None — endpoint unreachable/error,
+        # fall through to regex Layers 3B+4 as normal
+        # Layer 3B: Prompt Injection (no API call)
+        safe, reason = check_prompt_injection(text)
+        if not safe:
+            return False, reason
+
+        # Layer 4: Jailbreak (no API call)
+        safe, reason = check_jailbreak(text)
+        if not safe:
+            return False, reason
 
     # Layer 5: Azure Content Safety (API call — singleton client)
     safe, reason = check_azure_content_safety(text)

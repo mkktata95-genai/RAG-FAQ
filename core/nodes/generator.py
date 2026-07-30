@@ -631,6 +631,75 @@ v2.5.0 — July 2026 | Mukesh Kund
          - Restore: state.stream_tokens = tokens; state.model_used
          - Revert max_tokens to: 1200 if BROAD else 800
 
+v2.6.0 — July 2026 | Mukesh Kund
+         Content-filter-aware exception handling (Tier 1 item #23).
+
+         ROOT CAUSE:
+         - Azure OpenAI's built-in content filter (separate from
+           and independent of our own Layers 1-5 in safety.py —
+           this fires INSIDE the chat.completions.create() call
+           itself, on every deployment, always-on) can reject a
+           request for two genuinely different reasons that the
+           old except Exception block treated identically:
+             Case A — the CURRENT query is genuinely concerning
+               (e.g. "complete the application for me" — a
+               social-engineering attempt). Filter did its job.
+             Case B — the current query is completely innocent,
+               but TOXIC CONVERSATION HISTORY (e.g. a DAN jailbreak
+               attempt several turns earlier) poisoned the prompt.
+               Confirmed live: "Who is the PM of UK?" — itself
+               harmless — was rejected with jailbreak:detected=True
+               because prompt_builder_node.py's history block
+               (conversation_history[-6:], unsanitised) still
+               contained the raw jailbreak text from an earlier
+               turn in the same session.
+         - Both cases fell into the same generic except block and
+           returned RefusalReason.GENERAL — a vague "I'm unable to
+           process your request" message that reads like a bug to
+           a legitimate customer wrongly caught by Case B.
+
+         FIX — is_content_filter_error() [NEW HELPER] +
+         generator_node() except block [MODIFIED]:
+         - Detects Azure content-filter errors specifically
+           (content_filter_result / content_filter in the error
+           string) rather than falling into the fully generic
+           handler. Parses out which category fired (jailbreak,
+           violence, hate, self_harm, sexual) for observability —
+           every time Azure's filter catches something our own
+           Layers 1-4 regex missed is a concrete tuning signal.
+         - If content_filter fires AND conversation_history is
+           non-empty: retry ONCE with history stripped from
+           built_prompt (regex strip of the "Previous conversation:
+           ...\n\n" block prompt_builder_node.py prepends — see
+           its v1.x docstring for the exact format this matches).
+             Retry succeeds → serve that response normally, log
+             history_contamination_recovered (INFO) — a genuinely
+             useful metric for how often this occurs in practice.
+             Retry also fails / no history to strip → treat as
+             Case A, fall through to the refusal below.
+         - Capped at exactly one retry — never loops, does not
+           double latency/cost on every content-filter event.
+         - Genuine Case A blocks now use RefusalReason.HARMFUL
+           (existing template: "I'm unable to assist with that
+           request...") instead of GENERAL — clearer, more
+           honest tone for an actual boundary vs. a system error.
+         - Non-content-filter exceptions (network errors, timeouts,
+           etc.) are unaffected — still fall through to the
+           original GENERAL refusal path exactly as before.
+         - Does NOT fix the root architectural gap (unsanitised
+           history injection in prompt_builder_node.py — tracked
+           separately, bug #3 in the Tier 2 backlog). This is the
+           pragmatic, immediate countermeasure; proper history
+           sanitisation is a larger, separate piece of work.
+
+         ROLLBACK:
+         - Remove is_content_filter_error() and the retry-without-
+           history block.
+         - Restore the except block to its v2.5.0 form: log
+           generator_error, set refusal_triggered=True,
+           final_response=get_refusal(RefusalReason.GENERAL),
+           citations=make_static_citations(CONTACT_CITATION).
+
 ═══════════════════════════════════════════════════════════════
 """
 import os
@@ -693,6 +762,71 @@ def _build_create_kwargs(
     else:
         kwargs["max_completion_tokens"] = max_tokens
     return kwargs
+
+
+# ── Content-filter handling (v2.6.0) ─────────────────────────
+def is_content_filter_error(error_str: str) -> tuple[bool, str | None]:
+    """
+    Detect whether an exception from client.chat.completions.create()
+    is Azure OpenAI's built-in content filter firing, and if so,
+    which category triggered it (for observability only — the
+    caller decides what to do regardless of category).
+
+    This is Azure's infrastructure-level filter — separate from
+    and independent of our own Layers 1-5 in safety.py. It cannot
+    be disabled and fires inside every chat.completions.create()
+    call, on every deployment.
+
+    Returns (is_content_filter, category) where category is one
+    of "jailbreak", "violence", "hate", "self_harm", "sexual", or
+    None if the error is a content filter but the category could
+    not be parsed from the error string.
+    """
+    if "content_filter_result" not in error_str and "content_filter" not in error_str:
+        return False, None
+
+    # Best-effort category parse against Azure's observed error
+    # format, e.g.:
+    #   'jailbreak': {'detected': True, 'filtered': True}
+    #   'violence':  {'filtered': True, 'severity': 'medium'}
+    # For logging/observability only — never used for routing
+    # logic, so an unparsed category just logs as None.
+    normalised = error_str.replace('"', "'")
+    for category in ("jailbreak", "violence", "hate", "self_harm", "sexual"):
+        match = re.search(
+            rf"'{category}':\s*\{{[^}}]*?"
+            rf"(?:'detected':\s*True|'severity':\s*'(?!safe)\w+')",
+            normalised,
+        )
+        if match:
+            return True, category
+
+    return True, None  # content filter fired, category not parsed
+
+
+def strip_history_from_prompt(built_prompt: str) -> str:
+    """
+    Remove the "Previous conversation:\\n...\\n\\n" block that
+    prompt_builder_node.py prepends to built_prompt when
+    conversation_history is non-empty.
+
+    Used only as a one-off retry transformation when Azure's
+    content filter rejects a call — never mutates state.built_prompt
+    itself, and never touches prompt_builder_node.py. This is a
+    pragmatic countermeasure for toxic-history false positives
+    (see v2.6.0 changelog), not a fix for the underlying
+    unsanitised-history-injection gap (tracked separately).
+
+    Returns built_prompt unchanged if no history block is found
+    at the start (e.g. conversation_history was already empty).
+    """
+    return re.sub(
+        r"^Previous conversation:\n.*?\n\n",
+        "",
+        built_prompt,
+        count=1,
+        flags=re.DOTALL,
+    )
 
 
 # ── Singleton client ──────────────────────────────────────────
@@ -1020,6 +1154,112 @@ def extract_citations(
 
 
 # ── Main node ─────────────────────────────────────────────────
+def _finalize_response(
+    state: AgentState,
+    deployment: str,
+    raw_response: str,
+    usage_data,
+    start: float,
+    recovered_from_history_contamination: bool = False,
+) -> None:
+    """
+    Shared post-processing for a raw LLM response: clean text,
+    extract/renumber citations, UNKNOWN PRODUCT RULE detection,
+    static citation injection, token tracking, and final logging.
+
+    v2.6.0 — extracted from generator_node()'s main success path
+    so the content-filter retry-without-history path (also new in
+    v2.6.0) can produce an identically-processed response instead
+    of a hand-duplicated, easy-to-drift copy of this logic.
+
+    Mutates state in place. Does not set state.stream_tokens —
+    callers set that themselves since the shape differs between
+    the streaming path (list of chunks) and the non-streaming
+    retry path (single-element list).
+    """
+    state.model_used = deployment
+
+    # Clean formatting issues
+    raw_response = clean_response_text(raw_response)
+
+    # Extract + renumber citations
+    updated_text, citations = extract_citations(state, raw_response)
+
+    # ── UNKNOWN PRODUCT RULE refusal detection (v1.6.0) ──
+    if UNKNOWN_PRODUCT_RESPONSE in updated_text:
+        state.refusal_triggered = True
+        state.raw_response      = UNKNOWN_PRODUCT_RESPONSE
+        state.final_response    = UNKNOWN_PRODUCT_RESPONSE
+        state.citations = make_static_citations(CONTACT_CITATION)
+    else:
+        state.raw_response = updated_text
+        # ── Static citation injection (v2.2.0) ────────────
+        static_extras: list[dict] = []
+
+        if state.__dict__.get("_bereavement"):
+            static_extras = [BEREAVEMENT_CITATION, CONTACT_CITATION]
+        elif state.needs_disclaimer:
+            static_extras = [ADVISER_CITATION]
+        elif state.needs_empathy:
+            static_extras = [ADVISER_CITATION, CONTACT_CITATION]
+
+        if static_extras:
+            state.citations = make_static_citations(
+                *static_extras, existing=citations
+            )
+        else:
+            state.citations = citations
+
+    # Track token usage (v2.3.0)
+    if usage_data:
+        cached = 0
+        try:
+            cached = usage_data.prompt_tokens_details.cached_tokens or 0
+        except AttributeError:
+            pass
+
+        state.token_usage = {
+            "input_tokens":  usage_data.prompt_tokens,
+            "output_tokens": usage_data.completion_tokens,
+            "total_tokens":  usage_data.total_tokens,
+            "cached_tokens": cached,
+        }
+        track_token_usage(
+            model=deployment,
+            input_tokens=usage_data.prompt_tokens,
+            output_tokens=usage_data.completion_tokens,
+        )
+        if cached > 0:
+            log.info(
+                "kv_cache_hit",
+                cached_tokens=cached,
+                model=deployment,
+                request_id=state.request_id,
+            )
+        else:
+            log.debug(
+                "kv_cache_miss",
+                model=deployment,
+                request_id=state.request_id,
+            )
+
+    latency = (time.time() - start) * 1000
+    state.latency_ms["generator"] = latency
+
+    log.info(
+        "generation_complete",
+        model=deployment,
+        citations=len(state.citations),
+        latency_ms=round(latency),
+        empathy=state.needs_empathy,
+        disclaimer=state.needs_disclaimer,
+        refusal_triggered=state.refusal_triggered,
+        request_id=state.request_id,
+        tokens=state.token_usage.get("total_tokens", 0),
+        recovered_from_history_contamination=recovered_from_history_contamination,
+    )
+
+
 def generator_node(state: AgentState) -> AgentState:
     """
     Generate response using gpt-4.1 (DEPLOYMENT_MAIN) or
@@ -1147,125 +1387,113 @@ def generator_node(state: AgentState) -> AgentState:
         else:
             state.stream_tokens = tokens   # server.py reads this
 
-        state.model_used = deployment
-
-        # Clean formatting issues
-        raw_response = clean_response_text(raw_response)
-
-        # Extract + renumber citations
-        updated_text, citations = extract_citations(
-            state, raw_response
-        )
-
-        # ── UNKNOWN PRODUCT RULE refusal detection (v1.6.0) ──
-        # If GPT returned the UNKNOWN PRODUCT RULE refusal text,
-        # treat it as a refusal (refusal_triggered=True) so
-        # cache_write_node's existing
-        # "refusal_triggered or not final_response" check skips
-        # caching it. Prevents a wrong "no information" answer for
-        # one phrasing from being cached and then replayed for
-        # other phrasings of the same topic.
-        if UNKNOWN_PRODUCT_RESPONSE in updated_text:
-            state.refusal_triggered = True
-            state.raw_response      = UNKNOWN_PRODUCT_RESPONSE
-            state.final_response    = UNKNOWN_PRODUCT_RESPONSE
-            # Inject contact citation so the pill renders in UI
-            state.citations = make_static_citations(CONTACT_CITATION)
-        else:
-            state.raw_response = updated_text
-            # ── Static citation injection (v2.2.0) ────────────
-            # The LLM is no longer allowed to write URLs in the
-            # response body. Any response that redirects the
-            # customer to a Royal London page needs a Citation
-            # pill injected here by Python so the link still
-            # renders in the UI.
-            #
-            # 1. Bereavement → BEREAVEMENT_CITATION + CONTACT_CITATION
-            # 2. Financial disclaimer / adviser redirect →
-            #    ADVISER_CITATION (+ CONTACT_CITATION if also redirecting
-            #    to contact page)
-            # 3. Standard responses with retrieved citations only →
-            #    no static injection needed
-            static_extras: list[dict] = []
-
-            if state.__dict__.get("_bereavement"):
-                # Bereavement handoff always needs the bereavement
-                # page link. Also append contact page as fallback.
-                static_extras = [BEREAVEMENT_CITATION, CONTACT_CITATION]
-            elif state.needs_disclaimer:
-                # Financial disclaimer redirects to adviser finder
-                static_extras = [ADVISER_CITATION]
-            elif state.needs_empathy:
-                # Other sensitive (terminal, redundancy etc) →
-                # handoff directs to adviser
-                static_extras = [ADVISER_CITATION, CONTACT_CITATION]
-
-            if static_extras:
-                state.citations = make_static_citations(
-                    *static_extras, existing=citations
-                )
-            else:
-                state.citations = citations
-
-        # Track token usage (v2.3.0 — uses usage_data from stream)
-        # cached_tokens: Azure OpenAI returns prompt_tokens_details
-        # with cached_tokens > 0 when KV prefix caching is active
-        # for the SYSTEM_PROMPT prefix. If always 0, caching is not
-        # enabled on this deployment — check API version (requires
-        # 2024-12-01-preview or later) without needing to ask Andy.
-        if usage_data:
-            cached = 0
-            try:
-                cached = (
-                    usage_data.prompt_tokens_details.cached_tokens or 0
-                )
-            except AttributeError:
-                pass
-
-            state.token_usage = {
-                "input_tokens":   usage_data.prompt_tokens,
-                "output_tokens":  usage_data.completion_tokens,
-                "total_tokens":   usage_data.total_tokens,
-                "cached_tokens":  cached,
-            }
-            track_token_usage(
-                model=deployment,
-                input_tokens=usage_data.prompt_tokens,
-                output_tokens=usage_data.completion_tokens,
-            )
-            if cached > 0:
-                log.info(
-                    "kv_cache_hit",
-                    cached_tokens=cached,
-                    model=deployment,
-                    request_id=state.request_id,
-                )
-            else:
-                log.debug(
-                    "kv_cache_miss",
-                    model=deployment,
-                    request_id=state.request_id,
-                )
-
-        latency = (time.time() - start) * 1000
-        state.latency_ms["generator"] = latency
-
-        log.info(
-            "generation_complete",
-            model=deployment,
-            citations=len(state.citations),
-            latency_ms=round(latency),
-            empathy=state.needs_empathy,
-            disclaimer=state.needs_disclaimer,
-            refusal_triggered=state.refusal_triggered,
-            request_id=state.request_id,
-            tokens=state.token_usage.get("total_tokens", 0),
-        )
+        # ── Shared post-processing (v2.6.0) ───────────────────
+        # Extracted to _finalize_response() so this exact logic
+        # is also used by the content-filter retry-without-history
+        # path in the except block below — no hand-duplicated,
+        # drift-prone copy.
+        _finalize_response(state, deployment, raw_response, usage_data, start)
 
     except Exception as e:
+        error_str = str(e)
+        is_filter, filter_category = is_content_filter_error(error_str)
+
+        if is_filter:
+            log.warning(
+                "generator_content_filter_triggered",
+                category=filter_category,
+                has_history=bool(state.conversation_history),
+                request_id=state.request_id,
+            )
+
+            # Retry ONCE with conversation history stripped from
+            # the prompt. Distinguishes a genuine block on THIS
+            # query (Case A — fall through to refusal below) from
+            # toxic history from an earlier turn poisoning an
+            # otherwise innocent current query (Case B — recover
+            # and serve the retried response normally). See v2.6.0
+            # changelog for full rationale and a worked example.
+            if state.conversation_history and state.built_prompt:
+                stripped_prompt = strip_history_from_prompt(state.built_prompt)
+                if stripped_prompt != state.built_prompt:
+                    try:
+                        retry_deployment = (
+                            DEPLOYMENT_FAST
+                            if is_simple_query(
+                                state.query,
+                                state.is_sensitive,
+                                state.query_type,
+                            )
+                            else DEPLOYMENT_MAIN
+                        )
+                        retry_client  = get_openai_client()
+                        retry_is_gpt5 = "gpt-4" not in retry_deployment.lower()
+                        retry_max_tokens = (
+                            (4000 if state.query_type == "BROAD" else 3000)
+                            if retry_is_gpt5
+                            else (1200 if state.query_type == "BROAD" else 800)
+                        )
+                        retry_response = retry_client.chat.completions.create(
+                            model=retry_deployment,
+                            messages=[
+                                {"role": "system", "content": SYSTEM_PROMPT},
+                                {"role": "user",   "content": stripped_prompt},
+                            ],
+                            **_build_create_kwargs(
+                                retry_deployment, retry_max_tokens, 0.1
+                            ),
+                            stream=False,
+                        )
+                        retry_text = (
+                            retry_response.choices[0].message.content or ""
+                        )
+
+                        if retry_text.strip():
+                            log.info(
+                                "history_contamination_recovered",
+                                category=filter_category,
+                                request_id=state.request_id,
+                            )
+                            state.stream_tokens = [retry_text]
+                            _finalize_response(
+                                state,
+                                retry_deployment,
+                                retry_text,
+                                retry_response.usage,
+                                start,
+                                recovered_from_history_contamination=True,
+                            )
+                            return state
+
+                    except Exception as retry_e:
+                        log.warning(
+                            "history_contamination_retry_failed",
+                            error=str(retry_e),
+                            request_id=state.request_id,
+                        )
+                        # fall through to the refusal below
+
+            # Either: no history to strip, retry also failed, or
+            # this is a genuine block on the current query itself
+            # (Case A). RefusalReason.HARMFUL reads as an honest
+            # boundary rather than a system error.
+            log.error(
+                "generator_error",
+                error=error_str,
+                content_filter=True,
+                category=filter_category,
+                request_id=state.request_id,
+            )
+            from core.refusal import get_refusal, RefusalReason
+            state.refusal_triggered = True
+            state.final_response    = get_refusal(RefusalReason.HARMFUL)
+            state.citations = make_static_citations(CONTACT_CITATION)
+            return state
+
+        # Non-content-filter exceptions — unchanged from v2.5.0
         log.error(
             "generator_error",
-            error=str(e),
+            error=error_str,
             request_id=state.request_id,
         )
         from core.refusal import get_refusal, RefusalReason
