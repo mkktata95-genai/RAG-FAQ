@@ -273,6 +273,76 @@ v1.8.0 — July 2026 | Mukesh Kund
          Sets kept in sync between supervisor.py (quick path)
          and classifier_node.py (secondary check) — both updated.
 
+v1.10.0 — July 2026 | Mukesh Kund
+         Tier 1 batch 2 — routing fixes (Bugs #1, #2, #24).
+
+         BUG #24 — Safety checks moved earlier in the pipeline:
+         - ROOT CAUSE: input_safety_node ran 4th (Supervisor →
+           Classifier → Cache Check → Input Safety → ...), so
+           every harmful/weapons/jailbreak query paid for a
+           classifier LLM call AND a canonical-rewrite LLM call
+           — both rejected by Azure OpenAI's own built-in content
+           filter (HTTP 400) — before our own Layers 1-5 in
+           safety.py ever got a chance to block it for free.
+           Confirmed live: "How to make bomb" took ~26s and two
+           wasted API calls (intent_classification_failed,
+           canonical_rewrite_failed) before weapons_content_
+           detected (v1.1.0, safety.py) finally fired in 7ms.
+         - input_safety_node depends only on state.query — nothing
+           classifier_node or cache_check_node produce — so moving
+           it is safe. Confirmed via direct read of both files.
+         - FIX: route_after_supervisor now targets "input_safety"
+           (was "classifier"). route_after_input_safety now
+           targets "classifier" (was "retriever"). route_after_
+           classifier still leads to cache_check on success.
+           route_after_cache now targets "retriever" (was
+           "input_safety"). New pipeline order: Supervisor →
+           Input Safety → Classifier → Cache Check → Retriever →
+           Prompt Builder → Generator → Output Safety → Formatter
+           → Cache Write.
+         - Companion change: graph.py v1.3.0 — edge target map
+           updates to match.
+
+         BUG #1/#2 — classifier_node non-INSURANCE short-circuit
+         never actually took effect:
+         - ROOT CAUSE: classifier_node.py's Step 3 set
+           state.final_response for non-INSURANCE intents but
+           never set state.refusal_triggered. route_after_
+           classifier ignored final_response entirely and always
+           returned "cache_check" unconditionally — so a query
+           classifier had already correctly identified as
+           IRRELEVANT still ran the full pipeline (embedding,
+           canonical rewrite, retrieval, generation) anyway.
+           Confirmed live: "Who is the PM of UK?" was classified
+           IRRELEVANT, then proceeded through 5 more nodes and
+           ~19s before generating an answer using RLG pension
+           documents to (badly) address an unrelated political
+           question.
+         - input_safety_node's existing pattern (set both flags
+           together) was already correct — this brings
+           classifier_node.py in line with it. See classifier_
+           node.py v1.3.0 for that half of the fix.
+         - FIX (this file): route_after_classifier now checks
+           `state.refusal_triggered or state.final_response`
+           before falling through to cache_check — this is what
+           actually makes classifier_node's flag take effect.
+         - DEFENCE IN DEPTH: route_after_cache and route_after_
+           retriever also now check `state.final_response` in
+           addition to `refusal_triggered`, so a future node that
+           sets final_response without also setting
+           refusal_triggered (the exact bug just fixed) can never
+           again cause a silent, expensive fallthrough anywhere
+           else in the pipeline.
+
+         ROLLBACK:
+         - Revert route_after_supervisor target to "classifier".
+         - Revert route_after_input_safety target to "retriever".
+         - Revert route_after_classifier to unconditional
+           `return "cache_check"`.
+         - Revert route_after_cache target to "input_safety".
+         - Remove `or state.final_response` from route_after_cache
+           and route_after_retriever.
+
 v1.9.0 — July 2026 | Mukesh Kund
          RECOMMENDATION_TRIGGERS expanded
 
@@ -878,9 +948,33 @@ def route_after_supervisor(state: AgentState) -> str:
     Route after supervisor:
     - Greeting/farewell/thanks handled → END
     - Account lookup blocked → END
-    - All other queries → classifier (NEW: was cache_check)
+    - All other queries → input_safety
 
-    classifier_node always routes to cache_check.
+    v1.9.0 (Bug #24): target changed from "classifier" to
+    "input_safety" — safety checks now run before any LLM call.
+    Previously, a harmful/weapons/jailbreak query burned a
+    classifier LLM call AND a canonical-rewrite LLM call — both
+    rejected by Azure's own content filter — before our own
+    Layers 1-5 in safety.py ever got a chance to block it for
+    free. Confirmed live: "How to make bomb" cost ~26s and two
+    wasted API calls before weapons_content_detected fired.
+    input_safety_node only depends on state.query — nothing
+    classifier or cache_check produce — so moving it earlier is
+    safe and has no other side effects.
+    """
+    if state.refusal_triggered or state.final_response:
+        return "end"
+    return "input_safety"
+
+
+def route_after_input_safety(state: AgentState) -> str:
+    """
+    Route after input_safety (v1.9.0 — moved earlier in the
+    pipeline; now runs immediately after supervisor, before
+    classifier and cache_check. See route_after_supervisor for
+    rationale — Bug #24).
+    - Unsafe (harmful/weapons/jailbreak/irrelevant) → END
+    - Safe → classifier
     """
     if state.refusal_triggered or state.final_response:
         return "end"
@@ -890,24 +984,42 @@ def route_after_supervisor(state: AgentState) -> str:
 def route_after_classifier(state: AgentState) -> str:
     """
     Route after classifier:
-    - Always → cache_check.
+    - Non-INSURANCE intent (IRRELEVANT/GREETING/CHITCHAT etc,
+      confidence >= 0.85) → END directly.
 
-    classifier_node may set state.final_response for non-INSURANCE
-    intents that weren't caught by supervisor's quick_intent_check
-    (e.g. multi-word chitchat). cache_check detects this and
-    short-circuits — no retrieval or generation needed.
+    v1.9.0 FIX (Bug #1/#2): classifier_node now sets
+    refusal_triggered=True alongside final_response for
+    non-INSURANCE intents — this check is what makes that
+    actually take effect. Previously this function always
+    returned "cache_check" unconditionally, regardless of what
+    classifier set on state, so a query classifier had already
+    correctly identified as IRRELEVANT still ran the full
+    expensive pipeline anyway (cache embedding generation,
+    canonical rewrite LLM call, retrieval, generation) — wasting
+    latency and cost, and in one confirmed case producing a
+    visibly wrong answer when retrieved insurance content was
+    used to (badly) answer an unrelated political question.
+    The docstring here previously claimed "cache_check detects
+    this and short-circuits" — that logic never existed anywhere
+    in cache_check_node; this fix implements what was always
+    intended instead of just describing it.
+    - INSURANCE intent → cache_check
     """
+    if state.refusal_triggered or state.final_response:
+        return "end"
     return "cache_check"
 
 
 def route_after_cache(state: AgentState) -> str:
-    if state.cache_hit:
-        return "end"
-    return "input_safety"
+    """
+    Route after cache_check.
 
-
-def route_after_input_safety(state: AgentState) -> str:
-    if state.refusal_triggered:
+    v1.9.0: target changed from "input_safety" to "retriever" —
+    input_safety now runs earlier in the pipeline (see
+    route_after_supervisor, Bug #24), so cache_check's next stop
+    on a miss is retrieval directly.
+    """
+    if state.cache_hit or state.final_response:
         return "end"
     return "retriever"
 
@@ -919,8 +1031,15 @@ def route_after_retriever(state: AgentState) -> str:
     - Retrieved chunks → prompt_builder (v1.7.0+)
       prompt_builder assembles state.built_prompt before
       generator_node runs. Was "generator" in 8-node pipeline.
+
+    v1.9.0: added `or state.final_response` alongside the
+    existing refusal_triggered check — defence in depth, so a
+    node that sets final_response without also setting
+    refusal_triggered (the exact class of bug fixed in
+    classifier_node.py this round) can never again cause a
+    silent, expensive pipeline fallthrough.
     """
-    if state.refusal_triggered:
+    if state.refusal_triggered or state.final_response:
         return "end"
     return "prompt_builder"
 

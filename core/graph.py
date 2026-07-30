@@ -78,6 +78,7 @@ v1.1.0 — June 2026 | Mukesh Kund
            run_query()'s initial_state. No other changes to
            pydantic_to_dict()/dict_to_pydantic() are needed.
 
+
 v1.2.0 — July 2026 | Mukesh Kund
          Sprint 1 refactor — 10-node pipeline, new nodes,
          new GraphState fields.
@@ -132,6 +133,66 @@ v1.2.0 — July 2026 | Mukesh Kund
          propagate correctly through node boundaries via the
          normal model_dump() / AgentState(**clean) path without
          needing _DICT_EXTRA_KEYS registration.
+
+v1.3.0 — July 2026 | Mukesh Kund
+         Tier 1 batch 2 — pipeline reorder (Bug #24) + edge fix
+         for Bug #1/#2.
+
+         PIPELINE REORDER (Bug #24):
+         - Input Safety moved from 4th position to 2nd — now runs
+           immediately after Supervisor, before Classifier and
+           Cache Check.
+         - ROOT CAUSE: harmful/weapons/jailbreak queries were
+           paying for a classifier LLM call AND a canonical-
+           rewrite LLM call — both rejected by Azure OpenAI's own
+           built-in content filter — before our own Layers 1-5 in
+           safety.py ever ran. Confirmed live: "How to make bomb"
+           took ~26s and two wasted API calls before our own
+           weapons_content_detected (safety.py v1.1.0) fired in
+           7ms. input_safety_node depends only on state.query —
+           confirmed via direct read — so reordering is safe.
+         - Edge changes: supervisor → input_safety (was
+           → classifier). input_safety → classifier (was
+           → retriever). cache_check → retriever (was
+           → input_safety). classifier → cache_check unchanged
+           on success.
+         - See supervisor.py v1.10.0 and classifier_node.py v1.3.0
+           for the companion routing-function and node changes.
+
+         EDGE FIX (Bug #1/#2):
+         - "classifier" → "cache_check" edge changed from
+           unconditional (`{"cache_check": "cache_check"}`) to
+           conditional with an "end" branch
+           (`{"end": END, "cache_check": "cache_check"}`).
+         - ROOT CAUSE: classifier_node.py sets
+           state.refusal_triggered=True + final_response for
+           non-INSURANCE intents (v1.3.0 fix, that file) — but an
+           unconditional edge target ignores whatever
+           route_after_classifier returns beyond the one key it
+           declares. Without "end" in this map, LangGraph would
+           have nowhere to route even if route_after_classifier
+           correctly returned "end". This is the graph.py half of
+           that fix — both were needed together.
+
+         NEW PIPELINE ORDER (10 nodes, same count — just reordered):
+           Supervisor → Input Safety → Classifier → Cache Check
+           → Retriever → Prompt Builder → Generator
+           → Output Safety → Formatter → Cache Write
+
+         Node registration order in build_graph() reordered to
+         match (cosmetic only — LangGraph only reads the edges,
+         not registration order, but this keeps the file readable).
+
+         ROLLBACK:
+         - Revert supervisor edge target to
+           {"end": END, "classifier": "classifier"}.
+         - Revert classifier edge target to
+           {"cache_check": "cache_check"} (remove "end": END).
+         - Revert cache_check edge target to
+           {"end": END, "input_safety": "input_safety"}.
+         - Revert input_safety edge target to
+           {"end": END, "retriever": "retriever"}.
+         - Revert node registration order (cosmetic, optional).
 
 ═══════════════════════════════════════════════════════════════
 """
@@ -326,20 +387,22 @@ def build_graph():
     """
     Compile the 10-node LangGraph pipeline.
 
-    v1.2.0 pipeline order:
-    Supervisor → Classifier → Cache Check → Input Safety
+    v1.3.0 pipeline order (Bug #24 — safety moved earlier):
+    Supervisor → Input Safety → Classifier → Cache Check
     → Retriever → Prompt Builder → Generator → Output Safety
     → Formatter → Cache Write
     """
     graph = StateGraph(GraphState)
 
     # ── Register all nodes ────────────────────────────────
+    # Registration order matches pipeline order for readability;
+    # LangGraph itself only cares about the edges below.
     graph.add_node("supervisor",        _supervisor)
-    graph.add_node("classifier",        _classifier)        # NEW v1.2.0
+    graph.add_node("input_safety",      _input_safety)      # v1.3.0: moved up (was 4th)
+    graph.add_node("classifier",        _classifier)
     graph.add_node("cache_check",       _cache_check)
-    graph.add_node("input_safety",      _input_safety)
     graph.add_node("retriever",         _retriever)
-    graph.add_node("prompt_builder",    _prompt_builder)    # NEW v1.2.0
+    graph.add_node("prompt_builder",    _prompt_builder)
     graph.add_node("generator",         _generator)
     graph.add_node("output_safety",     _output_safety)
     graph.add_node("response_formatter",_response_formatter)
@@ -347,36 +410,45 @@ def build_graph():
 
     graph.set_entry_point("supervisor")
 
-    # ── Supervisor → Classifier (or END for greetings) ────
-    # v1.2.0: was supervisor → cache_check.
-    # Supervisor handles quick greetings (no LLM) → END.
-    # All other queries → classifier for LLM intent + query_type.
+    # ── Supervisor → Input Safety (or END for greetings) ──
+    # v1.3.0 (Bug #24): target changed from "classifier" to
+    # "input_safety" — safety checks now run before any LLM call.
+    # See supervisor.py v1.10.0 CHANGE LOG for full rationale.
     graph.add_conditional_edges(
         "supervisor",
         _route_after_supervisor,
-        {"end": END, "classifier": "classifier"},
-    )
-
-    # ── Classifier → Cache Check (always) ─────────────────
-    # Classifier never short-circuits — it always passes to
-    # cache_check. cache_check detects state.final_response
-    # set by classifier (for non-INSURANCE intents that
-    # supervisor's quick check missed) and skips retrieval.
-    graph.add_conditional_edges(
-        "classifier",
-        _route_after_classifier,
-        {"cache_check": "cache_check"},
-    )
-
-    # ── Remaining edges (unchanged from v1.1.0) ───────────
-    graph.add_conditional_edges(
-        "cache_check",
-        _route_after_cache,
         {"end": END, "input_safety": "input_safety"},
     )
+
+    # ── Input Safety → Classifier (or END if unsafe) ──────
+    # v1.3.0: moved earlier in the pipeline (was 4th, now 2nd).
     graph.add_conditional_edges(
         "input_safety",
         _route_after_input_safety,
+        {"end": END, "classifier": "classifier"},
+    )
+
+    # ── Classifier → Cache Check (or END for non-INSURANCE) ─
+    # v1.3.0 FIX (Bug #1/#2): now conditional. classifier_node
+    # sets state.refusal_triggered=True alongside final_response
+    # for non-INSURANCE intents (classifier_node.py v1.3.0) —
+    # this edge map addition is what lets that flag actually
+    # short-circuit to END instead of always continuing to
+    # cache_check regardless. See supervisor.py v1.10.0 CHANGE
+    # LOG for the confirmed live repro this fixes.
+    graph.add_conditional_edges(
+        "classifier",
+        _route_after_classifier,
+        {"end": END, "cache_check": "cache_check"},
+    )
+
+    # ── Cache Check → Retriever ────────────────────────────
+    # v1.3.0: target changed from "input_safety" to "retriever" —
+    # input_safety now runs earlier (see above), so a cache miss
+    # goes straight to retrieval.
+    graph.add_conditional_edges(
+        "cache_check",
+        _route_after_cache,
         {"end": END, "retriever": "retriever"},
     )
     graph.add_conditional_edges(

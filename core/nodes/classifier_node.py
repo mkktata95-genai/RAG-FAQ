@@ -1,19 +1,62 @@
 """
 Classifier Node — intent classification and query type detection.
 
-Runs AFTER supervisor (validation, sanitisation, quick greeting
-check) and BEFORE cache_check. Sets state.intent and
-state.query_type so all downstream nodes have consistent,
-pre-computed signals without re-classifying.
+Runs AFTER supervisor and input_safety (validation, sanitisation,
+quick greeting check, safety Layers 1-5) and BEFORE cache_check.
+Sets state.intent and state.query_type so all downstream nodes
+have consistent, pre-computed signals without re-classifying.
 
-Pipeline position:
-    Supervisor → [Classifier] → Cache Check → Input Safety
+Pipeline position (v1.3.0 — updated, Bug #24):
+    Supervisor → Input Safety → [Classifier] → Cache Check
     → Retriever → Prompt Builder → Generator → Output Safety
     → Formatter → Cache Write
 
 ═══════════════════════════════════════════════════════════════
 CHANGE LOG
 ═══════════════════════════════════════════════════════════════
+
+v1.3.0 — July 2026 | Mukesh Kund
+         Tier 1 batch 2 — Bug #1/#2 fix + pipeline reorder (Bug #24).
+
+         FIX — classifier_node() Step 3 now sets
+         state.refusal_triggered = True alongside final_response
+         for non-INSURANCE intents:
+         - ROOT CAUSE: only final_response was set. route_after_
+           classifier (supervisor.py) checked refusal_triggered
+           only and always returned "cache_check" unconditionally
+           — so a query already correctly classified as e.g.
+           IRRELEVANT still ran the full pipeline (cache embedding,
+           canonical rewrite, retrieval, generation) anyway.
+           Confirmed live: "Who is the PM of UK?" → classified
+           IRRELEVANT → proceeded through 5 more nodes and ~19s
+           before generating an answer using RLG pension documents
+           to (badly) address an unrelated political question.
+         - input_safety_node already used this exact pattern
+           correctly (both flags set together) — this brings
+           classifier_node.py in line with it.
+         - Companion fix: supervisor.py v1.10.0 — route_after_
+           classifier now actually checks the flag this sets.
+
+         ALSO — pipeline position updated (Bug #24, supervisor.py
+         v1.10.0 companion change): this node now runs AFTER
+         input_safety, not before. Docstrings above and on
+         classifier_node() itself updated to match. No functional
+         change to this file's own logic beyond the refusal_
+         triggered fix above — the reorder is entirely a
+         supervisor.py/graph.py routing change.
+
+         ALSO — cleaned up classifier_node()'s docstring, which
+         previously contained an unedited self-correction ("Wait —
+         actually route_after_supervisor handles non-insurance
+         early exit. Let me clarify the flow:") that had been
+         committed as-is. Replaced with a single accurate
+         description of current behaviour.
+
+         ROLLBACK:
+         - Remove `state.refusal_triggered = True` from Step 3.
+         - Revert docstrings to describe the pre-v1.3.0 pipeline
+           position (Supervisor → Classifier → Cache Check →
+           Input Safety → ...).
 
 v1.2.0 — July 2026 | Mukesh Kund
          GPT-5 compatibility + BROAD_SIGNALS fix + model-agnostic helper.
@@ -620,36 +663,31 @@ def classifier_node(state: AgentState) -> AgentState:
     Classify query intent and type. Sets state.intent and
     state.query_type for all downstream nodes to consume.
 
-    Pipeline position: Supervisor → [Classifier] → Cache Check
+    Pipeline position (v1.3.0 — updated, Bug #24):
+    Supervisor → Input Safety → [Classifier] → Cache Check
 
-    This node always routes to Cache Check — there are no
-    early-exit branches here. Non-INSURANCE responses
-    (greetings, chitchat, etc.) are generated HERE and stored
-    on state.final_response, but the node still returns normally.
-    route_after_classifier in graph.py always sends to cache_check;
-    cache_check will see final_response already set and skip.
-
-    Wait — actually route_after_supervisor handles non-insurance
-    early exit. Let me clarify the flow:
+    For non-INSURANCE intents (GREETING/CHITCHAT/IRRELEVANT etc,
+    confidence >= 0.85), this node sets BOTH state.final_response
+    AND state.refusal_triggered = True (v1.3.0 fix — see CHANGE
+    LOG). route_after_classifier in supervisor.py checks both and
+    routes directly to END, so the pipeline actually stops here
+    instead of continuing through cache_check/retrieval/generation
+    for a query already known not to need them.
 
     If supervisor's quick_intent_check() caught "hi"/"thanks"/
     "bye" → supervisor set state.final_response → route_after_
-    supervisor returned "end" → this node never runs.
+    supervisor returned "end" → this node never runs at all.
 
     If a longer greeting/chitchat/irrelevant query reached here:
     → classify_intent() returns GREETING/CHITCHAT/etc.
     → is_contextual_follow_up() checks if it's actually a
       follow-up (history context)
-    → If not a follow-up: set state.intent, set
-      state.final_response from GREETING_RESPONSES,
-      state.query_type = "SPECIFIC"
+    → If not a follow-up: set state.intent, state.refusal_
+      triggered = True, state.final_response from
+      GREETING_RESPONSES, state.query_type = "SPECIFIC"
     → If follow-up override: set state.intent = "INSURANCE",
       state._override_triggered = True, continue to pipeline
     → For INSURANCE queries: set state.intent, state.query_type
-
-    In all cases, route_after_classifier → cache_check.
-    cache_check and downstream nodes check state.final_response
-    and state.refusal_triggered to decide whether to proceed.
 
     Execution steps:
     1. classify_intent() — LLM (gpt-4o-mini)
@@ -694,10 +732,15 @@ def classifier_node(state: AgentState) -> AgentState:
                 )
 
         # ── Step 3: Handle non-INSURANCE intents ─────────────
-        # Generate direct response — does NOT exit the pipeline.
-        # route_after_classifier always goes to cache_check;
-        # downstream nodes check state.final_response.
+        # v1.3.0 FIX (Bug #1/#2): now sets refusal_triggered=True
+        # alongside final_response, matching the pattern already
+        # correct in input_safety_node. Previously only
+        # final_response was set, and route_after_classifier
+        # (supervisor.py) checked refusal_triggered only — so this
+        # branch never actually short-circuited the pipeline; see
+        # supervisor.py v1.10.0 for the other half of this fix.
         if intent != "INSURANCE" and confidence >= 0.85:
+            state.refusal_triggered = True
             state.final_response = GREETING_RESPONSES.get(
                 intent, GREETING_RESPONSES["IRRELEVANT"]
             )
