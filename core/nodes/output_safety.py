@@ -7,7 +7,8 @@ import structlog
 
 from core.safety import check_output
 from core.refusal import get_refusal, RefusalReason
-from core.schemas import AgentState
+from core.schemas import AgentState, Citation
+from core.nodes.prompt_builder_node import CONTACT_CITATION
 
 log = structlog.get_logger()
 
@@ -35,6 +36,12 @@ def output_safety_node(state: AgentState) -> AgentState:
             state.refusal_triggered = True
             state.refusal_reason = reason
             state.final_response = get_refusal(RefusalReason.UNSAFE_OUTPUT)
+            state.citations = [Citation(
+                index=1,
+                url=CONTACT_CITATION["url"],
+                title=CONTACT_CITATION["title"],
+                section=CONTACT_CITATION["section"],
+            )]
             log.warning(
                 "output_unsafe",
                 reason=reason,

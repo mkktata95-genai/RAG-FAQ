@@ -130,6 +130,35 @@ v1.3.0 — July 2026 | Mukesh Kund
          to reflect v1.2.0's approach (URL removed, Citation pill
          injected by generator). No logic change.
 
+v1.4.0 — July 2026 | Mukesh Kund
+         BUG #3 FIX — Conversation history sanitisation
+
+         PROBLEM: raw client-supplied conversation_history was
+         injected into the prompt verbatim. A refused/harmful turn
+         earlier in the session got re-sent to Azure OpenAI on
+         every later legitimate query, re-tripping the Content
+         Safety filter and forcing generator.py's
+         retry-without-history recovery path (extra LLM call +
+         latency) even though the current query was clean. Two
+         prior fixes (v1.7.0/v1.9.0 in the old generator.py) only
+         told the model to behave despite toxic history via
+         SYSTEM_PROMPT instructions — they didn't remove the toxic
+         text itself.
+
+         FIX: new sanitize_history() — drops any Assistant turn
+         whose content matches a known REFUSAL_TEMPLATES string,
+         plus the User turn immediately before it (the trigger).
+         Runs BEFORE the [-6:] window slice in both the main
+         history block and override_note, so refused turns can't
+         consume window space or get anchored to as "the last
+         question". Root-cause fix — eliminates the extra
+         LLM call/retry rather than recovering from it after
+         the fact.
+
+         No new state field or client contract change required —
+         detection is purely content-based against the existing
+         fixed refusal strings.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -139,6 +168,7 @@ import structlog
 from dotenv import load_dotenv, find_dotenv
 
 from core.schemas import AgentState
+from core.refusal import REFUSAL_TEMPLATES
 
 _dotenv_path = find_dotenv(usecwd=False)
 load_dotenv(_dotenv_path, override=True)
@@ -487,6 +517,58 @@ NEVER:
 """
 
 
+# ── History sanitisation (v1.4.0 — bug #3) ────────────────────
+# Every refusal in the pipeline (input_safety, output_safety,
+# retriever no-results, generator fallback) returns one of these
+# fixed strings via get_refusal(). That makes them a reliable
+# signature for "this turn was refused/harmful" — no new state
+# flag or client-side metadata required.
+_REFUSAL_TEXTS = {text.strip() for text in REFUSAL_TEMPLATES.values()}
+
+
+def sanitize_history(conversation_history: list[dict]) -> list[dict]:
+    """
+    Strip refused/harmful turns out of conversation_history BEFORE
+    they're ever injected into a prompt.
+
+    Root-cause fix for bug #3: previously the raw client-supplied
+    history was injected verbatim, so a harmful/jailbreak turn
+    sitting earlier in the session got re-sent to Azure OpenAI on
+    every subsequent legitimate query — tripping the Content Safety
+    filter again and forcing the retry-without-history recovery
+    path (extra LLM call + latency) on a completely clean query.
+
+    Detection: an Assistant turn whose content matches a known
+    REFUSAL_TEMPLATES string means the pipeline refused that
+    exchange. Both that Assistant turn AND the User turn
+    immediately before it (the actual trigger) are dropped.
+
+    Any other Assistant content (real answers) is left untouched.
+    """
+    if not conversation_history:
+        return conversation_history
+
+    drop = set()
+    for idx, turn in enumerate(conversation_history):
+        role    = (turn.get("role") or "").lower()
+        content = (turn.get("content") or "").strip()
+        if role == "assistant" and content in _REFUSAL_TEXTS:
+            drop.add(idx)
+            if (
+                idx > 0
+                and (conversation_history[idx - 1].get("role") or "").lower()
+                == "user"
+            ):
+                drop.add(idx - 1)
+
+    if not drop:
+        return conversation_history
+
+    return [
+        turn for i, turn in enumerate(conversation_history) if i not in drop
+    ]
+
+
 # ── Prompt construction helpers ───────────────────────────────
 def build_context(state: AgentState) -> str:
     """
@@ -528,10 +610,13 @@ def build_user_prompt(state: AgentState) -> str:
     """
     context = build_context(state)
 
-    # Conversation history — last 6 turns
+    # Conversation history — sanitised, then last 6 turns.
+    # Sanitisation runs BEFORE the [-6:] slice so a run of refused
+    # turns can't push legitimate history out of the window.
     history = ""
-    if state.conversation_history:
-        recent = state.conversation_history[-6:]
+    clean_history = sanitize_history(state.conversation_history)
+    if clean_history:
+        recent = clean_history[-6:]
         parts  = []
         for turn in recent:
             role    = turn.get("role", "")
@@ -590,8 +675,8 @@ def build_user_prompt(state: AgentState) -> str:
     override_note = ""
     if state.__dict__.get("_override_triggered"):
         last_user_q = ""
-        if state.conversation_history:
-            recent = state.conversation_history[-6:]
+        if clean_history:
+            recent = clean_history[-6:]
             for turn in reversed(recent):
                 if turn.get("role", "").lower() == "user":
                     last_user_q = turn.get("content", "").strip()
@@ -707,6 +792,11 @@ def prompt_builder_node(state: AgentState) -> AgentState:
             prompt_length=len(built_prompt),
             has_context=bool(state.retrieved_chunks),
             has_history=bool(state.conversation_history),
+            history_turns_dropped=(
+                len(state.conversation_history)
+                - len(sanitize_history(state.conversation_history))
+                if state.conversation_history else 0
+            ),
             needs_empathy=state.needs_empathy,
             needs_disclaimer=state.needs_disclaimer,
             bereavement=bool(state.__dict__.get("_bereavement")),

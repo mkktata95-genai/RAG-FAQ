@@ -11,6 +11,7 @@ class RefusalReason(Enum):
     NO_RESULTS = "no_results"
     GENERAL = "general"
     OUT_OF_SCOPE = "out_of_scope"
+    UNSAFE_OUTPUT = "unsafe_output"
 
 
 REFUSAL_TEMPLATES = {
@@ -37,14 +38,17 @@ REFUSAL_TEMPLATES = {
     RefusalReason.NO_RESULTS: (
         "I wasn't able to find specific information about "
         "that in our knowledge base. For detailed assistance "
-        "please contact Royal London directly on "
-        "0345 600 0371 or see our contact page below."
+        "please see our contact page below."
     ),
 
     RefusalReason.GENERAL: (
         "I'm unable to process your request at the moment. "
-        "Please contact Royal London directly on "
-        "0345 600 0371 or see our contact page below."
+        "Please see our contact page below."
+    ),
+
+    RefusalReason.UNSAFE_OUTPUT: (
+        "I'm unable to process your request at the moment. "
+        "Please see our contact page below."
     ),
 }
 
