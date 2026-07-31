@@ -748,6 +748,29 @@ v2.8.0 — July 2026 | Mukesh Kund
          elif ACCOUNT_ACCESS_RESPONSE branch, restore `elif state.
          needs_disclaimer:` (drop the `or has_disclaimer_text`).
 
+v2.9.0 — July 2026 | Mukesh Kund
+         BUG #29 FIX — RECOMMENDATION RULE refusal inconsistently
+         missing its adviser citation pill
+
+         PROBLEM: confirmed live — RECOMMENDATION_RESPONSE was
+         never directly detected in generator.py. Whether it got
+         ADVISER_CITATION depended entirely on state.needs_
+         disclaimer, a FINANCIAL_DECISION_TRIGGERS keyword-match
+         side effect. "Should I switch to Cash ISA?" matched
+         "should i switch" -> pill attached. "Is Income Protection
+         worth it for me?" hit the IDENTICAL refusal text but
+         matched no trigger phrase ("worth it for me" vs the
+         list's "is it worth") -> citations=0. Same refusal
+         template, inconsistent pill depending on exact wording.
+
+         FIX: added RECOMMENDATION_RESPONSE import + direct
+         detection branch (same structure as ACCOUNT_ACCESS_
+         RESPONSE) — attaches ADVISER_CITATION whenever this exact
+         refusal text is present, independent of needs_disclaimer.
+
+         ROLLBACK: revert to v2.8.0 — remove RECOMMENDATION_
+         RESPONSE from the import and its elif branch here.
+
 ═══════════════════════════════════════════════════════════════
 """
 import os
@@ -767,6 +790,7 @@ from core.nodes.prompt_builder_node import (
     SYSTEM_PROMPT,
     UNKNOWN_PRODUCT_RESPONSE,
     ACCOUNT_ACCESS_RESPONSE,
+    RECOMMENDATION_RESPONSE,
     FINANCIAL_DISCLAIMER_TEXT,
     BEREAVEMENT_HANDOFF_NUMBER,
     CONTACT_CITATION,
@@ -1264,6 +1288,22 @@ def _finalize_response(
         state.raw_response      = ACCOUNT_ACCESS_RESPONSE
         state.final_response    = ACCOUNT_ACCESS_RESPONSE
         state.citations = make_static_citations(CONTACT_CITATION)
+    # ── RECOMMENDATION RULE detection (BUG #29 FIX) ──
+    # Previously relied entirely on state.needs_disclaimer (a
+    # FINANCIAL_DECISION_TRIGGERS keyword-match side effect) to
+    # decide whether the adviser pill got attached to this refusal.
+    # Confirmed live: "Should I switch to Cash ISA?" matched
+    # "should i switch" and got the pill; "Is Income Protection
+    # worth it for me?" hit the identical RECOMMENDATION_RESPONSE
+    # text but matched no trigger phrase ("worth it for me" != "is
+    # it worth"), so citations=0 — same refusal, inconsistent pill.
+    # Detecting the response text directly removes the dependency
+    # on the keyword list predicting every phrasing correctly.
+    elif RECOMMENDATION_RESPONSE in updated_text:
+        state.refusal_triggered = True
+        state.raw_response      = RECOMMENDATION_RESPONSE
+        state.final_response    = RECOMMENDATION_RESPONSE
+        state.citations = make_static_citations(ADVISER_CITATION)
     else:
         state.raw_response = updated_text
         # ── Static citation injection (v2.2.0) ────────────
