@@ -12,6 +12,40 @@ Hybrid approach:
 CHANGE LOG
 ═══════════════════════════════════════════════════════════════
 
+v1.9.0 — July 2026 | Mukesh Kund
+         BUG #10, #11, #13 FIX — synonym corruption + normalisation
+         ordering bug
+
+         #10 — bare "transfer" (SINGLE_WORD_SYNONYMS) always
+         injected "pension" into any transfer query regardless of
+         product: "ISA transfer" -> "isa pension transfer", "bank
+         transfer" -> "bank pension transfer". Removed; genuine
+         pension-transfer queries already contain "pension"
+         verbatim or match "move pension" in DOMAIN_SYNONYMS.
+
+         #11 — bare "flexible access" (DOMAIN_SYNONYMS) always
+         mapped to "pension drawdown", corrupting genuine ISA
+         flexible-access queries (a real, different, ISA-specific
+         HMRC feature) into pension-drawdown content. Now only
+         maps when "pension" is explicitly present in the phrase
+         ("flexible access pension", "pension flexible access",
+         "flexible access to/on my pension").
+
+         #13 — apply_domain_synonyms() Stage 1 loop applied EVERY
+         matching entry unconditionally, including shorter phrases
+         overlapping an already-canonical longer phrase. Confirmed
+         reproducible: "what is critical illness cover" ->
+         "what is critical illness cover cover" (the no-op self-map
+         entry left "critical illness cover" untouched, then the
+         shorter "critical illness" entry partially re-matched it).
+         Fixed generally — a replacement is now skipped if its
+         target phrase is already present in text_lower, not just
+         for this one pair.
+
+         ROLLBACK: revert to v1.8.0 — restore bare "transfer" and
+         "flexible access" entries, remove the `replacement not in
+         text_lower` guard in apply_domain_synonyms().
+
 v1.8.0 — July 2026 | Mukesh Kund
          BUG #25 FIX — "vs" mis-lemmatized to "v"
 
@@ -345,7 +379,18 @@ DOMAIN_SYNONYMS = {
     "serious illness":            "critical illness cover",
     "critical illness":           "critical illness cover",
     "income cover":               "income protection",
-    "flexible access":            "pension drawdown",
+    # BUG #11 FIX (July 2026, Mukesh Kund): bare "flexible access"
+    # removed — always mapped to "pension drawdown" regardless of
+    # context, corrupting genuine ISA flexible-access queries
+    # ("does my ISA have flexible access?", "flexible access to my
+    # ISA" — a real, different, ISA-specific HMRC feature allowing
+    # same-tax-year withdraw/replace) into pension-drawdown content.
+    # Only maps now when "pension" is explicitly present.
+    "flexible access pension":    "pension drawdown",
+    "pension flexible access":    "pension drawdown",
+    "flexible access to my pension": "pension drawdown",
+    "flexible access to pension":    "pension drawdown",
+    "flexible access on my pension": "pension drawdown",
     "savings account":            "isa",
     "get in touch":               "contact",
     "phone number":               "contact",
@@ -371,7 +416,15 @@ SINGLE_WORD_SYNONYMS = {
     "unhappy":    "complaint",
     "dispute":    "complaint",
     "drawdown":   "pension drawdown",
-    "transfer":   "pension transfer",
+    # BUG #10 FIX (July 2026, Mukesh Kund): "transfer" removed —
+    # unconditionally injected "pension" into every transfer query
+    # regardless of product, corrupting "ISA transfer" -> "isa
+    # pension transfer" and "bank transfer" -> "bank pension
+    # transfer". Genuine pension-transfer queries already contain
+    # the word "pension" verbatim (or match "move pension" in
+    # DOMAIN_SYNONYMS above), so retrieval/embedding quality is
+    # unaffected by removing this — only the incorrect cross-domain
+    # injection stops.
 }
 
 # ── Canonical Rewrite Prompt ──────────────────────────────────
@@ -432,8 +485,26 @@ def apply_domain_synonyms(text: str) -> str:
     text_lower = text.lower()
 
     # Stage 1: multi-word phrase replacement (longest first)
+    #
+    # BUG #13 FIX (July 2026, Mukesh Kund): a no-op self-map entry
+    # (e.g. "critical illness cover" -> "critical illness cover",
+    # guarded by `replacement != phrase` below so it's skipped) left
+    # the already-canonical phrase untouched in text_lower. A LATER,
+    # shorter overlapping entry ("critical illness" -> "critical
+    # illness cover") then partially re-matched that same text and
+    # appended the replacement again: "critical illness cover" ->
+    # "critical illness cover cover". Confirmed reproducible.
+    # Fixed generally: skip a replacement if its target phrase is
+    # already present in text_lower — the text is already in
+    # canonical form for that concept, nothing to do. This also
+    # guards any other longer/shorter overlapping pair, not just
+    # the critical-illness one.
     for phrase, replacement in DOMAIN_SYNONYMS.items():
-        if phrase in text_lower and replacement != phrase:
+        if (
+            phrase in text_lower
+            and replacement != phrase
+            and replacement not in text_lower
+        ):
             text_lower = text_lower.replace(phrase, replacement)
 
     # Stage 2: single-word replacement with word boundaries

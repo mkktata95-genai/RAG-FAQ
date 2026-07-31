@@ -24,6 +24,23 @@ BUG #6/#7 FIX (July 2026, Mukesh Kund):
 ROLLBACK: restore the single combined pattern with unqualified
 rules/guidelines, and drop the \b on the "i am admin" alternation.
 
+BUG #26 FIX (July 2026, Mukesh Kund): "prime minister" in
+IRRELEVANT_KEYWORDS didn't catch the "PM" abbreviation; same gap
+for "MP". Added IRRELEVANT_PATTERNS (regex, not plain substring)
+for both — "pm" collides with time-of-day ("3pm"), "mp" collides
+with "employment"/"unemployment"/"self-employment" (all common in
+this domain). Also broadened IRRELEVANT_KEYWORDS with common
+abbreviations/slang for existing categories (sports leagues/
+abbreviations, streaming services, social media, crypto, consoles,
+etc.) — each checked individually against domain phrases
+("premium", "gig economy income protection", "self-employment",
+"contact method", "3pm"/"2pm") before inclusion; none collide.
+This is a performance optimisation (avoids paying for the gpt-5-nano
+classify_intent() call on common cases), not a coverage fix —
+gate 2 (classify_intent) already catches anything gate 1 misses.
+ROLLBACK: remove IRRELEVANT_PATTERNS and its check_relevance()
+call site; revert IRRELEVANT_KEYWORDS to the pre-v1.x list.
+
 ═══════════════════════════════════════════════════════════════
 CHANGE LOG
 ═══════════════════════════════════════════════════════════════
@@ -225,20 +242,48 @@ RELEVANT_KEYWORDS = [
 
 IRRELEVANT_KEYWORDS = [
     "weather", "forecast", "recipe", "cook", "food",
-    "sport", "football", "cricket", "rugby", "tennis",
-    "movie", "film", "music", "song", "concert",
+    "sport", "football", "footy", "footie",
+    "cricket", "rugby", "tennis",
+    "nba", "nfl", "mlb", "formula 1", "grand prix",
+    "movie", "film", "flick", "music", "song", "concert",
+    "live gig", "gig tickets",
     "politics", "election", "party", "government",
+    "brexit", "senate", "congress", "parliament",
     "celebrity", "gossip", "entertainment",
     "dating", "relationship", "romance",
     "travel", "holiday", "visa", "passport",
     "gaming", "video game", "console",
+    "xbox", "playstation", "nintendo",
     "fashion", "clothes", "shopping",
     "joke", "funny", "meme",
+    "quiz", "trivia", "horoscope", "zodiac",
+    "lottery", "lotto",
     "capital of", "prime minister", "president",
-    "cryptocurrency", "bitcoin", "nft",
+    "cryptocurrency", "bitcoin", "ethereum", "btc", "nft",
     "smartphone", "phone", "laptop", "technology",
+    "netflix", "spotify", "youtube",
+    "instagram", "tiktok", "twitter", "facebook",
     "pasta", "pizza", "restaurant",
     "premier league", "champions league",
+]
+
+# BUG #26 FIX (July 2026, Mukesh Kund): "prime minister"/"president"
+# above didn't catch common abbreviations ("PM", "MP"). Cannot add
+# these bare to IRRELEVANT_KEYWORDS — that list is plain-substring
+# matched, and both collide badly with ordinary insurance-domain
+# words: "pm" is a substring of time references ("3pm", "2pm
+# meeting") and words like "topmost"; "mp" is a substring of
+# "employment", "unemployment", "self-employment", "employer" —
+# all common in this domain (income protection, workplace pension
+# queries). Regex with explicit context instead. This is a
+# performance optimisation, not a coverage fix — classify_intent()
+# (gate 2, gpt-5-nano) already catches anything gate 1 misses; gate
+# 1 just avoids paying the LLM-call cost/latency for common cases.
+IRRELEVANT_PATTERNS = [
+    r"\bpm\s+of\s+(the\s+)?\w+",       # "PM of UK", "pm of the uk"
+    r"\bwho\s+is\s+the\s+pm\b",        # "who is the PM"
+    r"\bwho\s+is\s+(my|the)\s+mp\b",   # "who is my MP"
+    r"\bmp\s+for\s+my\s+\w+",          # "MP for my constituency"
 ]
 
 # ── Layer 2: Crime/Fraud ──────────────────────────────────────
@@ -355,6 +400,13 @@ def check_relevance(text: str) -> tuple[bool, str | None]:
 
     for keyword in IRRELEVANT_KEYWORDS:
         if keyword in text_lower:
+            if not any(r in text_lower for r in RELEVANT_KEYWORDS):
+                return False, "irrelevant"
+
+    # BUG #26 FIX: regex-based checks for topics that plain substring
+    # matching would be unsafe for (see IRRELEVANT_PATTERNS above).
+    for pattern in IRRELEVANT_PATTERNS:
+        if re.search(pattern, text_lower):
             if not any(r in text_lower for r in RELEVANT_KEYWORDS):
                 return False, "irrelevant"
 
