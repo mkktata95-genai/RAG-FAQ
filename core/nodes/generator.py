@@ -723,6 +723,31 @@ v2.7.0 — July 2026 | Mukesh Kund
          ROLLBACK: revert to v2.6.0's extract_citations() —
          renumber-then-filter instead of filter-then-renumber.
 
+v2.8.0 — July 2026 | Mukesh Kund
+         BUG #27 + #28 FIX — ACCOUNT ACCESS RULE and FINANCIAL
+         DISCLAIMER RULE responses missing their citation pills
+
+         #27: added ACCOUNT_ACCESS_RESPONSE import + detection
+         branch mirroring UNKNOWN_PRODUCT_RESPONSE's — attaches
+         CONTACT_CITATION whenever the ACCOUNT ACCESS RULE fires.
+
+         #28: added FINANCIAL_DISCLAIMER_TEXT import. static_extras
+         now checks `state.needs_disclaimer OR FINANCIAL_DISCLAIMER_
+         TEXT in updated_text` instead of the flag alone — attaches
+         ADVISER_CITATION (the dedicated /find-a-financial-adviser/
+         page) whenever the LLM actually wrote the disclaimer
+         paragraph, even on queries FINANCIAL_DECISION_TRIGGERS
+         didn't predict in advance.
+
+         Full rationale for both in prompt_builder_node.py v1.6.0
+         changelog (both constants defined there, single source
+         of truth).
+
+         ROLLBACK: revert to v2.7.0 — remove ACCOUNT_ACCESS_RESPONSE
+         and FINANCIAL_DISCLAIMER_TEXT from the import, remove the
+         elif ACCOUNT_ACCESS_RESPONSE branch, restore `elif state.
+         needs_disclaimer:` (drop the `or has_disclaimer_text`).
+
 ═══════════════════════════════════════════════════════════════
 """
 import os
@@ -741,6 +766,8 @@ from core.middleware import track_token_usage
 from core.nodes.prompt_builder_node import (
     SYSTEM_PROMPT,
     UNKNOWN_PRODUCT_RESPONSE,
+    ACCOUNT_ACCESS_RESPONSE,
+    FINANCIAL_DISCLAIMER_TEXT,
     BEREAVEMENT_HANDOFF_NUMBER,
     CONTACT_CITATION,
     ADVISER_CITATION,
@@ -1231,14 +1258,29 @@ def _finalize_response(
         state.raw_response      = UNKNOWN_PRODUCT_RESPONSE
         state.final_response    = UNKNOWN_PRODUCT_RESPONSE
         state.citations = make_static_citations(CONTACT_CITATION)
+    # ── ACCOUNT ACCESS RULE detection (BUG #27 FIX) ──
+    elif ACCOUNT_ACCESS_RESPONSE in updated_text:
+        state.refusal_triggered = True
+        state.raw_response      = ACCOUNT_ACCESS_RESPONSE
+        state.final_response    = ACCOUNT_ACCESS_RESPONSE
+        state.citations = make_static_citations(CONTACT_CITATION)
     else:
         state.raw_response = updated_text
         # ── Static citation injection (v2.2.0) ────────────
         static_extras: list[dict] = []
 
+        # BUG #28 FIX: detect the disclaimer TEXT directly, not just
+        # the needs_disclaimer flag. The LLM decides independently
+        # (FINANCIAL DISCLAIMER RULE) whether to write this
+        # paragraph — it can (and does) write it on queries the
+        # FINANCIAL_DECISION_TRIGGERS keyword list didn't predict.
+        # Without this, the disclaimer's own "please see the link
+        # in our resources below" has no link behind it.
+        has_disclaimer_text = FINANCIAL_DISCLAIMER_TEXT in updated_text
+
         if state.__dict__.get("_bereavement"):
             static_extras = [BEREAVEMENT_CITATION, CONTACT_CITATION]
-        elif state.needs_disclaimer:
+        elif state.needs_disclaimer or has_disclaimer_text:
             static_extras = [ADVISER_CITATION]
         elif state.needs_empathy:
             static_extras = [ADVISER_CITATION, CONTACT_CITATION]

@@ -199,6 +199,41 @@ v1.5.0 — July 2026 | Mukesh Kund
          ROLLBACK: revert to v1.4.0's RECOMMENDATION RULE text
          (personal-framing examples only, no explicit carve-out).
 
+v1.6.0 — July 2026 | Mukesh Kund
+         BUG #27 + #28 FIX — two rule responses reference "the
+         link/contact page" with no citation actually attached
+
+         #27 — ACCOUNT ACCESS RULE. Response text was hardcoded
+         inline in SYSTEM_PROMPT with no matching Python constant,
+         so generator.py had nothing to detect and never attached
+         CONTACT_CITATION, despite this file's own CONTACT_CITATION
+         header comment already documenting ACCOUNT ACCESS RULE as
+         one of the three rules meant to get the pill. Added
+         ACCOUNT_ACCESS_RESPONSE constant (single source of truth,
+         same pattern as UNKNOWN_PRODUCT_RESPONSE), referenced via
+         f-string instead of a hardcoded duplicate.
+
+         #28 — FINANCIAL DISCLAIMER RULE. The disclaimer paragraph
+         is an LLM judgement call, entirely separate from
+         state.needs_disclaimer (set by FINANCIAL_DECISION_TRIGGERS
+         keyword matching in supervisor.py). Confirmed live: LLM
+         wrote the disclaimer on a query ("...as a gig economy
+         worker?") that didn't match any trigger keyword, so
+         needs_disclaimer stayed False and ADVISER_CITATION was
+         never attached — the disclaimer's own "please see the
+         link in our resources below" had no link behind it. Added
+         FINANCIAL_DISCLAIMER_TEXT constant, same pattern.
+
+         Both now detected directly in generator.py's post-
+         generation text (see that file's changelog) rather than
+         inferred from upstream flags — closes the gap for any
+         case the LLM judges correctly but a keyword list didn't
+         predict in advance, not just the ones on file.
+
+         ROLLBACK: revert to v1.5.0 — restore hardcoded quoted
+         text inline for both rules, remove ACCOUNT_ACCESS_RESPONSE
+         and FINANCIAL_DISCLAIMER_TEXT constants.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -223,6 +258,46 @@ log = structlog.get_logger()
 UNKNOWN_PRODUCT_RESPONSE = (
     "I'm sorry, I don't have information about that in our "
     "knowledge base. For assistance please see our contact page."
+)
+
+# BUG #27 FIX (July 2026, Mukesh Kund): same single-source-of-truth
+# pattern as UNKNOWN_PRODUCT_RESPONSE above. Previously the ACCOUNT
+# ACCESS RULE's exact response text was hardcoded directly inline
+# in SYSTEM_PROMPT with no matching Python constant and no detection
+# in generator.py — so despite the response text saying "please use
+# our contact page", no CONTACT_CITATION pill was ever attached
+# (confirmed live: citations=0 on account-access queries). The
+# header comment on CONTACT_CITATION below already documented this
+# rule as one that should get the pill; the wiring was just missing.
+ACCOUNT_ACCESS_RESPONSE = (
+    "I'm not able to access account information directly. "
+    "For your account details please use our contact page "
+    "or log in to your Royal London account."
+)
+
+# BUG #28 FIX (July 2026, Mukesh Kund): the FINANCIAL DISCLAIMER
+# RULE is a judgement call the LLM makes itself (query "involves a
+# financial decision, investment choice, or personal financial
+# advice") — entirely separate from state.needs_disclaimer, which
+# is set by FINANCIAL_DECISION_TRIGGERS keyword matching in
+# supervisor.py. The two can (and did — confirmed live) disagree:
+# LLM wrote the disclaimer text (correctly judged this needed one)
+# on a query ("...as a gig economy worker?") that didn't match any
+# FINANCIAL_DECISION_TRIGGERS phrase, so needs_disclaimer stayed
+# False and ADVISER_CITATION was never attached — leaving the
+# disclaimer's own "please see the link in our resources below"
+# with no link behind it. Same single-source-of-truth pattern as
+# ACCOUNT_ACCESS_RESPONSE: generator.py now detects this exact text
+# and attaches ADVISER_CITATION whenever it's actually present,
+# regardless of the needs_disclaimer flag — closes the gap for any
+# query the LLM judges as financial-advice-adjacent, not just the
+# ones a keyword list happens to predict in advance.
+FINANCIAL_DISCLAIMER_TEXT = (
+    "Please note: This information is for general guidance only "
+    "and does not constitute financial advice. For advice tailored "
+    "to your personal circumstances, we recommend speaking with a "
+    "qualified financial adviser — please see the link in our "
+    "resources below."
 )
 
 # ── Static Contact Citation ───────────────────────────────────
@@ -410,11 +485,7 @@ FINANCIAL DISCLAIMER RULE:
 ONLY add this disclaimer when the query involves a financial
 decision, investment choice, or personal financial advice.
 Write it as plain text with NO asterisks or markdown:
-Please note: This information is for general guidance only
-and does not constitute financial advice. For advice tailored
-to your personal circumstances, we recommend speaking with a
-qualified financial adviser — please see the link in our
-resources below.
+{FINANCIAL_DISCLAIMER_TEXT}
 NEVER write a URL in the disclaimer text.
 
 PHONE NUMBER RULE:
@@ -539,9 +610,7 @@ If a customer asks you to look up, check, retrieve, or
 access their account, policy, pension, or personal
 information — do NOT attempt to do so.
 Respond with ONLY this exact message and nothing else:
-"I'm not able to access account information directly.
-For your account details please use our contact page
-or log in to your Royal London account."
+"{ACCOUNT_ACCESS_RESPONSE}"
 Do NOT add any further guidance, steps, resources,
 or helpful information after this message.
 Stop there. The refusal is your complete response.
