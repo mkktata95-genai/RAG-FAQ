@@ -1,0 +1,770 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Aria — RLG AI Assistant</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.development.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.development.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --brand:       #1e3a5f;   /* Royal London deep navy */
+      --brand-light: #2a5298;
+      --accent:      #c8a951;   /* gold */
+      --bg:          #f4f6f9;
+      --surface:     #ffffff;
+      --border:      #dde2eb;
+      --text:        #1a2233;
+      --muted:       #6b7a96;
+      --user-bubble: #1e3a5f;
+      --empathy:     #fef3cd;
+      --empathy-border: #f0c040;
+      --cite-bg:     #eef3ff;
+      --cite-border: #bfcfee;
+      --cite-text:   #1e3a5f;
+      --error-bg:    #fef2f2;
+      --error-text:  #b91c1c;
+      --cached:      #d97706;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Header ─────────────────────────────────────────────── */
+    .header {
+      background: var(--brand);
+      padding: 0 20px;
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.18);
+    }
+    .header-left { display: flex; align-items: center; gap: 12px; }
+    .aria-avatar {
+      width: 38px; height: 38px; border-radius: 50%;
+      background: var(--accent);
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 800; font-size: 15px; color: var(--brand);
+      flex-shrink: 0;
+    }
+    .header-name { font-weight: 700; font-size: 15px; color: #ffffff; }
+    .header-sub  { font-size: 11px; color: rgba(255,255,255,0.65); margin-top: 1px; }
+    .header-status {
+      display: flex; align-items: center; gap: 5px;
+      font-size: 11px; color: #6ee7b7;
+    }
+    .status-dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: #6ee7b7;
+      box-shadow: 0 0 0 2px rgba(110,231,183,0.3);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+
+    .header-actions { display: flex; gap: 8px; align-items: center; }
+    .icon-btn {
+      background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 7px; padding: 5px 10px;
+      color: rgba(255,255,255,0.85); font-size: 11px; cursor: pointer;
+      transition: background 0.15s;
+    }
+    .icon-btn:hover { background: rgba(255,255,255,0.22); }
+
+    /* ── Dev settings bar ──────────────────────────────────── */
+    .settings-bar {
+      background: #fffbeb; border-bottom: 2px solid var(--empathy-border);
+      padding: 8px 20px; display: flex; align-items: center; gap: 10px;
+      flex-shrink: 0;
+    }
+    .settings-bar label { font-size: 11px; font-weight: 700; color: #92400e; white-space: nowrap; }
+    .settings-bar input {
+      flex: 1; border: 1px solid #fcd34d; border-radius: 6px;
+      padding: 5px 10px; font-size: 12px; font-family: monospace;
+      background: white; color: #374151; outline: none;
+    }
+    .settings-bar input:focus { border-color: #f59e0b; box-shadow: 0 0 0 2px rgba(245,158,11,0.2); }
+    .settings-bar button {
+      font-size: 12px; font-weight: 600; color: #92400e;
+      background: rgba(245,158,11,0.15); border: 1px solid #fcd34d;
+      border-radius: 6px; padding: 5px 12px; cursor: pointer;
+    }
+
+    /* ── Messages area ─────────────────────────────────────── */
+    .messages {
+      flex: 1; overflow-y: auto; padding: 20px 16px 8px;
+      display: flex; flex-direction: column;
+      scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+    }
+    .messages-inner { max-width: 720px; margin: 0 auto; width: 100%; }
+
+    /* ── Message rows ──────────────────────────────────────── */
+    .message-row { display: flex; align-items: flex-end; gap: 10px; margin-bottom: 18px; }
+    .message-row.user { flex-direction: row-reverse; }
+
+    .msg-avatar {
+      width: 34px; height: 34px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 700; font-size: 13px; flex-shrink: 0;
+    }
+    .msg-avatar.aria { background: var(--accent); color: var(--brand); }
+    .msg-avatar.user { background: var(--brand-light); color: white; }
+
+    .msg-body { display: flex; flex-direction: column; max-width: 580px; }
+    .message-row.user .msg-body { align-items: flex-end; }
+
+    /* ── Bubbles ───────────────────────────────────────────── */
+    .bubble {
+      padding: 11px 15px; border-radius: 18px;
+      font-size: 14px; line-height: 1.65;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.07);
+    }
+    .bubble.assistant {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-bottom-left-radius: 4px;
+    }
+    .bubble.user {
+      background: var(--user-bubble);
+      color: #ffffff;
+      border-bottom-right-radius: 4px;
+      white-space: pre-wrap;
+    }
+    /* Empathy tint */
+    .bubble.assistant.empathy {
+      border-left: 3px solid var(--empathy-border);
+      background: var(--empathy);
+    }
+
+    /* ── Markdown content ──────────────────────────────────── */
+    .md-content p { margin-bottom: 7px; }
+    .md-content p:last-child { margin-bottom: 0; }
+    .md-content strong { font-weight: 600; color: #0f1e33; }
+    .md-content em { font-style: italic; color: var(--muted); }
+    .md-content ul { padding-left: 20px; margin-bottom: 7px; }
+    .md-content ul li { margin-bottom: 4px; }
+    .md-content ol { padding-left: 20px; margin-bottom: 7px; }
+    .md-content ol li { margin-bottom: 4px; }
+    .md-content h1,.md-content h2,.md-content h3 {
+      font-weight: 700; color: var(--brand); margin: 10px 0 5px;
+    }
+    .md-content h1 { font-size: 16px; }
+    .md-content h2 { font-size: 15px; }
+    .md-content h3 { font-size: 14px; }
+    .md-content h1:first-child,
+    .md-content h2:first-child,
+    .md-content h3:first-child { margin-top: 0; }
+    /* Superscript citation markers */
+    .cite-sup {
+      color: var(--brand-light); font-weight: 700;
+      font-size: 10px; vertical-align: super; cursor: default;
+    }
+
+    /* ── Streaming cursor ──────────────────────────────────── */
+    .cursor {
+      display: inline-block; width: 2px; height: 14px;
+      background: var(--brand); margin-left: 2px;
+      animation: blink 0.9s infinite; vertical-align: middle;
+    }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
+    /* ── Citation pills ────────────────────────────────────── */
+    .citations {
+      display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px;
+    }
+    .citation-pill {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 3px 10px; background: var(--cite-bg);
+      border: 1px solid var(--cite-border); border-radius: 20px;
+      font-size: 11px; color: var(--cite-text); text-decoration: none;
+      transition: all 0.15s; max-width: 220px;
+    }
+    .citation-pill:hover {
+      background: #dce8ff; border-color: var(--brand-light);
+      box-shadow: 0 1px 4px rgba(30,58,95,0.12);
+    }
+    .cite-num {
+      font-weight: 800; font-size: 10px;
+      background: var(--brand); color: white;
+      border-radius: 50%; width: 16px; height: 16px;
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+    }
+    .cite-label {
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font-weight: 500;
+    }
+
+    /* ── Meta row ──────────────────────────────────────────── */
+    .meta {
+      display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+      margin-top: 5px; font-size: 11px; color: var(--muted);
+    }
+    .meta-tag {
+      display: inline-flex; align-items: center; gap: 3px;
+      background: #f0f4ff; border: 1px solid var(--border);
+      border-radius: 10px; padding: 1px 7px; font-size: 10px;
+    }
+    .meta-tag.cached { background: #fef3c7; border-color: #fde68a; color: var(--cached); }
+    .meta-tag.empathy { background: var(--empathy); border-color: var(--empathy-border); color: #92400e; }
+    .meta-tag.model { color: var(--brand); }
+
+    /* ── Typing indicator ──────────────────────────────────── */
+    .typing-row { display: flex; align-items: flex-end; gap: 10px; margin-bottom: 18px; }
+    .typing-bubble {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 18px; border-bottom-left-radius: 4px;
+      padding: 12px 16px; display: flex; gap: 5px; align-items: center;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }
+    .dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--brand-light); opacity: 0.7;
+      animation: bounce 1.3s infinite;
+    }
+    .dot:nth-child(2) { animation-delay: 0.18s; }
+    .dot:nth-child(3) { animation-delay: 0.36s; }
+    @keyframes bounce { 0%,60%,100%{ transform:translateY(0) } 30%{ transform:translateY(-7px) } }
+
+    /* ── Suggestions ───────────────────────────────────────── */
+    .suggestions { padding: 0 16px 10px; }
+    .suggestions-inner {
+      max-width: 720px; margin: 0 auto;
+      display: flex; flex-wrap: wrap; gap: 8px;
+    }
+    .suggestion-label {
+      font-size: 11px; color: var(--muted); width: 100%;
+      margin-bottom: 2px; font-weight: 500; letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+    .suggestion-btn {
+      font-size: 12px; padding: 6px 14px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px; color: var(--brand);
+      cursor: pointer; transition: all 0.15s;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+      font-weight: 500;
+    }
+    .suggestion-btn:hover {
+      border-color: var(--brand-light); background: #eef3ff;
+      box-shadow: 0 2px 5px rgba(30,58,95,0.1);
+    }
+
+    /* ── Error banner ──────────────────────────────────────── */
+    .error-bar { margin-bottom: 12px; }
+    .error-msg {
+      font-size: 12px; color: var(--error-text);
+      background: var(--error-bg); padding: 7px 14px;
+      border-radius: 8px; border: 1px solid #fecaca;
+      display: flex; align-items: center; gap: 6px;
+    }
+
+    /* ── Input area ────────────────────────────────────────── */
+    .input-area {
+      background: var(--surface); border-top: 1px solid var(--border);
+      padding: 12px 16px 14px; flex-shrink: 0;
+    }
+    .input-inner { max-width: 720px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+    textarea {
+      flex: 1; border: 1.5px solid var(--border); border-radius: 14px;
+      padding: 10px 14px; font-size: 14px; font-family: inherit;
+      resize: none; outline: none; color: var(--text);
+      transition: border-color 0.15s, box-shadow 0.15s;
+      min-height: 44px; max-height: 120px; line-height: 1.5;
+      background: var(--bg);
+    }
+    textarea:focus {
+      border-color: var(--brand-light);
+      box-shadow: 0 0 0 3px rgba(42,82,152,0.12);
+      background: white;
+    }
+    textarea:disabled { background: #f0f2f6; color: var(--muted); }
+    textarea::placeholder { color: #a0aabe; }
+
+    .send-btn {
+      width: 44px; height: 44px; border-radius: 12px;
+      background: var(--brand); border: none; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      transition: background 0.15s, transform 0.1s;
+      flex-shrink: 0;
+    }
+    .send-btn:hover:not(:disabled) { background: var(--brand-light); transform: translateY(-1px); }
+    .send-btn:active:not(:disabled) { transform: translateY(0); }
+    .send-btn:disabled { background: var(--border); cursor: not-allowed; }
+
+    .spinner {
+      width: 16px; height: 16px;
+      border: 2px solid rgba(255,255,255,0.35);
+      border-top-color: white; border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .disclaimer {
+      max-width: 720px; margin: 7px auto 0;
+      text-align: center; font-size: 11px; color: #a0aabe;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useRef, useEffect, useCallback } = React;
+
+    const SUGGESTED = [
+      "How do I make a claim?",
+      "How do I contact Royal London?",
+      "What is income protection?",
+      "What are the types of pensions?",
+      "How do I find a lost pension?",
+      "What is a Stocks and Shares ISA?",
+    ];
+
+    // ── Markdown renderer ────────────────────────────────────
+    function parseInline(text) {
+      const parts = [];
+      // Match: **bold**, *italic*, [text](url), [n] citation
+      const regex = /(\*\*(.+?)\*\*|\*(.+?)\*|\[([^\]]+)\]\(([^)]+)\)|\[(\d+)\])/g;
+      let last = 0, match, key = 0;
+      while ((match = regex.exec(text)) !== null) {
+        if (match.index > last) parts.push(text.slice(last, match.index));
+        if (match[2]) {
+          parts.push(<strong key={key++}>{match[2]}</strong>);
+        } else if (match[3]) {
+          parts.push(<em key={key++}>{match[3]}</em>);
+        } else if (match[4] && match[5]) {
+          // Markdown link — open externally (shouldn't appear per URL rule, but handle gracefully)
+          parts.push(
+            <a key={key++} href={match[5]} target="_blank" rel="noopener noreferrer"
+               style={{color:"var(--brand-light)", textDecoration:"underline"}}>
+              {match[4]}
+            </a>
+          );
+        } else if (match[6]) {
+          // [n] citation superscript
+          parts.push(
+            <sup key={key++} className="cite-sup">[{match[6]}]</sup>
+          );
+        }
+        last = match.index + match[0].length;
+      }
+      if (last < text.length) parts.push(text.slice(last));
+      return parts;
+    }
+
+    function renderMarkdown(text) {
+      if (!text) return [];
+      const lines = text.split("\n");
+      const elements = [];
+      let i = 0, key = 0;
+
+      while (i < lines.length) {
+        const line = lines[i];
+        if (line.trim() === "") { i++; continue; }
+
+        if (line.startsWith("### ")) {
+          elements.push(<h3 key={key++}>{parseInline(line.slice(4))}</h3>);
+          i++; continue;
+        }
+        if (line.startsWith("## ")) {
+          elements.push(<h2 key={key++}>{parseInline(line.slice(3))}</h2>);
+          i++; continue;
+        }
+        if (line.startsWith("# ")) {
+          elements.push(<h1 key={key++}>{parseInline(line.slice(2))}</h1>);
+          i++; continue;
+        }
+
+        // Unordered list
+        if (line.match(/^(\s*[-*•])\s/)) {
+          const items = [];
+          while (i < lines.length && lines[i].match(/^(\s*[-*•])\s/)) {
+            const content = lines[i].replace(/^\s*[-*•]\s/, "");
+            items.push(<li key={i}>{parseInline(content)}</li>);
+            i++;
+          }
+          elements.push(<ul key={key++}>{items}</ul>);
+          continue;
+        }
+
+        // Ordered list
+        if (line.match(/^\d+\.\s/)) {
+          const items = [];
+          let olCounter = 1;
+          while (i < lines.length) {
+            const l = lines[i];
+            if (l.match(/^\d+\.\s/)) {
+              const content = l.replace(/^\d+\.\s/, "");
+              items.push(<li key={i} value={olCounter}>{parseInline(content)}</li>);
+              olCounter++; i++;
+            } else if (l.match(/^\s*[-*•]\s/)) {
+              const content = l.replace(/^\s*[-*•]\s/, "");
+              items.push(
+                <li key={i} style={{listStyleType:"disc",marginLeft:"16px",fontWeight:"normal"}}>
+                  {parseInline(content)}
+                </li>
+              );
+              i++;
+            } else if (l.trim() === "") {
+              i++;
+            } else {
+              break;
+            }
+          }
+          elements.push(<ol key={key++}>{items}</ol>);
+          continue;
+        }
+
+        elements.push(<p key={key++}>{parseInline(line)}</p>);
+        i++;
+      }
+      return elements;
+    }
+
+    function MarkdownContent({ text, streaming }) {
+      return (
+        <div className="md-content">
+          {renderMarkdown(text)}
+          {streaming && text && <span className="cursor" />}
+        </div>
+      );
+    }
+
+    // ── Citation pill ────────────────────────────────────────
+    function CitationPill({ c }) {
+      const label = c.title || c.section || c.url || "";
+      return (
+        <a href={c.url} target="_blank" rel="noopener noreferrer"
+           className="citation-pill" title={c.url}>
+          <span className="cite-num">{c.index}</span>
+          <span className="cite-label">{label}</span>
+        </a>
+      );
+    }
+
+    // ── Meta row ────────────────────────────────────────────
+    function MetaRow({ meta }) {
+      if (!meta) return null;
+      const totalMs = meta.latency_ms
+        ? Math.round(Object.values(meta.latency_ms).reduce((a, b) => a + b, 0))
+        : null;
+      return (
+        <div className="meta">
+          {meta.cached && <span className="meta-tag cached">⚡ Cached</span>}
+          {meta.needs_empathy && <span className="meta-tag empathy">💙 Empathy</span>}
+          {meta.model_used && (
+            <span className="meta-tag model">{meta.model_used}</span>
+          )}
+          {totalMs !== null && <span className="meta-tag">{totalMs}ms</span>}
+          {meta.token_usage && meta.token_usage.total_tokens && (
+            <span className="meta-tag">{meta.token_usage.total_tokens} tokens</span>
+          )}
+        </div>
+      );
+    }
+
+    // ── Message component ────────────────────────────────────
+    function Message({ msg }) {
+      const isUser    = msg.role === "user";
+      const hasEmpathy = msg.meta && msg.meta.needs_empathy;
+      return (
+        <div className={`message-row ${isUser ? "user" : ""}`}>
+          <div className={`msg-avatar ${isUser ? "user" : "aria"}`}>
+            {isUser ? "Y" : "A"}
+          </div>
+          <div className="msg-body">
+            <div className={`bubble ${isUser ? "user" : "assistant"} ${hasEmpathy && !isUser ? "empathy" : ""}`}>
+              {isUser
+                ? msg.content
+                : <MarkdownContent text={msg.content} streaming={msg.streaming} />
+              }
+            </div>
+            {/* Citations — only when not streaming and citations exist */}
+            {!isUser && !msg.streaming && msg.citations && msg.citations.length > 0 && (
+              <div className="citations">
+                {msg.citations
+                  .slice()
+                  .sort((a, b) => a.index - b.index)
+                  .map((c, i) => <CitationPill key={i} c={c} />)
+                }
+              </div>
+            )}
+            {!isUser && !msg.streaming && (
+              <MetaRow meta={msg.meta} />
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ── Typing indicator ─────────────────────────────────────
+    function TypingIndicator() {
+      return (
+        <div className="typing-row">
+          <div className="msg-avatar aria">A</div>
+          <div className="typing-bubble">
+            <div className="dot" /><div className="dot" /><div className="dot" />
+          </div>
+        </div>
+      );
+    }
+
+    // ── Main App ─────────────────────────────────────────────
+    function App() {
+      const [messages, setMessages] = useState([{
+        id: 0, role: "assistant",
+        content: "Hello! I'm Aria, RLG's AI Assistant. I'm here to help you with questions about Royal London insurance, pensions, ISAs and other financial products. How can I help you today?",
+        citations: [], streaming: false, meta: null,
+      }]);
+      const [input, setInput]               = useState("");
+      const [loading, setLoading]           = useState(false);
+      const [error, setError]               = useState(null);
+      const [showTyping, setShowTyping]     = useState(false);
+      const [backendUrl, setBackendUrl]     = useState("http://127.0.0.1:8000");
+      const [showSettings, setShowSettings] = useState(false);
+
+      const bottomRef = useRef(null);
+      const inputRef  = useRef(null);
+
+      useEffect(() => {
+        bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      }, [messages, showTyping]);
+
+      // Build history (exclude welcome message id=0)
+      const history = messages
+        .filter(m => m.id !== 0)
+        .map(m => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content }));
+
+      const send = useCallback(async (query) => {
+        if (!query.trim() || loading) return;
+        const userMsg = { id: Date.now(), role: "user", content: query.trim(), citations: [], streaming: false, meta: null };
+        setMessages(prev => [...prev, userMsg]);
+        setInput("");
+        setLoading(true);
+        setShowTyping(true);
+        setError(null);
+        const aId = Date.now() + 1;
+
+        try {
+          const res = await fetch(`${backendUrl}/api/chat`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ query: query.trim(), conversation_history: history }),
+          });
+
+          if (!res.ok) {
+            const errBody = await res.text().catch(() => "");
+            throw new Error(`Server error ${res.status}${errBody ? ": " + errBody.slice(0, 120) : ""}`);
+          }
+
+          const reader  = res.body.getReader();
+          const decoder = new TextDecoder();
+          let fullText = "";
+          let started  = false;
+          let buffer   = "";
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop(); // keep incomplete line
+
+            for (const line of lines) {
+              if (!line.startsWith("data: ")) continue;
+              try {
+                const data = JSON.parse(line.slice(6));
+
+                if (data.token) {
+                  if (!started) {
+                    setShowTyping(false);
+                    setMessages(prev => [...prev, {
+                      id: aId, role: "assistant", content: "", streaming: true, citations: [], meta: null,
+                    }]);
+                    started = true;
+                  }
+                  fullText += data.token;
+                  setMessages(prev => prev.map(m =>
+                    m.id === aId ? { ...m, content: fullText } : m
+                  ));
+                }
+
+                if (data.done) {
+                  setMessages(prev => prev.map(m =>
+                    m.id === aId ? {
+                      ...m,
+                      content: fullText,
+                      streaming: false,
+                      citations: data.citations || [],
+                      meta: {
+                        cached:      data.cached      || false,
+                        model_used:  data.model_used  || null,
+                        latency_ms:  data.latency_ms  || null,
+                        token_usage: data.token_usage || null,
+                        needs_empathy: data.needs_empathy || false,
+                      },
+                    } : m
+                  ));
+                }
+
+                if (data.error) {
+                  setShowTyping(false);
+                  setMessages(prev => {
+                    // Replace streaming bubble with error if exists, else add new
+                    const hasStreaming = prev.some(m => m.id === aId);
+                    if (hasStreaming) {
+                      return prev.map(m => m.id === aId
+                        ? { ...m, content: data.error, streaming: false, citations: [], meta: null }
+                        : m
+                      );
+                    }
+                    return [...prev, { id: aId, role: "assistant", content: data.error, streaming: false, citations: [], meta: null }];
+                  });
+                }
+              } catch (_) {}
+            }
+          }
+
+          // Flush any remaining buffer
+          if (buffer.startsWith("data: ")) {
+            try {
+              const data = JSON.parse(buffer.slice(6));
+              if (data.done) {
+                setMessages(prev => prev.map(m =>
+                  m.id === aId ? { ...m, streaming: false, citations: data.citations || [] } : m
+                ));
+              }
+            } catch (_) {}
+          }
+
+        } catch (err) {
+          setShowTyping(false);
+          setError(`${err.message} — Is the backend running on ${backendUrl}?`);
+          // Remove streaming placeholder if it was added
+          setMessages(prev => prev.filter(m => !(m.id === aId && m.content === "")));
+        } finally {
+          setLoading(false);
+          setShowTyping(false);
+          inputRef.current?.focus();
+        }
+      }, [loading, backendUrl, history]);
+
+      const onKey = (e) => {
+        if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); }
+      };
+
+      const showSuggestions = messages.length === 1 && !loading;
+
+      return (
+        <>
+          {/* ── Header ─────────────────────────────────── */}
+          <div className="header">
+            <div className="header-left">
+              <div className="aria-avatar">A</div>
+              <div>
+                <div className="header-name">Aria</div>
+                <div className="header-sub">Royal London AI Assistant</div>
+              </div>
+            </div>
+            <div className="header-actions">
+              <div className="header-status">
+                <span className="status-dot" /> Online
+              </div>
+              <button className="icon-btn" onClick={() => setShowSettings(!showSettings)}>
+                ⚙ Settings
+              </button>
+            </div>
+          </div>
+
+          {/* ── Dev settings ───────────────────────────── */}
+          {showSettings && (
+            <div className="settings-bar">
+              <label>Backend URL:</label>
+              <input
+                type="text" value={backendUrl}
+                onChange={e => setBackendUrl(e.target.value)}
+                placeholder="http://127.0.0.1:8000"
+              />
+              <button onClick={() => setShowSettings(false)}>✓ Done</button>
+            </div>
+          )}
+
+          {/* ── Messages ────────────────────────────────── */}
+          <div className="messages">
+            <div className="messages-inner">
+              {messages.map(m => <Message key={m.id} msg={m} />)}
+              {showTyping && <TypingIndicator />}
+              {error && (
+                <div className="error-bar">
+                  <div className="error-msg">⚠ {error}</div>
+                </div>
+              )}
+              <div ref={bottomRef} />
+            </div>
+          </div>
+
+          {/* ── Suggested questions ──────────────────────── */}
+          {showSuggestions && (
+            <div className="suggestions">
+              <div className="suggestions-inner">
+                <span className="suggestion-label">Try asking</span>
+                {SUGGESTED.map((q, i) => (
+                  <button key={i} className="suggestion-btn" onClick={() => send(q)}>{q}</button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ── Input area ──────────────────────────────── */}
+          <div className="input-area">
+            <div className="input-inner">
+              <textarea
+                ref={inputRef}
+                value={input}
+                onChange={e => setInput(e.target.value)}
+                onKeyDown={onKey}
+                placeholder="Ask about Royal London insurance, pensions or ISAs…"
+                disabled={loading}
+                rows={1}
+              />
+              <button
+                className="send-btn"
+                onClick={() => send(input)}
+                disabled={loading || !input.trim()}
+                title="Send"
+              >
+                {loading
+                  ? <div className="spinner" />
+                  : <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white"
+                         strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="22" y1="2" x2="11" y2="13"/>
+                      <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                    </svg>
+                }
+              </button>
+            </div>
+            <div className="disclaimer">
+              Aria may make mistakes. For complex queries contact Royal London on 0345 600 0371
+            </div>
+          </div>
+        </>
+      );
+    }
+
+    ReactDOM.render(<App />, document.getElementById("root"));
+  </script>
+</body>
+</html>
