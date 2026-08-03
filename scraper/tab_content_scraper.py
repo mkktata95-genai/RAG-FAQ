@@ -24,6 +24,10 @@ shape, so integration is a copy-paste-adjacent addition, not a rewrite:
     tab entries. `dropdown_state` stays absent on tab entries and vice
     versa — the two mechanisms are mutually exclusive per page in
     practice, but nothing prevents both existing in the schema.
+  - Every tab — including the default/active one — is clicked and
+    scraped individually. base_page_data["content"] is NOT reused for
+    any tab (see v2.1.0 changelog: it was found to contain all panels
+    concatenated).
 
 INTEGRATION POINT in scrape_page() (v4.8.0, after line ~2422)
 -----------------------------------------------------------------
@@ -67,6 +71,16 @@ So: replace, don't prepend.
 
 CHANGELOG
 ---------
+v2.1.0 — Fixed content contamination: base_page_data["content"] was
+          found to contain ALL tab panels concatenated (RLG renders
+          every panel in the DOM simultaneously — same root cause as
+          the routing-dropdown duplication bug). Removed the "reuse
+          active tab" shortcut entirely; every tab, including the
+          default one, is now clicked and scraped identically via
+          _get_visible_panel_text_sync(). Also added OneTrust cookie
+          overlay dismissal via direct JS style override — clicking
+          the Accept button was unreliable because the overlay itself
+          intercepts pointer events even with force=True.
 v2.0.0 — Full rewrite to match _scrape_dropdown_states_playwright()
           architecture exactly: sync Playwright, executor invocation,
           full page_data-shaped output dicts. Detection via
@@ -183,10 +197,12 @@ def _scrape_tab_states_playwright(
     label. Returns [] on any failure — caller falls back to returning
     the original page_data unchanged.
 
-    The default/active tab is NOT re-scraped via click — we already
-    have its text in base_page_data["content"] from the initial
-    crawler.arun() call, so it's relabelled and reused as-is. This
-    avoids a redundant page load for the tab we already captured.
+    Every tab — including the default/active one — is clicked and
+    scraped individually via the same code path. base_page_data is
+    used only as a template for shared fields (audience, has_video,
+    scraper_version etc.); its "content" field is never copied into
+    a result entry (v2.1.0: found to contain all tab panels
+    concatenated, causing duplication — see module changelog).
     """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -230,6 +246,28 @@ def _scrape_tab_states_playwright(
                 except PWTimeout:
                     pass
 
+                # v2.1.0 — dismiss OneTrust cookie overlay directly via JS.
+                # Clicking the Accept button was unreliable — the overlay
+                # itself intercepts pointer events even with force=True,
+                # blocking every subsequent tab click. Hiding it outright
+                # sidesteps the click entirely. Selectors are OneTrust-
+                # specific; move to site_config.py if another vendor is
+                # ever used.
+                try:
+                    page.evaluate(
+                        """
+                        () => {
+                            const overlay = document.querySelector('.onetrust-pc-dark-filter');
+                            if (overlay) overlay.style.display = 'none';
+                            const modal = document.querySelector('div#onetrust-consent-sdk');
+                            if (modal) modal.style.display = 'none';
+                        }
+                        """
+                    )
+                    page.wait_for_timeout(300)
+                except Exception:
+                    pass
+
                 # Re-detect tab labels from live DOM (page.content() is
                 # sync-Playwright's HTML snapshot — consistent with how
                 # the dropdown function re-queries selects live rather
@@ -240,29 +278,18 @@ def _scrape_tab_states_playwright(
                 if len(labels) <= 1:
                     return []
 
-                # Determine which label is the default/active one so we
-                # can reuse base_page_data["content"] for it without a
-                # redundant click+scrape.
-                active_el = (
-                    soup.find(attrs={"role": "tab", "aria-selected": "true"}) or
-                    soup.select_one(".nav-tabs .nav-link.active") or
-                    soup.select_one(".nav-link.active")
-                )
-                active_label = (
-                    active_el.get_text(strip=True) if active_el else labels[0]
-                )
-
+                # v2.1.0 — click EVERY tab, including the default/active
+                # one. base_page_data["content"] is NOT reused here: it
+                # was found to contain ALL tab panels concatenated (RLG
+                # renders every panel in the DOM simultaneously, same
+                # issue already solved for routing dropdowns). Reusing
+                # it caused Engage/Embed content to appear duplicated
+                # inside the "Invest" entry. Clicking every tab and
+                # reading only the visible panel via
+                # _get_visible_panel_text_sync() eliminates this — each
+                # entry ends up isolated and clean, confirmed via a
+                # single-URL test (3 unique, non-overlapping contents).
                 for label in labels:
-                    if label == active_label:
-                        # Already have this content — relabel, don't re-scrape
-                        entry = dict(base_page_data)
-                        entry["tab_state"] = label
-                        entry["content_hash"] = hashlib.sha256(
-                            entry["content"].encode("utf-8")
-                        ).hexdigest()
-                        results.append(entry)
-                        continue
-
                     try:
                         locator = page.get_by_text(label, exact=True)
                         locator.first.click(timeout=timeout_ms)
