@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from crawl4ai import AsyncWebCrawler
 
-from scraper.scrape_approved_urls_updatedV4_old import (
+from scraper.scrape_approved_urls_updatedV4 import (
     scrape_page,
     _make_browser_config,
 )

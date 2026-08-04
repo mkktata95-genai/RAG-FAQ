@@ -66,7 +66,7 @@ SEP2 = "-" * 50
 sys.path.insert(0, str(Path(__file__).parent))
 
 try:
-    from scraper.scrape_approved_urls_updatedV4_old import (
+    from scraper.scrape_approved_urls_updatedV4 import (
         _make_browser_config,
         clean_content,
         _ensure_chrome_cdp,

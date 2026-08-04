@@ -706,6 +706,21 @@ v4.7.0 — July 2026 | Mukesh Kund
            METADATA_VERSION — bump when WHAT metadata we extract changes
            (Both are developer-bumped only — never auto-increment)
 
+v4.7.1 — July 2026 | Mukesh Kund
+         Bugfix: read_time_mins stored as str not int (schema audit).
+
+         extract_page_metadata() [MODIFIED]:
+         - Default dict: 5 (int) → "5" (str)
+         - Calculation: int(read_time) → str(max(1, round(...)))
+         _scrape_dropdown_states_playwright() [MODIFIED]:
+         - max(1, len(...)) → str(max(1, len(...)))
+         Root cause: Azure AI Search schema declares read_time_mins
+         as Edm.String. Scraper v4.4.0 changed it to int — this went
+         undetected until upload failed with "Cannot convert the
+         literal '9' to the expected type 'Edm.String'".
+         A schema type audit script (audit_schema_types.py) has been
+         added to the project to catch this class of bug early.
+
 v4.8.0 — July 2026 | Mukesh Kund
     FIX 1 — parent_url on dropdown state dicts.
     Dropdown state entries were stored with url=state_url (#state=...)
@@ -726,20 +741,6 @@ v4.8.0 — July 2026 | Mukesh Kund
     normalised URL. This is a belt-and-braces guard for post-normalisation
     collisions (e.g. http vs https, trailing slash) and for dropdown state
     entries sharing a parent URL fragment key.
-v4.7.1 — July 2026 | Mukesh Kund
-         Bugfix: read_time_mins stored as str not int (schema audit).
-
-         extract_page_metadata() [MODIFIED]:
-         - Default dict: 5 (int) → "5" (str)
-         - Calculation: int(read_time) → str(max(1, round(...)))
-         _scrape_dropdown_states_playwright() [MODIFIED]:
-         - max(1, len(...)) → str(max(1, len(...)))
-         Root cause: Azure AI Search schema declares read_time_mins
-         as Edm.String. Scraper v4.4.0 changed it to int — this went
-         undetected until upload failed with "Cannot convert the
-         literal '9' to the expected type 'Edm.String'".
-         A schema type audit script (audit_schema_types.py) has been
-         added to the project to catch this class of bug early.
 
 ═══════════════════════════════════════════════════════════════
 """
@@ -779,15 +780,6 @@ from crawl4ai.content_filter_strategy import PruningContentFilter
 # override=True ensures .env always wins over shell environment
 # variables — prevents silent misconfiguration in DevOps pipelines.
 from dotenv import load_dotenv, find_dotenv
-
-# v4.9.0 — content tab handling (Invest | Engage | Embed style pages).
-# Separate module: site_config.py holds RLG-specific selectors so a
-# future client with a different frontend only needs a new config,
-# not a rewrite of this file's detection/scraping logic.
-from tab_content_scraper import (
-    has_content_tabs_in_html,
-    scrape_tab_states_playwright,
-)
 
 _dotenv_path = find_dotenv(usecwd=False)
 load_dotenv(_dotenv_path, override=True)
@@ -2471,40 +2463,6 @@ async def scrape_page(
                     option_count=len(dropdown_states),
                 )
                 return [page_data] + dropdown_states
-
-        # v4.9.0 — detect content tabs from already-fetched HTML.
-        # Same raw_html, zero extra network call — mirrors the dropdown
-        # check above. Uses tab_content_scraper.py (separate module,
-        # site_config.py holds RLG-specific selectors for portability).
-        if has_content_tabs_in_html(raw_html):
-            try:
-                loop     = asyncio.get_event_loop()
-                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                tab_states = await loop.run_in_executor(
-                    executor,
-                    scrape_tab_states_playwright,
-                    url,
-                    page_data["title"],
-                    page_data,
-                )
-            except Exception as _te:
-                log.warning(
-                    "playwright_tabs_skipped",
-                    url=url,
-                    error=str(_te),
-                )
-                tab_states = []
-
-            if tab_states:
-                log.info(
-                    "multi_tab_page_scraped",
-                    url=url,
-                    tab_count=len(tab_states),
-                )
-                # Tab pages have no content outside the tabs — replace
-                # page_data rather than prepend (unlike dropdown_states,
-                # where the base page has genuine standalone intro content).
-                return tab_states
 
         return page_data
 
