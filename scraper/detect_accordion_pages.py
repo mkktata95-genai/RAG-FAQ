@@ -43,6 +43,12 @@ USAGE
 
 CHANGELOG
 ---------
+v1.1.0 — Added header-uniqueness filter. First run on 297-URL scrape
+          flagged 69 candidates, but inspection showed false positives
+          where the SAME header repeated verbatim (e.g. "What you can
+          do online" x5) — a boilerplate/dropdown artifact, not a real
+          accordion. Runs where >30% of headers are duplicates are now
+          rejected.
 v1.0.0 — Initial accordion existence check, content-only.
 """
 
@@ -165,18 +171,32 @@ def find_accordion_runs(elements: list) -> list:
 
 def check_consistency(run: list) -> bool:
     """
-    Real accordions have relatively similar answer lengths.
-    Flag as consistent if stdev/mean ratio is reasonable (not wildly
-    varying — e.g. one 50-char answer next to a 3000-char one suggests
-    this isn't a true accordion, just headers that happen to repeat).
+    Real accordions have relatively similar answer lengths AND distinct
+    question headers. Flag as consistent if:
+      - stdev/mean ratio is reasonable (not wildly varying)
+      - headers are NOT mostly duplicates of each other (a repeated
+        identical header, e.g. "What you can do online" x5, is a
+        boilerplate/dropdown artifact, not a genuine accordion)
     """
     lengths = [body_len for _, body_len in run]
+    headers = [h for h, _ in run]
+
     if not lengths or statistics.mean(lengths) == 0:
         return False
+
     mean = statistics.mean(lengths)
     stdev = statistics.stdev(lengths) if len(lengths) > 1 else 0
     cv = stdev / mean  # coefficient of variation
-    return cv < 1.5  # generous threshold — real accordions vary some
+    if cv >= 1.5:
+        return False
+
+    # Header uniqueness check — real accordions have distinct questions
+    unique_headers = len(set(h.strip().lower() for h in headers))
+    uniqueness_ratio = unique_headers / len(headers)
+    if uniqueness_ratio < 0.7:  # allow some near-duplicates, not majority
+        return False
+
+    return True
 
 
 def main():
