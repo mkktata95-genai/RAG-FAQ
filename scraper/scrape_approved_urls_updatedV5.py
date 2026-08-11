@@ -1,0 +1,3042 @@
+"""
+Royal London FAQ — Web Scraper v5 (Customer Approved URLs Only)
+════════════════════════════════════════════════════════════
+Scrapes customer-approved Royal London pages and saves structured
+JSON for chunk_and_index_hqaV5.py to index into Azure AI Search.
+
+Pipeline:
+  1. Load approved URLs from Excel from Azure Blob Storage
+  2. Scrape each URL with crawl4ai (main content only)
+  3. Clean content (deduplicate, strip nav/footer boilerplate)
+  4. Detect routing dropdowns → scrape per-option states via Playwright
+  5. Extract rich metadata (video, content type, product category etc.)
+  6. Save JSON → local file or Azure Blob Storage (production)
+
+Input:
+  Approved URL Excel from Azure Blob Storage (production) or
+  local file (--file flag for VDI/dev). Header-based column
+  detection — no hardcoded positions.
+
+Output:
+  scraper/data/royal_london_faq_approved_<timestamp>.json (local)
+  or Azure Blob Storage: scraper-data/royal_london_faq_latest.json
+
+Output fields per page:
+  url, title, section, audience, content, scraped_at,
+  content_length, content_hash, has_video, content_type,
+  product_category, description, thumbnail_url, publish_date,
+  collection_name, read_time_mins, dropdown_state, dropdown_value,
+  scraper_version, metadata_version, scrape_run_id
+
+═══════════════════════════════════════════════════════════════
+LOCAL USAGE (VDI)
+═══════════════════════════════════════════════════════════════
+
+    # Standard scrape — local Excel
+    python scraper/scrape_approved_urls_updatedV5.py \
+        --file scraper/data/Approved_URLs.xlsx
+
+    # Dry run — validate Excel + URL detection, no scraping
+    python scraper/scrape_approved_urls_updatedV5.py \
+        --file scraper/data/Approved_URLs.xlsx --dry-run
+
+    # Required .env for VDI (Chrome CDP mode):
+    # PLAYWRIGHT_EXECUTABLE_PATH=C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe
+    # AZURE_STORAGE_CONNECTION=<blob-conn-string>   (if saving to Blob)
+
+═══════════════════════════════════════════════════════════════
+PRODUCTION — AZURE CONTAINER APPS JOB (DevOps)
+═══════════════════════════════════════════════════════════════
+
+# TODO (DevOps): Create Container Apps Job: digital-assistance-scraper-job
+# Trigger: manual only (ADO pipeline after URL list update)
+#          NOT scheduled — scraper runs on demand, freshness runs nightly
+#
+# ── DOCKERFILE ────────────────────────────────────────────────
+#
+#   FROM python:3.11-slim
+#   RUN apt-get update && apt-get install -y \
+#       wget gnupg ca-certificates fonts-liberation \
+#       libasound2 libatk-bridge2.0-0 libdrm2 libxkbcommon0 \
+#       libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+#       libgbm1 libnss3 libnspr4 libdbus-1-3 libatspi2.0-0 \
+#       && rm -rf /var/lib/apt/lists/*
+#   COPY requirements.txt .
+#   RUN pip install -r requirements.txt
+#   # Install Playwright chromium + system deps (production browser)
+#   RUN playwright install chromium --with-deps
+#   # DO NOT set PLAYWRIGHT_EXECUTABLE_PATH — leave unset so CDP
+#   # mode is skipped and crawl4ai uses its own playwright chromium.
+#   COPY . .
+#   CMD ["python", "scraper/scrape_approved_urls_updatedV5.py"]
+#
+# ── AZURE MANAGED IDENTITY ────────────────────────────────────
+#
+#   Container app must have User/System-Assigned Managed Identity
+#   with these RBAC roles:
+#
+#   Resource                    Role
+#   ─────────────────────────── ────────────────────────────────
+#   Azure Blob Storage          Storage Blob Data Contributor
+#   Azure Key Vault             Key Vault Secrets User
+#
+#   DefaultAzureCredential picks up Managed Identity automatically
+#   in Container Apps — no service principal or API keys needed.
+#   TODO (DevOps): assign identity to digital-assistance-scraper-job + grant roles.
+#
+# ── AZURE KEY VAULT — required secrets ───────────────────────
+#
+#   Secret Name                   Value
+#   ───────────────────────────── ────────────────────────────────────
+#   AZURE-STORAGE-CONNECTION      Blob Storage connection string
+#   BLOB-CONTAINER-NAME           scraper-data
+#   BLOB-SCRAPED-FILENAME         royal_london_faq_latest.json
+#                                 (must match BLOB_SCRAPED_FILENAME in
+#                                  chunk_and_index_hqaV5.py)
+#   BLOB-APPROVED-EXCEL-NAME      approved-urls/Approved_URLs.xlsx
+#                                 (dedicated team always overwrites this
+#                                  fixed name — no date-stamped filenames)
+#   APPROVED-EXCEL-PATH           (leave unset — use BLOB_APPROVED_EXCEL_NAME)
+#
+#   DO NOT add PLAYWRIGHT-EXECUTABLE-PATH to Key Vault.
+#   In production, crawl4ai uses playwright chromium from Dockerfile.
+#   CDP mode auto-skipped when path doesn't exist.
+#
+# ── CONTAINER APPS JOB trigger ────────────────────────────────
+#
+#   # Manual trigger (ADO pipeline after URL list update):
+#   az containerapp job start \
+#       --name digital-assistance-scraper-job \
+#       --resource-group <rg>
+#
+# ── JOB RUN ORDER (manual full re-index) ─────────────────────
+#
+#   1. digital-assistance-scraper-job   → scrape → Blob JSON
+#   2. digital-assistance-indexer-job   → chunk_and_index_hqaV5.py --full → AI Search
+#   3. Update AZURE-SEARCH-INDEX-NAME in Key Vault → rlg-faq-index-v5
+#   4. Restart Digital Assistance server (picks up new index from Key Vault)
+#   5. digital-assistance-freshness-job → run --mode report to verify, then enable nightly
+
+═══════════════════════════════════════════════════════════════
+PROGRAMMATIC (DEVOPS / TESTING)
+═══════════════════════════════════════════════════════════════
+
+    from scraper.scrape_approved_urls_updatedV5 import run_scraper
+
+    result = run_scraper()                          # default Excel
+    result = run_scraper(excel_path="custom.xlsx") # custom file
+    result = run_scraper(dry_run=True)             # dry run
+
+    # Result dict:
+    # {
+    #   "success":       bool,
+    #   "pages_scraped": int,
+    #   "pages_failed":  int,
+    #   "output_path":   str,  # local path or blob name
+    #   "dry_run":       bool,
+    #   "error":         str,  # empty if success
+    # }
+
+═══════════════════════════════════════════════════════════════
+CHANGE LOG
+═══════════════════════════════════════════════════════════════
+
+v1.0.0 — Initial version
+         crawl4ai scraping from customer Excel file.
+         Saves output JSON to scraper/data/ locally.
+
+v2.0.0 — June 2026 | Mukesh Kund
+         Production readiness: Blob Storage + entry point
+
+         PRODUCTION GAP (pre v2.0.0):
+         - Scraper saved output JSON to local disk only.
+         - Azure Function App has no persistent local disk.
+         - Output JSON must go to Azure Blob Storage so
+           chunk_and_index.py can read it from a separate
+           Function App invocation.
+         - Excel URL source is developer-only. Production
+           URL source (Blob JSON, SharePoint, CMS API) to
+           be agreed with brand/marketing team and DevOps.
+
+         save_scraped_pages() [NEW]:
+         - Abstracts local vs Blob Storage output.
+         - Local: saves to scraper/data/ as before.
+         - Production: uploads to Azure Blob Storage.
+         - Switched by AZURE_STORAGE_CONNECTION env var.
+         - Not set → local mode, zero behaviour change.
+
+         load_url_source() [NEW]:
+         - Abstracts local Excel vs Blob Storage URL list.
+         - Local: reads Excel file as before.
+         - Production: reads JSON from Blob Storage.
+         - Switched by AZURE_STORAGE_CONNECTION env var.
+         - TODO: production URL source format to be agreed
+           with brand/marketing team and DevOps.
+
+         run_scraper() [NEW]:
+         - Clean entry point for DevOps / Function App.
+         - Returns structured result dict with stats.
+         - TODO (DevOps): wrap in Function App trigger.
+
+v3.0.0 — June 2026 | Mukesh Kund
+         Rich metadata extraction — video detection, content type,
+         product category, audience, publish date, thumbnail
+
+         WHY:
+         - Royal London pages contain videos (webinars, guides,
+           product explainers) on ANY page type — not just /webinars/.
+           Videos appear on pension pages, insurance pages, tools,
+           existing customer pages etc.
+         - UI/UX team will need metadata to render rich citations
+           (video cards, product badges, publish dates, thumbnails)
+           without requiring a re-index.
+         - Principle: index once, serve many use cases. All metadata
+           extracted at scrape time from HTML already fetched by
+           crawl4ai — zero extra HTTP calls, zero extra cost.
+
+         VIDEO DETECTION STRATEGY:
+         - Royal London uses a proprietary/JS-rendered video player.
+           The video embed URL is NOT reliably extractable from HTML.
+         - Decision: source_url IS the video reference. UI team links
+           to the page — the video is on that page.
+         - Detection uses three independent signals (any one = True):
+             Signal 1: URL pattern (/webinars/, /videos/, /video/)
+             Signal 2: meta-Collection_name contains "webinar"/"video"
+             Signal 3: rendered HTML contains video player CSS classes
+                       or data attributes (fallback, less reliable)
+         - has_video field: True/False stored per page and per chunk.
+           UI team uses this to render a "📹 Watch video" indicator.
+
+         METADATA EXTRACTION — extract_page_metadata() [NEW]:
+         - Parses result.html (already fetched by crawl4ai, no extra
+           HTTP call) using BeautifulSoup to extract:
+             has_video        — bool: page contains video content
+             content_type     — webinar/guide/article/faq/tool/news
+             product_category — pensions/insurance/isa/retirement/general
+             audience         — customer/adviser/employer (from URL)
+             description      — from meta-description or og:description
+             thumbnail_url    — from meta-teaser_image or og:image
+             publish_date     — from meta-st-publish-date (ISO format)
+             collection_name  — from meta-Collection_name (e.g. "Pension webinar")
+             read_time_mins   — estimated from word count (200 wpm)
+
+         OUTPUT FORMAT UPDATED:
+         - Old: url, title, section, audience, content, scraped_at, content_length
+         - New: + has_video, content_type, product_category, description,
+                  thumbnail_url, publish_date, collection_name, read_time_mins
+         - All new fields have safe defaults — if extraction fails,
+           defaults are used and scraping continues normally.
+         - chunk_and_index.py passes all new fields through to index.
+
+         audience FIELD FIX:
+         - Was hardcoded to "customer" regardless of URL.
+         - Now derived from URL: adviser.royallondon.com → "adviser",
+           employer.royallondon.com → "employer", else → "customer".
+         - Matches the audience derivation in extract_page_metadata().
+
+v4.0.0 — July 2026 | Mukesh Kund
+         Production hardening: dotenv import fix, URL normalisation,
+         content_hash field.
+
+         CRITICAL BUG FIX — dotenv import missing:
+         find_dotenv() and load_dotenv() were called at module level
+         but neither was imported — NameError on startup.
+         Fixed: added from dotenv import load_dotenv, find_dotenv.
+         Also added override=True so .env always beats shell vars.
+
+         URL NORMALISATION — normalize_url() helper:
+         load_approved_pages() only stripped trailing slash + query.
+         No path lowercasing meant should-I vs should-i survived
+         deduplication as two separate URLs — double-indexing same
+         content. normalize_url() lowercases path only (domain kept).
+         Applied in load_approved_pages() (dedup key + stored URL)
+         and in scrape_page() output (defence-in-depth for redirects).
+
+         CONTENT HASH:
+         SHA-256 hash of page content added to scrape output.
+         Used by content_freshness.py (Sprint 2) to detect changed
+         pages without re-scraping all 350 URLs.
+
+v4.1.0 — July 2026 | Mukesh Kund
+         Live HTTP status check at scrape time.
+
+         ROOT CAUSE:
+         The Excel "status" column reflects verification-time status —
+         recorded when the Excel was last built, potentially weeks
+         before a scrape run. scrape_page() only checked
+         result.success from crawl4ai — but success=True just means
+         the browser loaded a page; a 404 error page still
+         "successfully" loads. result.status_code was never checked.
+
+         FIX:
+         scrape_page() now reads result.status_code after the
+         crawl4ai fetch. status_code >= 400 → page dropped and
+         logged as scrape_http_error with the actual code.
+         status_code is None (crawl4ai occasionally doesn't
+         populate it) → fails open, does not reject, so working
+         pages are never dropped over a missing field.
+
+v4.2.0 — July 2026 | Mukesh Kund
+         Header-based column detection — no hardcoded positions.
+
+         ROOT CAUSE:
+         load_approved_pages() assumed fixed column layout
+         (title=col B, url=col C, status=col E) from the internal
+         verification file. A customer-supplied Excel is not
+         guaranteed to match that layout. A URL-only file (2 columns)
+         would skip EVERY row due to `len(row) < 5` guard —
+         silently returning zero pages with no error.
+
+         FIX — detect columns by HEADER NAME (row 1):
+         URL_HEADERS    = {"url", "page url", "link", ...}
+         TITLE_HEADERS  = {"title", "page title", "name"}
+         STATUS_HEADERS = {"status", "status code", "http status"}
+         All matched case-insensitively. URL column REQUIRED —
+         raises ValueError with actual headers if not found.
+         Title and status are optional.
+
+         STATUS HANDLING:
+         Only skips on unambiguous dead signals (HTTP >= 400,
+         or words like dead/broken/removed). Blank, "200", "OK",
+         "Live", or unrecognised values are KEPT — ambiguity
+         defers to "keep it, let the live scrape decide".
+
+v4.3.0 — July 2026 | Mukesh Kund
+         Excel Category column used as primary content_type source.
+         derive_section() function added (was missing — NameError).
+
+         BUG FIX — derive_section() never defined:
+         scrape_page() called derive_section(url) but the function
+         was missing from the codebase — would crash with NameError
+         on every scrape. Added derive_section() using SECTION_MAP.
+
+         Excel Category as primary content_type:
+         - Customer supplies Category per URL (Brand/Guidance/Other/
+           Product/Tool) — more authoritative than URL-pattern.
+         - CATEGORY_HEADERS set added to column detection.
+         - _EXCEL_CATEGORY_MAP: Brand/Other/Product → article,
+           Guidance → guide, Tool → tool.
+         - URL-pattern still wins for high-signal types (webinar,
+           video, faq, news) — a "Product" page on /webinars/ is
+           still correctly typed as "webinar".
+         - Fallback: Category absent or unrecognised → derive_content_type().
+         - No changes to chunk_and_index_hqaV3.py required.
+
+v4.4.0 — July 2026 | Mukesh Kund
+         Multi-state dropdown scraping + 4 bug fixes.
+
+         FEATURE — Multi-state dropdown scraping:
+         Pages like /tell-us-about-a-bereavement/ render different
+         phone numbers and contact details per dropdown selection
+         (e.g. Scottish Provident → 0345 646 2096, Royal London/
+         Bright Grey → 0345 646 2108). With wait_until="domcontentloaded"
+         and a single arun() call the scraper only captured the
+         default/unselected state — all per-policy contact numbers
+         were missing from the index.
+
+         FIX — _detect_routing_dropdowns() + _scrape_dropdown_states():
+         After the initial page load, the scraper checks the rendered
+         HTML for <select> elements with more than one non-placeholder
+         option. If found, it iterates each option by injecting JS to
+         fire 'input' + 'change' events (same technique validated in
+         manual Playwright testing), waits 1.5 s for the DOM to settle,
+         then captures the updated body text. A line-by-line diff
+         against the default state extracts ONLY the content that
+         changed (phone numbers, addresses, form links) — shared
+         static content is not duplicated. Each option produces a
+         separate page_data entry with a synthetic URL
+         (base_url + #policy=<option_value>) so the indexer treats
+         them as distinct documents and chunk_and_index_hqaV3.py does
+         not deduplicate them. The base page (default state) is still
+         indexed as the primary document.
+
+         scrape_page() return type widened to list[dict] | dict | None:
+         - Standard page → dict (unchanged behaviour)
+         - Dropdown page → list[dict] (base + one entry per option)
+         - Failure → None (unchanged behaviour)
+         Both _run() (run_scraper) and main() batch loops updated to
+         flatten list returns correctly. content_length guard for
+         dropdown entries lowered to 20 chars (phone number + label
+         is valid content even at short length).
+
+         BUG FIX #1 — asyncio.run() crashes in async contexts:
+         run_scraper() used asyncio.run(_run()) which raises
+         RuntimeError when called from an already-running event loop
+         (Azure Functions, Jupyter, FastAPI). Fixed with
+         nest_asyncio.apply() + asyncio.get_event_loop().run_until_complete()
+         pattern, with graceful fallback to asyncio.run() when
+         nest_asyncio is not installed (plain script usage unchanged).
+
+         BUG FIX #2 — read_time_mins stored as str not int:
+         extract_page_metadata() stored read_time_mins as str(read_time)
+         — e.g. "5" — making downstream arithmetic (sum, average) fail
+         silently. Fixed: stored as int. Default also changed from
+         "5" (str) to 5 (int).
+
+         BUG FIX #3 — traceback and asyncio imported inside functions:
+         traceback was imported inside run_scraper(); asyncio was
+         imported twice (module level + inside run_scraper()). Both
+         moved to top-level imports.
+
+         BUG FIX #4 — save_scraped_pages() saves empty JSON silently:
+         If all URLs failed, save_scraped_pages() wrote [] to disk
+         with no warning — next indexer run would silently wipe the
+         index. Fixed: early-exit with log.error and return "" when
+         results list is empty. Callers check for empty output_path
+         and surface the failure in the result dict.
+
+v4.5.0 — July 2026 | Mukesh Kund
+         Playwright-based dropdown scraping + base page deduplication fix.
+
+         PROBLEM WITH v4.4.0 DROPDOWN APPROACH:
+         _scrape_dropdown_states() called crawler.arun() a SECOND time
+         to detect dropdowns — this reloaded the page with
+         wait_until="networkidle" causing 30s timeouts on Royal London
+         contact pages (background XHR activity never fully settles).
+         Result: dropdown_detect_failed warning on most pages, and the
+         bereavement page #policy= variants were never captured.
+
+         ADDITIONALLY: The base page crawl4ai scrape on dropdown pages
+         (e.g. /tell-us-about-a-bereavement/) captured ALL option
+         content rendered in the DOM simultaneously (Royal London
+         renders hidden panels for every option at page load). This
+         caused the content to repeat 3x in the scraped output — the
+         existing remove_duplicate_content() only catches H1/H2-level
+         duplication, not inline paragraph repetition.
+
+         FIX 1 — Playwright for dropdown pages:
+         After crawl4ai scrapes the base page, BeautifulSoup checks
+         result.html for <select> elements with >1 non-placeholder
+         option. If found, a Playwright browser handles the dropdown
+         interaction — single page load (wait_until="networkidle",
+         timeout=45000ms), then per-option JS event injection +
+         1.5s DOM wait + body text diff. This exactly mirrors the
+         proven standalone Playwright script (crawler.py v0.1.0)
+         that correctly captured all 13 bereavement policy options.
+         Playwright runs in a thread pool executor to avoid blocking
+         the crawl4ai asyncio event loop.
+
+         FIX 2 — Base page content truncation for dropdown pages:
+         When a page has routing dropdowns, the crawl4ai base page
+         content is truncated at the first dropdown-related marker
+         (select, dropdown, policy, please select etc.) to remove
+         the repeated option content that Royal London renders inline.
+         This gives a clean intro paragraph as the base page — exactly
+         matching what the proven Playwright script captured as the
+         default state (234 words, clean intro only).
+
+         FIX 3 — Page timeout 30s → 45s for dropdown detection:
+         All CrawlerRunConfig page_timeout values inside dropdown
+         handling raised from 30000 → 45000ms to match the Playwright
+         script's proven timeout value.
+
+         NEW FUNCTIONS:
+         - _has_routing_dropdowns_in_html(): BeautifulSoup check on
+           already-fetched HTML — zero extra network call.
+         - _scrape_dropdown_states_playwright(): Playwright thread
+           that mirrors crawler.py _scrape_multi_state_page() exactly.
+         - _truncate_base_content_at_dropdown(): strips repeated option
+           content from base page markdown before storing.
+
+         PLAYWRIGHT EXECUTABLE PATH (v4.5.0):
+         _scrape_dropdown_states_playwright() reads
+         PLAYWRIGHT_EXECUTABLE_PATH env var (default: system Chrome
+         on Windows). Falls back to None on Linux containers.
+         VDI: set in .env. Production: leave UNSET — Dockerfile
+         installs playwright chromium via: RUN playwright install
+         chromium --with-deps. Do NOT add to Key Vault.
+
+         REMOVED:
+         - _JS_DETECT_DROPDOWNS, _JS_SELECT_OPTION, _JS_GET_BODY_TEXT
+         - _scrape_dropdown_states() async function
+
+v4.5.1 — July 2026 | Mukesh Kund
+         #state= URL encoding + urllib.parse.quote.
+
+         state_url changed from:
+           f"{url}#policy={safe_value}"  (regex-sanitised)
+         to:
+           f"{url}#state={urllib.parse.quote(safe_value)}"
+         Spaces and special chars (ampersands, apostrophes) now
+         correctly percent-encoded. Consistent with content_freshness.py.
+         import urllib.parse added at top-level imports.
+
+v4.5.2 — July 2026 | Mukesh Kund
+         CDP mode for crawl4ai 0.8.9 VDI fix.
+
+         ROOT CAUSE:
+         crawl4ai 0.8.9 ignores chrome_channel and executable_path
+         parameters — it always attempts to use its own ms-playwright
+         chromium binary. VDI SSL restrictions block the binary
+         download (UNABLE_TO_GET_ISSUER_CERT_LOCALLY). All previous
+         env var attempts (PLAYWRIGHT_BROWSERS_PATH, PLAYWRIGHT_
+         CHROMIUM_EXECUTABLE_PATH) were also ineffective because
+         crawl4ai 0.8.9 does not read them.
+
+         FIX — CDP mode:
+         - _CDP_PORT, _CDP_URL, _CHROME_PROC constants added.
+         - _start_chrome_cdp(): launches system Chrome subprocess
+           with --remote-debugging-port=9222 --headless=new if
+           PLAYWRIGHT_EXECUTABLE_PATH exists. Waits up to 7.5s
+           for port to be ready via socket check. Returns False
+           on Linux/production (path absent → no-op).
+         - _stop_chrome_cdp(): terminates Chrome subprocess with
+           full pipe cleanup (close stdin/stdout/stderr) to prevent
+           ValueError: I/O operation on closed pipe during Python
+           asyncio cleanup after subprocess exits. Called in
+           main() finally block.
+         - _make_browser_config(): returns BrowserConfig with
+           cdp_url="http://localhost:9222" on VDI (CDP mode),
+           or normal BrowserConfig on production (Playwright mode).
+         - Both BrowserConfig instances (scrape_page + main) replaced
+           with _make_browser_config() call.
+
+         VDI .env:
+           PLAYWRIGHT_EXECUTABLE_PATH=C:\\\\Program Files\\\\Google\\\\
+           Chrome\\\\Application\\\\chrome.exe
+
+         PRODUCTION (Azure Container Apps Linux):
+           PLAYWRIGHT_EXECUTABLE_PATH unset → CDP skipped →
+           crawl4ai uses playwright chromium from:
+             RUN playwright install chromium --with-deps
+           Do NOT add PLAYWRIGHT_EXECUTABLE_PATH to Key Vault.
+
+         VERIFIED: All 13 bereavement policy dropdown states
+         captured correctly with CDP mode on VDI (July 2026).
+
+v4.5.3 — July 2026 | Mukesh Kund
+         Fix ValueError: I/O operation on closed pipe on Windows.
+
+         ROOT CAUSE:
+         Python’s asyncio ProactorEventLoop on Windows performs
+         garbage collection of subprocess handles after the process
+         exits. Without CREATE_NO_WINDOW, Chrome inherits the
+         terminal’s console handles (stdin/stdout/stderr). When
+         asyncio’s GC tries to close those inherited handles they
+         are already gone — raising ValueError: I/O operation on
+         closed pipe. This is a known Python 3.11/3.12 Windows bug
+         triggered by subprocess + ProactorEventLoop interaction.
+         The scrape completes successfully before this error but
+         the traceback is confusing and masks real errors.
+
+         FIX — subprocess.CREATE_NO_WINDOW + stdin=DEVNULL:
+         CREATE_NO_WINDOW (Windows-only flag) prevents the child
+         process from inheriting the parent’s console handles.
+         Chrome gets its own isolated handle space — asyncio GC
+         has nothing to conflict with.
+         stdin=subprocess.DEVNULL added explicitly alongside
+         stdout/stderr=DEVNULL to close all three standard streams.
+         On Linux/macOS: creation_flags=0 is a no-op — safe
+         cross-platform.
+
+         Applied in: _start_chrome_cdp() only.
+         _stop_chrome_cdp() pipe.close() fix from v4.5.2 retained
+         as defence-in-depth (belt + braces).
+
+v4.5.4 — July 2026 | Mukesh Kund
+         Suppress asyncio ProactorEventLoop GC noise on Windows.
+
+         ROOT CAUSE (updated understanding):
+         CREATE_NO_WINDOW (v4.5.3) fixed our Chrome subprocess but
+         crawl4ai’s internal AsyncWebCrawler also launches its own
+         browser subprocess. We have no control over crawl4ai’s
+         Popen flags. The "Exception ignored in:" tracebacks:
+           "ValueError: I/O operation on closed pipe"
+           "ResourceWarning: unclosed transport"
+         occur DURING PYTHON INTERPRETER SHUTDOWN — after
+         asyncio.run() has already returned and the event loop is
+         closed. A custom event loop exception handler cannot
+         intercept these because the loop is already torn down
+         when they fire (GC runs at interpreter exit, not while
+         the loop is running).
+
+         FIX — sys.unraisablehook + warnings.filterwarnings:
+         sys.unraisablehook is called for every "Exception ignored"
+         traceback during GC/interpreter shutdown. We replace it
+         with a wrapper that drops the specific "I/O operation on
+         closed pipe" ValueError and delegates everything else to
+         the original hook. warnings.filterwarnings() added for
+         the ResourceWarning: unclosed transport companion warning.
+         Both are applied in if __name__ == "__main__" on win32
+         only — before asyncio.run() so they are active for the
+         full lifetime of the process including shutdown.
+
+         SAFETY:
+         Real errors surface via Python exceptions, structlog
+         log.error(), the result dict, and sys.exit(1) — none
+         go through unraisablehook. Only uncaught exceptions
+         during GC (which are already "Exception ignored" by
+         Python) are affected.
+
+         PRODUCTION (Linux / Azure Container Apps):
+         sys.platform != "win32" — complete no-op.
+         EpollEventLoop on Linux does not exhibit this issue.
+
+v4.5.5 — July 2026 | Mukesh Kund
+         Bulletproof dropdown scraping — contact signal validation
+         + navigation guard + placeholder expansion.
+
+         BACKGROUND:
+         Full scrape of 350 approved URLs revealed that our dropdown
+         detection was too broad — triggering Playwright on pages
+         with filter controls (Newest/Oldest sort, Category/Years/
+         Months filters), form inputs (Mr/Mrs/Ms title, language
+         selectors), registration routing (pension plan type), and
+         navigation tabs. This produced 132 extra ‘pages’ (350
+         approved → 482 scraped) of low-quality or irrelevant content.
+
+         A standalone diagnostic script (detect_dropdowns.py) was
+         run against all 350 URLs and confirmed exactly 36 URLs have
+         detectable dropdowns, classified as:
+           contact_routing  —  5 URLs (the ONLY ones worth scraping)
+           content_filter   — 22 URLs (Newest/Oldest, Category etc)
+           form_field       —  2 URLs (Mr/Mrs/Ms, language)
+           unknown          —  7 URLs (confirmed no useful content)
+
+         STRATEGY — 3-layer filter (all rules auto, no manual list):
+
+         Layer 1 — Navigation guard:
+         After firing JS event, check page.url against original URL.
+         If changed — page navigated (SPA routing) — skip option and
+         re-navigate back. Fixes find-a-lost-pension stale element
+         errors and prevents indexing off-page content.
+
+         Layer 2 — Content signal validation:
+         After getting body text diff, check if it contains at least
+         one contact signal:
+           • Phone number:  UK format e.g. 0345 646 2101
+           • Address:       "write to us", "lines are open",
+                              "call us", "excluding bank holidays"
+           • Form link:     "fill in our online form",
+                              "tell us someone has died"
+         If NO signal — skip. Eliminates filter controls, form inputs,
+         registration routing, and navigation tabs automatically.
+         No whitelist, no manual maintenance required.
+         Approved Excel remains the sole source of truth.
+
+         Layer 3 — Placeholder expansion:
+         Added dashed/numbered variants to _DROPDOWN_PLACEHOLDERS:
+         "-- select an option --", "- select -", "select an option",
+         "select option", "none", "n/a", "0", "all".
+         Prevents garbage #state= URLs like
+         #state=--Select%20an%20option-- appearing in the index.
+
+         RULES SATISFIED (from client architect meeting July 2026):
+         Rule 1 — Form dropdowns: no contact signal → skipped
+         Rule 2 — Navigation redirect: page.url check → skipped
+         Rule 3 — No content change: <20 chars check → skipped
+         Rule 4 — Personal detail dropdowns: no signal → skipped
+         Rule 5 — Complaint/other forms: no signal → skipped
+         Rule 6 — Core: selection→contact content only → captured
+         Rule 7 — No manual list: fully automatic → satisfied
+
+         VERIFIED against 36 dropdown URLs — only genuine contact
+         routing pages (bereavement, lost pension etc) produce
+         contact signals and pass all 3 layers.
+
+v4.6.0 — July 2026 | Mukesh Kund
+         Content versioning and traceability — scraper side.
+
+         TWO NEW VERSION CONSTANTS:
+           SCRAPER_VERSION  = "1.0.0"
+             Bump when scraping logic changes: CDP mode, dropdown
+             detection, content extraction, crawl4ai config.
+           METADATA_VERSION = "1.0.0"
+             Bump when metadata extraction/mapping logic changes:
+             EXCEL_CATEGORY_MAP, SECTION_MAP, extract_page_metadata(),
+             derive_content_type(), has_video detection.
+
+         BOTH are independent — changing crawl4ai config bumps
+         SCRAPER_VERSION but not METADATA_VERSION. Changing how
+         content_type is mapped from Excel Category bumps
+         METADATA_VERSION but not SCRAPER_VERSION.
+
+         OUTPUT JSON — 4 new fields on EVERY page:
+           scraper_version  — which scraping logic produced this page
+           metadata_version — which metadata extraction produced this page
+           scrape_run_id    — UUID generated once per scrape run;
+                              links all pages from the same execution
+           scraped_at       — already existed; now always UTC ISO format
+
+         scrape_run_id is generated at startup (module level) so all
+         pages from one scraper invocation share the same ID.
+         chunk_and_index_hqaV4.py passes scraper_version,
+         metadata_version, and scrape_run_id through to the AI Search
+         index for end-to-end chunk traceability.
+
+         PRINT FIX:
+         Completion next-step print corrected from
+         chunk_and_index_hqaV3.py → chunk_and_index_hqaV4.py.
+
+v4.7.0 — July 2026 | Mukesh Kund
+         Versioning field descriptions added as code comments.
+         No logic changes — documentation only.
+
+         VERSIONING FIELDS PRODUCED BY THIS SCRIPT:
+         ┌─────────────────┬────────┬──────────────────────────────────────────────┐
+         │ Field           │ Type   │ Meaning                                      │
+         ├─────────────────┼────────┼──────────────────────────────────────────────┤
+         │ scraper_version │ String │ Which SCRAPING LOGIC built this page.        │
+         │                 │        │ Bump SCRAPER_VERSION when scrape_page(),     │
+         │                 │        │ CDP mode, dropdown detection, or crawl4ai    │
+         │                 │        │ config changes. Never auto-increments.       │
+         ├─────────────────┼────────┼──────────────────────────────────────────────┤
+         │ metadata_version│ String │ Which METADATA EXTRACTION LOGIC built this.  │
+         │                 │        │ Bump METADATA_VERSION when                   │
+         │                 │        │ extract_page_metadata(), CONTENT_TYPE_MAP,   │
+         │                 │        │ PRODUCT_CATEGORY_MAP, EXCEL_CATEGORY_MAP,   │
+         │                 │        │ or video detection logic changes.            │
+         │                 │        │ Never auto-increments.                       │
+         ├─────────────────┼────────┼──────────────────────────────────────────────┤
+         │ scrape_run_id   │ UUID   │ Groups ALL PAGES from ONE scraper execution. │
+         │                 │        │ All 350 pages from one run share one UUID.   │
+         │                 │        │ Generated once at startup. Lets you query   │
+         │                 │        │ "show me every chunk from scrape run X".    │
+         ├─────────────────┼────────┼──────────────────────────────────────────────┤
+         │ scraped_at      │ ISO ts │ When the page was scraped from the website.  │
+         │                 │        │ UTC ISO format. Distinct from indexed_at     │
+         │                 │        │ (set by indexer when chunk is uploaded).     │
+         └─────────────────┴────────┴──────────────────────────────────────────────┘
+
+         Fields NOT set by this script (set by indexer):
+           pipeline_version, index_run_id, indexed_at, refresh_count
+
+         BUMPING RULES SUMMARY:
+           SCRAPER_VERSION  — bump when HOW we scrape changes
+           METADATA_VERSION — bump when WHAT metadata we extract changes
+           (Both are developer-bumped only — never auto-increment)
+
+v4.7.1 — July 2026 | Mukesh Kund
+         Bugfix: read_time_mins stored as str not int (schema audit).
+
+         extract_page_metadata() [MODIFIED]:
+         - Default dict: 5 (int) → "5" (str)
+         - Calculation: int(read_time) → str(max(1, round(...)))
+         _scrape_dropdown_states_playwright() [MODIFIED]:
+         - max(1, len(...)) → str(max(1, len(...)))
+         Root cause: Azure AI Search schema declares read_time_mins
+         as Edm.String. Scraper v4.4.0 changed it to int — this went
+         undetected until upload failed with "Cannot convert the
+         literal '9' to the expected type 'Edm.String'".
+         A schema type audit script (audit_schema_types.py) has been
+         added to the project to catch this class of bug early.
+
+v4.8.0 — July 2026 | Mukesh Kund
+    FIX 1 — parent_url on dropdown state dicts.
+    Dropdown state entries were stored with url=state_url (#state=...)
+    only. No clean parent URL was persisted, so retriever.py passed
+    fragment URLs straight into citation chips — dead links for customers.
+    - Added "parent_url": url to every dropdown state dict in
+      _scrape_dropdown_states_playwright(). url here is already the
+      clean base URL (no fragment).
+    FIX 2 — URL dedup before JSON save (main scrape loop).
+    The scraper accumulated all results and called save_scraped_pages()
+    with no URL uniqueness check. If the Excel had duplicate URL rows
+    (different Category column), or normalize_url() resolved two entries
+    to the same URL, both were written to JSON → indexer doubled every
+    chunk for that page (confirmed: 5548 removable duplicates in v4 index
+    from 5911 total docs, single run_id). Fix: deduplicate results by
+    "url" key before saving; suppressed duplicates are logged as warnings.
+    NOTE: load_approved_pages() already deduplicates the Excel input by
+    normalised URL. This is a belt-and-braces guard for post-normalisation
+    collisions (e.g. http vs https, trailing slash) and for dropdown state
+    entries sharing a parent URL fragment key.
+
+v5.0.0 — August 2026 | Mukesh Kund
+    RENAMED: scrape_approved_urls_updatedV4.py → scrape_approved_
+    urls_updatedV5.py. Matches chunk_and_index_hqaV5.py naming, which
+    was renamed in the same rebuild cycle (element-aware chunking).
+
+    NAME-ONLY CHANGE — NO FUNCTIONAL CHANGE:
+    SCRAPER_VERSION intentionally left at "1.0.0". Per this file's
+    own documented bumping rule (see v4.6.0 entry above), it only
+    bumps when scraping LOGIC changes — CDP mode, dropdown detection,
+    content extraction, crawl4ai config. None of that changed here.
+    This rename does not touch scrape_page(), the dropdown Playwright
+    handler, metadata extraction, or any other scraping behaviour.
+
+    WHAT CHANGED (all references to this script's own identity,
+    and to downstream scripts/resources that are ALSO now renamed):
+    - Module docstring title: "Web Scraper v4" → "Web Scraper v5"
+    - Usage examples, Dockerfile CMD, programmatic import examples:
+      scrape_approved_urls_updatedV4.py → V5
+    - Downstream references updated to match their OWN actual rename:
+      chunk_and_index_hqaV4.py → chunk_and_index_hqaV5.py (see that
+      file's v5.10.0 changelog), rlg-faq-index-v4 → rlg-faq-index-v5
+      in the "manual full re-index" job-run-order documentation.
+    - Container Apps Job names: aria-scraper-job → digital-assistance-
+      scraper-job, aria-indexer-job → digital-assistance-indexer-job,
+      aria-freshness-job → digital-assistance-freshness-job. "ARIA"
+      product name replaced with "Digital Assistance" throughout —
+      matches current internal naming (see project CLAUDE.md: all
+      Container Apps Jobs, scripts, and documentation use
+      digital-assistance-* prefixes, not aria-*).
+
+    WHAT DID NOT CHANGE (left as accurate historical record):
+    - Every changelog entry above (v1.0.0 through v4.8.0) — these
+      describe what was true in this file AT THAT TIME, including
+      historical mentions of "chunk_and_index_hqaV4.py" or "v4 index"
+      that were correct when written. Rewriting them to V5 would
+      misrepresent history (e.g. the v4.6.0 PRINT FIX entry describes
+      a V3→V4 correction — it was never a V4→V5 fix).
+    - Inline "# vX.Y.Z:" code comments throughout the file (e.g.
+      "# v4.0.0 FIX:", "# v4.5.2:") — these mark WHEN a specific
+      piece of code was introduced to this file's history and stay
+      accurate as written, same convention as chunk_and_index_hqaV5.py
+      and content_freshnessV1.py's inline version markers.
+
+═══════════════════════════════════════════════════════════════
+"""
+
+import argparse
+import asyncio
+import concurrent.futures
+import hashlib
+import os
+import json
+import re
+import sys
+import time
+import traceback
+from pathlib import Path
+from datetime import datetime, timezone
+import urllib.parse
+
+# nest_asyncio allows asyncio.run()-equivalent to work inside an already-running
+# event loop (Azure Functions, FastAPI, Jupyter). Optional — plain script use
+# works without it via the except ImportError fallback in run_scraper().
+try:
+    import nest_asyncio as _nest_asyncio
+    _NEST_ASYNCIO_AVAILABLE = True
+except ImportError:
+    _NEST_ASYNCIO_AVAILABLE = False
+
+import structlog
+from bs4 import BeautifulSoup       # v3.0.0: meta tag + video detection
+from openpyxl import load_workbook
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+from crawl4ai.content_filter_strategy import PruningContentFilter
+
+# v4.0.0 FIX: find_dotenv / load_dotenv were called but never imported
+# — caused NameError on startup. Added the import.
+# override=True ensures .env always wins over shell environment
+# variables — prevents silent misconfiguration in DevOps pipelines.
+from dotenv import load_dotenv, find_dotenv
+
+_dotenv_path = find_dotenv(usecwd=False)
+load_dotenv(_dotenv_path, override=True)
+log = structlog.get_logger()
+
+# ── Versioning (v4.6.0) ───────────────────────────────────────
+#
+# VERSIONING FIELDS — WHAT EACH MEANS:
+#
+#   SCRAPER_VERSION  ("1.0.0" → "1.1.0" → ...)
+#     Tracks WHICH SCRAPING LOGIC produced each page.
+#     Bump when: scrape_page(), CDP mode, dropdown detection,
+#     crawl4ai config, or content extraction logic changes.
+#     Never auto-increments. Developer-bumped only.
+#     Stored as: scraper_version field on every AI Search chunk.
+#
+#   METADATA_VERSION  ("1.0.0" → "1.1.0" → ...)
+#     Tracks WHICH METADATA EXTRACTION LOGIC produced each page.
+#     Bump when: extract_page_metadata(), CONTENT_TYPE_MAP,
+#     PRODUCT_CATEGORY_MAP, EXCEL_CATEGORY_MAP, has_video
+#     detection, or derive_content_type() logic changes.
+#     Never auto-increments. Developer-bumped only.
+#     Stored as: metadata_version field on every AI Search chunk.
+#
+#   SCRAPE_RUN_ID  (UUID per invocation)
+#     Groups ALL PAGES from ONE scraper execution together.
+#     All 350 pages from one run share the same UUID.
+#     Generated fresh at startup — never persisted across runs.
+#     Stored as: scrape_run_id field on every AI Search chunk.
+#
+#   scraped_at  (ISO timestamp, set per page)
+#     When the page was fetched from the Royal London website.
+#     UTC ISO format. Distinct from indexed_at (set by indexer).
+#     Stored as: scraped_at field on every AI Search chunk.
+#
+# Fields NOT set by this script (set by chunk_and_index_hqaV5.py):
+#   pipeline_version, index_run_id, indexed_at, refresh_count
+#
+import uuid as _uuid
+SCRAPER_VERSION  = "1.0.0"
+METADATA_VERSION = "1.0.0"
+SCRAPE_RUN_ID    = str(_uuid.uuid4())
+
+# ── Config ────────────────────────────────────────────
+APPROVED_EXCEL = "scraper/data/royal_london_verification_retried.xlsx"
+BATCH_SIZE = 5
+BATCH_DELAY_SECONDS = 2
+
+# ── Production: Azure Blob Storage ─────────────────────────────
+# TODO (DevOps): Set these in Azure Key Vault before go-live.
+#
+# AZURE_STORAGE_CONNECTION — Blob Storage connection string.
+#   Not set (default) → local mode, saves to scraper/data/.
+#   Set in production → uploads JSON to Blob Storage instead.
+#
+# BLOB_CONTAINER_NAME — container name in Blob Storage.
+#   DevOps creates this in the Azure Storage Account.
+#   Default: "scraper-data"
+#
+# BLOB_SCRAPED_FILENAME — filename written to Blob Storage.
+#   chunk_and_index.py reads this exact filename.
+#   Both scripts must agree on the same filename.
+#   Default: "royal_london_faq_latest.json"
+#
+# TODO: Production URL source format TBD with client.
+#   Currently reads approved URLs from Excel (dev-only workflow).
+#   Production options (agree with brand/marketing + DevOps):
+#     Option A: JSON file in Blob Storage (content team uploads)
+#     Option B: SharePoint list via Microsoft Graph API
+#     Option C: CMS API endpoint from Royal London website team
+#   Until decided, Excel path works for local + manual prod runs.
+BLOB_STORAGE_CONNECTION = os.getenv("AZURE_STORAGE_CONNECTION", "")
+BLOB_CONTAINER_NAME     = os.getenv("BLOB_CONTAINER_NAME", "scraper-data")
+BLOB_SCRAPED_FILENAME   = os.getenv(
+    "BLOB_SCRAPED_FILENAME",
+    "royal_london_faq_latest.json",
+)
+
+# ── Playwright browser executable path ─────────────────────────
+# VDI/corporate environments block Playwright's chromium download
+# via SSL certificate interception (UNABLE_TO_GET_ISSUER_CERT).
+# Use system Chrome instead — set PLAYWRIGHT_EXECUTABLE_PATH in
+# .env or Key Vault.
+#
+# VDI (Windows):
+#   PLAYWRIGHT_EXECUTABLE_PATH=C:\Program Files\Google\Chrome\Application\chrome.exe
+#   (default below — works on Royal London VDI without any .env change)
+#
+# Production (Azure Container Apps — Linux):
+#   Set PLAYWRIGHT_EXECUTABLE_PATH=/usr/bin/google-chrome in Key Vault
+#   OR leave unset — container image installs chromium via
+#   `playwright install chromium` in Dockerfile (no SSL issue in Azure).
+#
+# TODO (DevOps): Add to Dockerfile:
+#   RUN playwright install chromium --with-deps
+#   ENV PLAYWRIGHT_EXECUTABLE_PATH=""
+_PLAYWRIGHT_DEFAULT_WIN = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+PLAYWRIGHT_EXECUTABLE_PATH = os.getenv("PLAYWRIGHT_EXECUTABLE_PATH", _PLAYWRIGHT_DEFAULT_WIN)
+
+# Section mapping from first URL path segment
+SECTION_MAP = {
+    "existing-customers":       "Existing Customers",
+    "insurance":                "Insurance",
+    "pensions":                 "Pensions",
+    "guides-tools":             "Guides and Tools",
+    "retirement-planning":      "Retirement Planning",
+    "isa":                      "ISA",
+    "profitshare":              "ProfitShare",
+    "about-us":                 "About Us",
+    "find-a-financial-adviser": "Find a Financial Adviser",
+    "accessibility":            "Accessibility",
+    "informational-pages":      "Information",
+}
+
+
+# Derive section label from first URL path segment.
+def derive_section(url: str) -> str:
+    """
+    Derive section label from first URL path segment.
+
+    Uses SECTION_MAP — first segment of the path after the domain.
+    Falls back to "General" if no segment matches.
+
+    Examples:
+        .../pensions/...            → "Pensions"
+        .../existing-customers/...  → "Existing Customers"
+        .../isa/...                 → "ISA"
+        .../unknown/...             → "General"
+    """
+    try:
+        path = url.split("://", 1)[-1]          # strip scheme
+        path = path.split("/", 1)[-1]            # strip domain
+        first_segment = path.split("/")[0].lower()
+        return SECTION_MAP.get(first_segment, "General")
+    except Exception:
+        return "General"
+
+
+# ── CDP / Chrome subprocess (VDI fix v4.5.2) ────────────────────
+# crawl4ai 0.8.9 ignores chrome_channel and executable_path —
+# it always tries to use its own ms-playwright chromium which
+# VDI SSL restrictions block from downloading.
+# Solution: launch system Chrome with --remote-debugging-port
+# and connect crawl4ai to it via cdp_url. crawl4ai never
+# launches its own browser in CDP mode.
+
+_CDP_PORT    = int(os.getenv("PLAYWRIGHT_CDP_PORT", "9222"))
+_CDP_URL     = f"http://localhost:{_CDP_PORT}"
+_CHROME_PROC = None  # subprocess handle — module level
+
+
+# Launch system Chrome with remote debugging.
+def _start_chrome_cdp() -> bool:
+    """
+    Launch system Chrome with remote debugging.
+    Returns True if CDP mode should be used.
+
+    On Linux/production where PLAYWRIGHT_EXECUTABLE_PATH
+    does not exist, returns False — crawl4ai uses its own
+    Playwright browser normally (installed in Dockerfile).
+
+    v4.5.3 FIX — CREATE_NO_WINDOW on Windows:
+    Without this flag, the Chrome subprocess inherits the
+    terminal's console handles. asyncio's ProactorEventLoop
+    on Windows tries to close those inherited handles during
+    garbage collection after the subprocess exits, but they
+    are already gone → ValueError: I/O operation on closed
+    pipe. CREATE_NO_WINDOW gives Chrome its own isolated
+    console handle space — no inheritance, no conflict.
+    stdin=DEVNULL added explicitly for the same reason.
+    Linux/macOS: creation_flags=0 is a no-op.
+    """
+    global _CHROME_PROC
+    import socket
+    import subprocess
+    import sys as _sys
+    import time as _time
+
+    exec_path = PLAYWRIGHT_EXECUTABLE_PATH
+    if not exec_path or not os.path.exists(exec_path):
+        log.info("cdp_mode_skipped", reason="no_system_chrome_found")
+        return False
+
+    # Check if port already listening
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        already_up = s.connect_ex(("localhost", _CDP_PORT)) == 0
+
+    if already_up:
+        log.info("cdp_chrome_already_running", port=_CDP_PORT)
+        return True
+
+    try:
+        # CREATE_NO_WINDOW: Windows-only flag — prevents Chrome from
+        # inheriting terminal handles that asyncio tries to close
+        # after subprocess exit (ValueError: I/O on closed pipe fix).
+        creation_flags = 0
+        if _sys.platform == "win32":
+            creation_flags = subprocess.CREATE_NO_WINDOW
+
+        _CHROME_PROC = subprocess.Popen(
+            [
+                exec_path,
+                f"--remote-debugging-port={_CDP_PORT}",
+                "--headless=new",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creation_flags,
+        )
+        # Wait up to 7.5s for Chrome to be ready
+        for _ in range(15):
+            _time.sleep(0.5)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                if s.connect_ex(("localhost", _CDP_PORT)) == 0:
+                    log.info(
+                        "cdp_chrome_started",
+                        pid=_CHROME_PROC.pid,
+                        port=_CDP_PORT,
+                    )
+                    return True
+        log.error("cdp_chrome_start_timeout", port=_CDP_PORT)
+        return False
+    except Exception as e:
+        log.error("cdp_chrome_start_failed", error=str(e))
+        return False
+
+
+# Terminate Chrome subprocess if we launched it.
+def _stop_chrome_cdp() -> None:
+    """Terminate Chrome subprocess if we launched it."""
+    global _CHROME_PROC
+    if _CHROME_PROC is not None:
+        pid = _CHROME_PROC.pid
+        try:
+            _CHROME_PROC.terminate()
+        except Exception:
+            # Process may already be gone — cleanup path, safe to ignore.
+            pass
+        try:
+            _CHROME_PROC.wait(timeout=5)
+        except Exception:
+            # Already exited or terminate() didn't finish in time —
+            # nothing left to clean up either way.
+            pass
+        # Close pipes explicitly to prevent I/O on closed pipe errors
+        # that occur when asyncio cleanup runs after subprocess exit
+        for pipe in [_CHROME_PROC.stdin, _CHROME_PROC.stdout, _CHROME_PROC.stderr]:
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    # Pipe may already be closed by process exit — safe to ignore.
+                    pass
+        _CHROME_PROC = None
+        log.info("cdp_chrome_stopped", pid=pid)
+
+
+# Build BrowserConfig. CDP mode on VDI, normal on production.
+def _make_browser_config() -> BrowserConfig:
+    """
+    Build BrowserConfig. CDP mode on VDI, normal on production.
+
+    VDI: cdp_url set — crawl4ai connects to our Chrome subprocess.
+    Production: cdp_url=None — crawl4ai uses its own browser.
+    """
+    use_cdp = _start_chrome_cdp()
+    if use_cdp:
+        log.info("browser_config_mode", mode="CDP", url=_CDP_URL)
+        return BrowserConfig(
+            browser_type="chromium",
+            headless=True,
+            verbose=False,
+            cdp_url=_CDP_URL,
+        )
+    log.info("browser_config_mode", mode="normal_playwright")
+    return BrowserConfig(
+        browser_type="chromium",
+        headless=True,
+        verbose=False,
+    )
+
+
+# ── Step 0: Metadata extraction (v3.0.0) ────────────────────
+
+# CSS class names and data attributes that Royal London uses
+# for their video player components. Detected in rendered HTML
+# as a fallback signal when meta tags don't confirm video.
+# These were identified from inspecting Royal London page source.
+# Update this list if new player classes are discovered.
+VIDEO_CSS_SIGNALS = [
+    "video-player",
+    "webinar-player",
+    "brightcove-player",
+    "bc-player",
+    "vjs-tech",          # Video.js (common enterprise player)
+    "kaltura-player",
+    "jwplayer",
+    "data-video-id",
+    "data-webinar-id",
+    "data-brightcove",
+]
+
+# URL path segments that reliably indicate video content.
+# Any segment present in the page URL → has_video = True.
+VIDEO_URL_SIGNALS = [
+    "/webinars/",
+    "/videos/",
+    "/video/",
+    "/webinar/",
+]
+
+# meta-Collection_name values that indicate video pages.
+# crawl4ai renders these as text in the HTML head.
+# Case-insensitive matching used.
+VIDEO_COLLECTION_SIGNALS = [
+    "webinar",
+    "video",
+    "podcast",          # audio/video content
+]
+
+# Product category keyword mapping.
+# URL path segments → product_category value.
+# Order matters — first match wins.
+PRODUCT_CATEGORY_MAP = [
+    ("/pension",              "pensions"),
+    ("/retirement",           "retirement"),
+    ("/life-insurance",       "life_insurance"),
+    ("/life-cover",           "life_insurance"),
+    ("/whole-of-life",        "life_insurance"),
+    ("/income-protection",    "income_protection"),
+    ("/critical-illness",     "critical_illness"),
+    ("/illness-income",       "income_protection"),
+    ("/isa",                  "isa"),
+    ("/investments",          "investments"),
+    ("/investment",           "investments"),
+    ("/fund",                 "investments"),
+    ("/funeral",              "funeral"),
+    ("/profitshare",          "profitshare"),
+    ("/financial-adviser",    "financial_advice"),
+    ("/find-a-financial",     "financial_advice"),
+    ("/about-us",             "corporate"),
+    ("/media",                "corporate"),
+    ("/existing-customers",   "customer_support"),
+]
+
+# Content type mapping from URL path segments.
+# Order matters — more specific patterns first.
+CONTENT_TYPE_MAP = [
+    ("/webinars/",            "webinar"),
+    ("/videos/",              "video"),
+    ("/video/",               "video"),
+    ("/guides-tools/",        "guide"),
+    ("/pension-calculator",   "tool"),
+    ("/retirement-planner",   "tool"),
+    ("/lump-sum-calculator",  "tool"),
+    ("/risk-profiler",        "tool"),
+    ("/calculator",           "tool"),
+    ("/planner",              "tool"),
+    ("/existing-customers/",  "faq"),
+    ("/help-and-support/",    "faq"),
+    ("/pensions-explained",   "faq"),
+    ("/about-us/",            "corporate"),
+    ("/media/",               "news"),
+    ("/press-release",        "news"),
+    ("/news/",                "news"),
+    ("/agm/",                 "corporate"),
+]
+
+
+# Derive content_type from URL path pattern.
+def derive_content_type(url: str) -> str:
+    """
+    Derive content_type from URL path pattern.
+
+    Uses CONTENT_TYPE_MAP — first match wins (most specific first).
+    Falls back to "article" if no pattern matches.
+
+    Returns one of:
+        webinar, video, guide, tool, faq, corporate, news, article
+    """
+    url_lower = url.lower()
+    for pattern, content_type in CONTENT_TYPE_MAP:
+        if pattern in url_lower:
+            return content_type
+    return "article"
+
+
+# Derive product_category from URL path pattern.
+def derive_product_category(url: str) -> str:
+    """
+    Derive product_category from URL path pattern.
+
+    Uses PRODUCT_CATEGORY_MAP — first match wins.
+    Falls back to "general" if no pattern matches.
+
+    Returns one of:
+        pensions, retirement, life_insurance, income_protection,
+        critical_illness, isa, investments, funeral, profitshare,
+        financial_advice, corporate, customer_support, general
+    """
+    url_lower = url.lower()
+    for pattern, category in PRODUCT_CATEGORY_MAP:
+        if pattern in url_lower:
+            return category
+    return "general"
+
+
+# Derive audience from URL domain/path.
+def derive_audience_from_url(url: str) -> str:
+    """
+    Derive audience from URL domain/path.
+
+    v3.0.0 FIX: was hardcoded to "customer" in scrape_page().
+    Now properly derived from URL:
+        adviser.royallondon.com  → "adviser"
+        employer.royallondon.com → "employer"
+        /adviser/ in path        → "adviser"
+        /employer/ in path       → "employer"
+        everything else          → "customer"
+    """
+    url_lower = url.lower()
+    if "adviser.royallondon.com" in url_lower or "/adviser/" in url_lower:
+        return "adviser"
+    if "employer.royallondon.com" in url_lower or "/employer/" in url_lower:
+        return "employer"
+    return "customer"
+
+
+# Detect whether a page contains video content.
+def detect_video_from_html(html: str, url: str) -> bool:
+    """
+    Detect whether a page contains video content.
+
+    Uses three independent signals — any one True = has_video:
+
+    Signal 1 — URL pattern (most reliable):
+        URL contains /webinars/, /videos/, /video/, /webinar/
+
+    Signal 2 — Meta tag (very reliable):
+        meta-Collection_name contains "webinar" or "video"
+        Parsed from HTML <head> — always present, not JS-dependent.
+
+    Signal 3 — HTML class/attribute (fallback):
+        Rendered HTML contains known video player CSS class names
+        or data attributes (VIDEO_CSS_SIGNALS list).
+        Less reliable as Royal London's player is JS-rendered and
+        may not appear at domcontentloaded — but included as belt-
+        and-suspenders.
+
+    Args:
+        html: Raw HTML string from crawl4ai result.html
+        url:  Page URL for Signal 1 check
+
+    Returns:
+        bool — True if any signal indicates video content
+    """
+    url_lower = url.lower()
+
+    # Signal 1: URL pattern
+    for pattern in VIDEO_URL_SIGNALS:
+        if pattern in url_lower:
+            return True
+
+    # Signal 2 + 3: parse HTML
+    if not html:
+        return False
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Signal 2: meta-Collection_name tag
+        # Royal London sets this in the page head as:
+        # <meta name="Collection_name" content="Pension webinar">
+        collection_meta = (
+            soup.find("meta", attrs={"name": "Collection_name"}) or
+            soup.find("meta", attrs={"name": "collection_name"}) or
+            soup.find("meta", property="Collection_name")
+        )
+        if collection_meta:
+            collection_val = (
+                collection_meta.get("content", "") or ""
+            ).lower()
+            for signal in VIDEO_COLLECTION_SIGNALS:
+                if signal in collection_val:
+                    return True
+
+        # Also check og:type = "video" or similar
+        og_type = soup.find("meta", property="og:type")
+        if og_type and "video" in (og_type.get("content", "") or "").lower():
+            return True
+
+        # Signal 3: HTML class/attribute scan
+        # Check rendered HTML (not just head) for video player signals
+        html_lower = html.lower()
+        for signal in VIDEO_CSS_SIGNALS:
+            if signal in html_lower:
+                return True
+
+    except Exception as e:
+        log.warning(
+            "video_detection_parse_error",
+            url=url,
+            error=str(e),
+        )
+
+    return False
+
+
+# Extract rich metadata from page HTML for index enrichment.
+def extract_page_metadata(html: str, url: str) -> dict:
+    """
+    Extract rich metadata from page HTML for index enrichment.
+
+    Parses result.html (already fetched by crawl4ai — zero extra
+    HTTP calls, zero extra cost) using BeautifulSoup.
+
+    All extractions are defensive — any failure returns safe
+    defaults so scraping continues normally.
+
+    Args:
+        html: Raw HTML string from crawl4ai result.html
+        url:  Page URL for URL-based derivations
+
+    Returns dict with keys:
+        has_video        (bool) — page contains video content
+        content_type     (str)  — webinar/guide/article/faq/tool/news
+        product_category (str)  — pensions/insurance/isa/etc
+        audience         (str)  — customer/adviser/employer
+        description      (str)  — page description for UI previews
+        thumbnail_url    (str)  — teaser/og image URL
+        publish_date     (str)  — ISO date string or ""
+        collection_name  (str)  — e.g. "Pension webinar"
+        read_time_mins   (str)  — estimated reading time
+
+    All string fields default to "" if not found.
+    has_video defaults to False if detection fails.
+    """
+    # Safe defaults — used if any extraction fails
+    metadata = {
+        "has_video":        False,
+        "content_type":     derive_content_type(url),
+        "product_category": derive_product_category(url),
+        "audience":         derive_audience_from_url(url),
+        "description":      "",
+        "thumbnail_url":    "",
+        "publish_date":     "",
+        "collection_name":  "",
+        "read_time_mins":   "5",  # default 5 min if calculation fails
+    }
+
+    # Video detection — uses URL + HTML signals
+    metadata["has_video"] = detect_video_from_html(html, url)
+
+    if not html:
+        # No HTML available — return URL-derived defaults
+        return metadata
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+
+        # ── Description ──────────────────────────────────────
+        # Priority: meta-description > og:description > st-description
+        # UI team uses this for citation preview tooltips.
+        for attr, key in [
+            ({"name": "description"}, "content"),
+            ({"property": "og:description"}, "content"),
+            ({"name": "st-description"}, "content"),
+        ]:
+            tag = soup.find("meta", attrs=attr)
+            if tag and tag.get(key, "").strip():
+                metadata["description"] = tag[key].strip()[:300]
+                break
+
+        # ── Thumbnail URL ─────────────────────────────────────
+        # Priority: meta-teaser_image > og:image
+        # meta-teaser_image is Royal London's custom teaser image
+        # (350x200px, page-specific). og:image is usually the RL logo.
+        # UI team can use teaser_image for rich citation cards.
+        teaser = soup.find("meta", attrs={"name": "teaser_image"})
+        if teaser and teaser.get("content", "").strip():
+            metadata["thumbnail_url"] = teaser["content"].strip()
+        else:
+            og_image = soup.find("meta", property="og:image")
+            if og_image and og_image.get("content", "").strip():
+                # Only store if it's Royal London hosted (not generic logo)
+                img_url = og_image["content"].strip()
+                if "rl-logo-meta-image" not in img_url:
+                    metadata["thumbnail_url"] = img_url
+
+        # ── Publish date ──────────────────────────────────────
+        # Royal London sets meta-st-publish-date as human-readable
+        # e.g. "13 March 2024". Parse to ISO format for indexing.
+        pub_date_tag = soup.find(
+            "meta", attrs={"name": "st-publish-date"}
+        )
+        if pub_date_tag and pub_date_tag.get("content", "").strip():
+            raw_date = pub_date_tag["content"].strip()
+            try:
+                # Parse "13 March 2024" → "2024-03-13"
+                parsed = datetime.strptime(raw_date, "%d %B %Y")
+                metadata["publish_date"] = parsed.strftime("%Y-%m-%d")
+            except ValueError:
+                # If format differs, store raw value
+                metadata["publish_date"] = raw_date[:20]
+
+        # ── Collection name ───────────────────────────────────
+        # e.g. "Pension webinar", "Life insurance guide"
+        # UI team can use this for content category badges.
+        collection_tag = soup.find(
+            "meta", attrs={"name": "Collection_name"}
+        )
+        if collection_tag and collection_tag.get("content", "").strip():
+            metadata["collection_name"] = (
+                collection_tag["content"].strip()[:100]
+            )
+
+        # ── Read time estimate ────────────────────────────────
+        # Estimate from visible text word count at 200 wpm.
+        # For webinar pages: transcript is ~5,000-8,000 words →
+        # 25-40 min. For articles: ~500-1,500 words → 2-7 min.
+        # UI team can display "8 min read" or "30 min webinar".
+        body_text = soup.get_text(separator=" ", strip=True)
+        word_count = len(body_text.split())
+        read_time = max(1, round(word_count / 200))
+        metadata["read_time_mins"] = str(max(1, round(word_count / 200)))  # str: schema is Edm.String
+
+    except Exception as e:
+        log.warning(
+            "metadata_extraction_error",
+            url=url,
+            error=str(e),
+            note="Using safe defaults for this page",
+        )
+
+    return metadata
+
+
+# ── URL normalisation helper ──────────────────────────────────
+# Canonical URL form for deduplication and index consistency.
+def normalize_url(url: str) -> str:
+    """
+    Canonical URL form for deduplication and index consistency.
+
+    Strips trailing slash, query string, fragment, and lowercases
+    the path. Domain is left as-is (already lowercase in practice).
+
+    WHY lowercase the path:
+    Customer Excel contained both:
+        .../should-I-consolidate-my-pensions
+        .../should-i-consolidate-my-pensions
+    Without path lowercasing these survive deduplication as two
+    separate entries and are scraped + indexed twice — duplicate
+    content with different chunk_ids causing retrieval noise.
+    """
+    url = url.strip()
+    url = url.split("?")[0].split("#")[0]   # strip query + fragment
+    url = url.rstrip("/")                    # strip trailing slash
+    if "://" in url:
+        scheme_host, _, path = url.partition("://")
+        domain_end = path.find("/")
+        if domain_end == -1:
+            return f"{scheme_host}://{path}"
+        domain = path[:domain_end]
+        rest   = path[domain_end:].lower()  # lowercase path only
+        return f"{scheme_host}://{domain}{rest}"
+    return url.lower()
+
+
+# ── Excel column detection + URL loading ─────────────────────
+# Reads customer Excel, returns list of dicts:
+def load_approved_pages(excel_path: str) -> list[dict]:
+    """
+    Reads customer Excel, returns list of dicts:
+    [{"url": "...", "title": "..."}]
+
+    Deduplicates by normalized URL (keeps first occurrence's title).
+
+    v4.2.0 — COLUMN DETECTION BY HEADER NAME, NOT FIXED POSITION:
+    Previous versions assumed a fixed column layout (title at
+    column B, url at column C, status at column E) copied from
+    the internal verification file
+    (royal_london_verification_retried.xlsx), which included a
+    status column from an earlier internal check pass. A real
+    customer-supplied Excel is NOT guaranteed to have that
+    layout, or even a status column at all — the customer
+    typically supplies ONLY a URL column, sometimes with a title
+    column, and no status information whatsoever.
+
+    Previous behaviour on a URL-only or URL+title file:
+    `if not row or len(row) < 5: continue` would skip EVERY row
+    (fewer than 5 columns), silently producing zero pages with
+    no error — the worst possible failure mode.
+
+    Column detection (case-insensitive, header = row 1):
+      URL column    (REQUIRED): "url", "page url", "link",
+                                 "webpage", "web page", "web url"
+      Title column  (optional): "title", "page title", "name"
+      Status column (optional): "status", "status code",
+                                 "http status"
+
+    If no URL column is found, raises ValueError listing the
+    headers actually present — an immediate, clear failure
+    instead of a silent empty result.
+
+    STATUS HANDLING — Excel status is a pre-filter hint, NEVER
+    the final authority:
+    - If a status column exists: rows are skipped ONLY when the
+      value is an unambiguous dead signal — a numeric HTTP code
+      >= 400, or a word like "dead"/"broken"/"404"/"removed"/
+      "gone"/"not found". Anything else (a plain "200", "OK",
+      "Live", blank, or unrecognised text) is KEPT — customer
+      status notation isn't guaranteed to be a numeric HTTP code,
+      so being lenient avoids wrongly discarding a working URL
+      over an ambiguous cell value.
+    - If NO status column exists at all: every row with a valid
+      URL is kept as a candidate.
+    - Either way, the LIVE HTTP status_code check in scrape_page()
+      (v4.1.0) is what actually determines whether a URL is live
+      at scrape time — this function only avoids wasting scrape
+      effort on links already known-dead when that information
+      happens to be available in the Excel.
+    """
+    wb = load_workbook(excel_path, read_only=True)
+    ws = wb.active
+
+    # ── Detect columns by header name (row 1) ──────────────────
+    # Sets of recognised header names (case-insensitive).
+    # Adding new synonyms here is all that's needed if the
+    # customer changes their column heading in future.
+    URL_HEADERS      = {"url", "page url", "link", "webpage", "web page", "web url"}
+    TITLE_HEADERS    = {"title", "page title", "name"}
+    STATUS_HEADERS   = {"status", "status code", "http status"}
+    CATEGORY_HEADERS = {"category", "content category", "page category", "type"}
+
+    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+    headers    = [
+        str(h).strip().lower() if h is not None else ""
+        for h in header_row
+    ]
+
+    # Find the column index whose header matches one of the candidate names.
+    def find_col(candidates: set) -> int | None:
+        for idx, h in enumerate(headers):
+            if h in candidates:
+                return idx
+        return None
+
+    url_idx      = find_col(URL_HEADERS)
+    title_idx    = find_col(TITLE_HEADERS)
+    status_idx   = find_col(STATUS_HEADERS)
+    category_idx = find_col(CATEGORY_HEADERS)
+
+    if url_idx is None:
+        wb.close()
+        raise ValueError(
+            f"load_approved_pages: no URL column found in "
+            f"{excel_path!r}. Expected a header matching one of "
+            f"{sorted(URL_HEADERS)} (case-insensitive). "
+            f"Headers actually found: {header_row!r}"
+        )
+
+    log.info(
+        "approved_pages_columns_detected",
+        url_column=headers[url_idx],
+        title_column=headers[title_idx] if title_idx is not None else None,
+        status_column=headers[status_idx] if status_idx is not None else None,
+        category_column=headers[category_idx] if category_idx is not None else None,
+        has_status_column=status_idx is not None,
+        has_category_column=category_idx is not None,
+    )
+
+    # Lenient dead-link detector for an OPTIONAL status column.
+    def _is_dead_status(value) -> bool:
+        """
+        Lenient dead-link detector for an OPTIONAL status column.
+        Only returns True for unambiguous dead signals — see
+        load_approved_pages() docstring for rationale.
+        Never used to REQUIRE a "200" — absence or ambiguity
+        always means "keep it, let the live scrape decide".
+        """
+        if value is None:
+            return False
+        s = str(value).strip().lower()
+        if not s:
+            return False
+        try:
+            code = int(s)
+            return code >= 400
+        except ValueError:
+            # Not a numeric status code — fall through to keyword check.
+            pass
+        dead_words = {"dead", "broken", "404", "removed", "gone", "not found"}
+        return any(w in s for w in dead_words)
+
+    seen           = set()
+    pages          = []
+    total_rows     = 0
+    skipped_status = 0
+    duplicates     = []
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or len(row) <= url_idx:
+            continue
+
+        url = str(row[url_idx]).strip() if row[url_idx] else ""
+        if not url.startswith("http"):
+            continue
+
+        raw_title = (
+            str(row[title_idx]).strip()
+            if title_idx is not None and len(row) > title_idx and row[title_idx]
+            else ""
+        )
+        status_value = (
+            row[status_idx]
+            if status_idx is not None and len(row) > status_idx
+            else None
+        )
+        excel_category = (
+            str(row[category_idx]).strip().lower()
+            if category_idx is not None and len(row) > category_idx and row[category_idx]
+            else ""
+        )
+
+        total_rows += 1
+
+        if _is_dead_status(status_value):
+            skipped_status += 1
+            log.debug(
+                "url_skipped_dead_status",
+                url=url,
+                status_value=status_value,
+            )
+            continue
+
+        normalized = normalize_url(url)
+
+        if normalized in seen:
+            duplicates.append(url)
+            log.debug(
+                "url_duplicate_skipped",
+                raw_url=url,
+                normalized=normalized,
+            )
+            continue
+
+        seen.add(normalized)
+
+        # Clean title — strip " - Royal London" suffix variants
+        title = raw_title
+        for suffix in [
+            " - Royal London", " | Royal London",
+            "- Royal London",  "| Royal London",
+        ]:
+            if title.endswith(suffix):
+                title = title[: -len(suffix)].strip()
+                break
+
+        pages.append({"url": normalized, "title": title, "excel_category": excel_category})
+
+    wb.close()
+
+    # Audit log — production canary for Excel data quality
+    log.info(
+        "approved_pages_loaded",
+        total_rows=total_rows,
+        skipped_dead_status=skipped_status,
+        duplicates_removed=len(duplicates),
+        unique_pages=len(pages),
+        had_status_column=status_idx is not None,
+        had_title_column=title_idx is not None,
+        had_category_column=category_idx is not None,
+    )
+    if duplicates:
+        log.warning(
+            "duplicate_urls_in_excel",
+            count=len(duplicates),
+            examples=duplicates[:5],
+        )
+    if not pages:
+        log.warning(
+            "approved_pages_empty",
+            note=(
+                "No pages loaded — check that the URL column was "
+                "detected correctly and rows contain http(s) URLs."
+            ),
+        )
+
+    return pages
+
+
+
+# ── Step 2: Content cleaning ───────────────────────────
+# Remove exact duplicate of article content.
+def remove_duplicate_content(content: str) -> str:
+    """
+    Remove exact duplicate of article content.
+    crawl4ai sometimes scrapes the page twice.
+
+    Finds H1/H2 headings — if the second one starts after
+    40% of content AND has >60% word overlap with the first
+    chunk, it's a true duplicate → cut it.
+    """
+    h1_pattern = re.compile(r'^#{1,2}\s+\S', re.MULTILINE)
+    matches = list(h1_pattern.finditer(content))
+
+    if len(matches) < 2:
+        return content
+
+    second_pos = matches[1].start()
+    content_len = len(content)
+
+    if second_pos < content_len * 0.40:
+        return content
+
+    first_chunk = content[:second_pos].strip()
+    second_chunk = content[second_pos:].strip()
+
+    first_words = set(first_chunk.split()[:200])
+    second_words = set(second_chunk.split()[:200])
+
+    if not first_words:
+        return content
+
+    overlap_pct = len(first_words & second_words) / len(first_words)
+
+    if overlap_pct > 0.60:
+        log.info(
+            "duplicate_removed",
+            overlap_pct=round(overlap_pct, 2),
+            chars_removed=len(second_chunk),
+        )
+        return first_chunk
+
+    return content
+
+
+# Safe content cleaning — removes only pure UI noise.
+def clean_content(content: str) -> str:
+    """
+    Safe content cleaning — removes only pure UI noise.
+    No meaningful content removed.
+
+    NOTE: External (non-royallondon) URL stripping is NOT
+    done here — chunk_and_index.py handles that separately
+    at chunk time.
+    """
+
+    # Step 1: Remove duplicate article copy
+    content = remove_duplicate_content(content)
+
+    # Step 2: Remove breadcrumb navigation
+    # "1. [ Home ](url) >" or last item "5. Section Name"
+    content = re.sub(
+        r'^\s*\d+\.\s*\[.*?\]\(.*?\)\s*>\s*$',
+        '', content, flags=re.MULTILINE,
+    )
+    content = re.sub(
+        r'^\s*\d+\.\s*\[.*?\]\(.*?\)\s*$',
+        '', content, flags=re.MULTILINE,
+    )
+    content = re.sub(
+        r'^\s*\d+\.\s+[A-Z][^\n]{3,60}$',
+        '', content, flags=re.MULTILINE,
+    )
+
+    # Step 3: Remove social share sections
+    # "Share" heading + following empty bullets
+    content = re.sub(
+        r'Share\s*\n(\s*\*\s*(\[?\s*\]?\([^\)]*\))?\s*\n)+',
+        '', content,
+    )
+    content = re.sub(
+        r'^\s*\*\s*\[?\s*\]?\(\s*[^\)]{0,10}\)\s*$',
+        '', content, flags=re.MULTILINE,
+    )
+    content = re.sub(
+        r'^Share\s*$',
+        '', content, flags=re.MULTILINE,
+    )
+
+    # Step 4: Remove Twitter share links
+    content = re.sub(
+        r'\[?\s*\]?\(https://twitter\.com/intent/tweet[^\)]*\)\s*',
+        '', content,
+    )
+
+    # Step 5: Remove other social media URLs
+    content = re.sub(
+        r'https://www\.(facebook|instagram|linkedin|x|youtube|twitter)\.com/\S+',
+        '', content,
+    )
+
+    # Step 6: Remove empty markdown links
+    content = re.sub(r'\[\s*\]\(\s*\)', '', content)
+    content = re.sub(
+        r'^\s*\*\s*\[\s*\]\s*$', '', content, flags=re.MULTILINE,
+    )
+
+    # Step 7: Remove Previous/Next Item labels
+    content = re.sub(
+        r'^(Previous Item|Next Item)\s*$',
+        '', content, flags=re.MULTILINE | re.IGNORECASE,
+    )
+
+    # Step 8: Remove footer boilerplate
+    content = re.sub(
+        r'Your browser is not supported\..*?×\s*',
+        '', content, flags=re.DOTALL,
+    )
+    content = re.sub(
+        r'#{1,3}\s*Connect with us.*$',
+        '', content, flags=re.DOTALL | re.MULTILINE,
+    )
+    content = re.sub(
+        r'#{1,3}\s*Products and services.*$',
+        '', content, flags=re.DOTALL | re.MULTILINE,
+    )
+    content = re.sub(
+        r'#{1,3}\s*About Royal London.*$',
+        '', content, flags=re.DOTALL | re.MULTILINE,
+    )
+    content = re.sub(
+        r'#{1,3}\s*Useful links.*$',
+        '', content, flags=re.DOTALL | re.MULTILINE,
+    )
+    content = re.sub(
+        r'\*\*The Royal London Mutual Insurance.*$',
+        '', content, flags=re.DOTALL | re.MULTILINE,
+    )
+    content = re.sub(
+        r'©\s*Royal London \d{4}.*$',
+        '', content, flags=re.DOTALL | re.MULTILINE,
+    )
+    content = re.sub(r'\[Back to top\].*?\n', '', content)
+
+    # Step 9: Normalize whitespace
+    content = re.sub(r'\n{3,}', '\n\n', content)
+    content = re.sub(r'[ \t]+\n', '\n', content)
+    content = re.sub(r'\n[ \t]+\n', '\n\n', content)
+
+    return content.strip()
+
+
+# ── Excel category → content_type mapping (v4.3.0) ────
+# Maps customer-supplied Category values to content_type.
+# Excel wins over URL-pattern detection when present.
+# URL-pattern detection is the fallback when Excel category
+# is blank or unrecognised.
+_EXCEL_CATEGORY_MAP = {
+    "brand":    "article",    # brand/marketing pages → article
+    "guidance": "guide",      # guidance content → guide
+    "other":    "article",    # catch-all → article
+    "product":  "article",    # product pages → article
+    "tool":     "tool",       # tools/calculators → tool
+}
+
+# v4.3.0 — Map customer Excel Category to content_type.
+def map_excel_category_to_content_type(excel_category: str, url: str) -> str:
+    """
+    v4.3.0 — Map customer Excel Category to content_type.
+
+    Priority: Excel category (primary) → URL-pattern (fallback).
+
+    Args:
+        excel_category: lowercased value from Excel Category column
+                        (e.g. "brand", "guidance", "product", "tool", "other")
+        url:            page URL — used as fallback via derive_content_type()
+
+    Returns:
+        content_type string: guide / tool / webinar / video /
+                             faq / news / corporate / article
+    """
+    if excel_category:
+        mapped = _EXCEL_CATEGORY_MAP.get(excel_category)
+        if mapped:
+            # URL-pattern can still upgrade: a "product" page
+            # on /webinars/ should still be "webinar".
+            url_type = derive_content_type(url)
+            if url_type in ("webinar", "video", "tool", "faq", "news"):
+                return url_type
+            return mapped
+    # Fallback: URL-pattern only
+    return derive_content_type(url)
+
+
+# ── Step 2b: Multi-state dropdown helpers (v4.5.0) ─────────
+#
+# Replaced crawl4ai JS-injection approach (v4.4.0) with Playwright.
+# Root cause of v4.4.0 failure: a second crawler.arun() call with
+# wait_until="networkidle" timed out on Royal London contact pages.
+# Playwright loads the page ONCE, detects dropdowns from the live DOM,
+# then iterates options via JS event injection — matching the proven
+# standalone crawler.py script (v0.1.0) exactly.
+
+# Dropdown option text that indicates a placeholder (skip these).
+# v4.5.5: expanded to include dashed variants and form defaults
+# that slipped through and produced garbage #state= URLs.
+_DROPDOWN_PLACEHOLDERS = {
+    "select...", "select", "please select", "--", "choose...",
+    "choose", "please choose", "-- select an option --",
+    "- select -", "select an option", "select option",
+    "none", "n/a", "0", "all",
+}
+
+# Contact signals that must be present in dropdown diff content
+# for it to be worth indexing. Eliminates filter controls, form
+# inputs, registration routing, and navigation tabs automatically.
+# Any diff that contains at least one signal is a genuine contact
+# routing option (phone number, address, or online form link).
+_CONTACT_SIGNAL_PATTERNS = [
+    # Phone numbers: 0345 646 2101, 0800123456, 1850 201351
+    re.compile(r'0\d{3,4}[\s\-]?\d{3,4}[\s\-]?\d{3,4}'),
+    re.compile(r'1\d{3,4}[\s\-]?\d{3,4}[\s\-]?\d{3,4}'),  # ROI numbers
+]
+_CONTACT_SIGNAL_KEYWORDS = [
+    "call us",
+    "write to us",
+    "lines are open",
+    "excluding bank holidays",
+    "fill in our online form",
+    "tell us someone has died",
+    "fill out our online form",
+    "monday to friday",
+    "8am to",
+    "9am to",
+]
+
+
+# Check if dropdown diff content contains genuine contact signals.
+def _has_contact_signals(text: str) -> bool:
+    """
+    Check if dropdown diff content contains genuine contact signals.
+
+    v4.5.5 — Layer 2 of bulletproof dropdown filter.
+    Returns True only if the diff contains a phone number, address
+    keyword, or online form link. This eliminates:
+      - Content filter dropdowns (Newest/Oldest, Category/Years)
+      - Form input dropdowns (Mr/Mrs/Ms, language selectors)
+      - Registration routing (pension plan type -> same content)
+      - Navigation tabs (switching between sibling pages)
+
+    Only genuine contact routing options (bereavement policy type
+    -> phone number) contain these signals.
+    """
+    text_lower = text.lower()
+    # Check keyword signals first (fast)
+    for kw in _CONTACT_SIGNAL_KEYWORDS:
+        if kw in text_lower:
+            return True
+    # Check phone number patterns
+    for pattern in _CONTACT_SIGNAL_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
+
+
+# Check rendered HTML for routing <select> elements.
+def _has_routing_dropdowns_in_html(html: str) -> bool:
+    """
+    Check rendered HTML for routing <select> elements.
+
+    Uses BeautifulSoup on already-fetched crawl4ai HTML — zero
+    extra network call. Returns True only if a <select> has more
+    than one non-placeholder <option>.
+    """
+    if not html:
+        return False
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for select in soup.find_all("select"):
+            valid_opts = [
+                o for o in select.find_all("option")
+                if o.get_text(strip=True).lower() not in _DROPDOWN_PLACEHOLDERS
+                and o.get_text(strip=True)
+            ]
+            if len(valid_opts) > 1:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+# For dropdown pages, truncate base page content at the first
+def _truncate_base_content_at_dropdown(content: str) -> str:
+    """
+    For dropdown pages, truncate base page content at the first
+    dropdown-related marker.
+
+    Royal London renders all dropdown option content in the DOM
+    simultaneously (hidden panels shown via JS). crawl4ai captures
+    everything, causing the contact details to appear 3x in the
+    markdown output (once per visible render pass).
+
+    We keep only the intro paragraph — the part before the dropdown
+    widget appears. This matches exactly what the Playwright script
+    captured as the default state (clean intro, no repeated options).
+
+    Markers that indicate the dropdown/contact panel has started:
+    These appear in the markdown just before the repeated content.
+    """
+    DROPDOWN_MARKERS = [
+        "please select an option",
+        "please select",
+        "select an option",
+        "getting in touch",
+        "get in touch",
+        "to show you how best",
+        "we need to know what kind of policy",
+        "don't worry if you don't know",
+        "choose from the list below",
+        "select from the list",
+    ]
+
+    content_lower = content.lower()
+    earliest_cut  = len(content)
+
+    for marker in DROPDOWN_MARKERS:
+        idx = content_lower.find(marker)
+        if idx != -1 and idx < earliest_cut:
+            earliest_cut = idx
+
+    if earliest_cut < len(content):
+        truncated = content[:earliest_cut].strip()
+        # Only truncate if we still have meaningful content
+        if len(truncated) >= 100:
+            log.info(
+                "base_content_truncated_at_dropdown",
+                original_chars=len(content),
+                truncated_chars=len(truncated),
+            )
+            return truncated
+
+    return content
+
+
+# Scrape per-option content from a routing dropdown page using Playwright.
+def _scrape_dropdown_states_playwright(
+    url:            str,
+    base_title:     str,
+    base_page_data: dict,
+) -> list[dict]:
+    """
+    Scrape per-option content from a routing dropdown page using Playwright.
+
+    Runs synchronously — called via asyncio thread pool executor from
+    scrape_page() to avoid blocking the crawl4ai event loop.
+
+    Mirrors _scrape_multi_state_page() from crawler.py v0.1.0 exactly:
+    1. Single page load (networkidle, 45s timeout)
+    2. Detect <select> elements from live DOM
+    3. For each option: JS event injection → 1.5s wait → body text
+    4. Line-by-line diff against default state → only changed lines
+    5. Build page_data dict with synthetic #policy= URL
+
+    Returns list of page_data dicts (one per option with changed content).
+    Empty list on any failure — base page is still used.
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        log.error(
+            "playwright_not_installed",
+            note="pip install playwright && playwright install chromium",
+        )
+        return []
+
+    results: list[dict] = []
+
+    try:
+        with sync_playwright() as pw:
+            # Use system Chrome if available (VDI/corporate SSL restriction
+            # blocks Playwright chromium download). Falls back to Playwright's
+            # own chromium when executable_path doesn't exist (production/Linux).
+            import os as _os
+            _exec = PLAYWRIGHT_EXECUTABLE_PATH
+            _exec_arg = _exec if _exec and _os.path.exists(_exec) else None
+            browser = pw.chromium.launch(
+                headless=True,
+                executable_path=_exec_arg,
+            )
+            try:
+                page = browser.new_page()
+
+                # Block images/fonts — speed up load, no impact on text content
+                page.route(
+                    "**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,eot}",
+                    lambda route: route.abort(),
+                )
+
+                log.info("playwright_navigating", url=url)
+                page.goto(url, wait_until="networkidle", timeout=45000)
+
+                # Try to wait for main content area
+                try:
+                    page.wait_for_selector(
+                        "main, article, [role='main']",
+                        timeout=10000,
+                    )
+                except PWTimeout:
+                    pass  # Continue anyway — main content may still be present
+
+                # Detect routing dropdowns from live DOM
+                selects = page.query_selector_all("select")
+                routing_dropdowns = []
+
+                for select in selects:
+                    options     = select.query_selector_all("option")
+                    valid_opts  = []
+                    for opt in options:
+                        text  = opt.inner_text().strip()
+                        value = opt.get_attribute("value") or ""
+                        if text and text.lower() not in _DROPDOWN_PLACEHOLDERS:
+                            valid_opts.append({"value": value, "text": text})
+
+                    if len(valid_opts) > 1:
+                        routing_dropdowns.append({
+                            "select_element": select,
+                            "options":        valid_opts,
+                        })
+
+                if not routing_dropdowns:
+                    log.info("playwright_no_dropdowns_found", url=url)
+                    return []
+
+                log.info(
+                    "playwright_dropdowns_detected",
+                    url=url,
+                    dropdown_count=len(routing_dropdowns),
+                )
+
+                # Capture default body text for diffing
+                default_raw_text = page.inner_text("body")
+                default_lines    = {
+                    line.strip()
+                    for line in default_raw_text.split("\n")
+                    if line.strip()
+                }
+
+                # Iterate each dropdown × each option
+                for dropdown in routing_dropdowns:
+                    select_el = dropdown["select_element"]
+                    options   = dropdown["options"]
+
+                    for option in options:
+                        opt_value = option["value"]
+                        opt_text  = option["text"]
+
+                        try:
+                            # Fire JS input + change events on the select element
+                            select_el.evaluate(
+                                """(el, optText) => {
+                                    const options = Array.from(el.options);
+                                    const target = options.find(
+                                        o => o.text.trim() === optText
+                                    );
+                                    if (target) {
+                                        el.value = target.value;
+                                        el.dispatchEvent(
+                                            new Event('input', { bubbles: true })
+                                        );
+                                        el.dispatchEvent(
+                                            new Event('change', { bubbles: true })
+                                        );
+                                    }
+                                }""",
+                                opt_text,
+                            )
+
+                            # Wait 1.5s for DOM to update
+                            time.sleep(1.5)
+
+                            # ── Layer 1: Navigation guard ─────────────────
+                            # If JS event caused a page navigation (SPA routing)
+                            # the page.url will differ from our original url.
+                            # Skip this option — content belongs to a different
+                            # page that may or may not be in the approved list.
+                            # Re-navigate back so next option starts clean.
+                            current_url = page.url.split("?")[0].rstrip("/")
+                            original_clean = url.split("?")[0].rstrip("/")
+                            if current_url != original_clean:
+                                log.warning(
+                                    "playwright_option_navigated",
+                                    url=url,
+                                    option=opt_text,
+                                    navigated_to=page.url[:80],
+                                )
+                                try:
+                                    page.goto(
+                                        url,
+                                        wait_until="networkidle",
+                                        timeout=45000,
+                                    )
+                                    # Re-capture default lines after re-navigation
+                                    default_raw_text = page.inner_text("body")
+                                    default_lines = {
+                                        line.strip()
+                                        for line in default_raw_text.split("\n")
+                                        if line.strip()
+                                    }
+                                    # Re-query selects — stale after navigation
+                                    selects = page.query_selector_all("select")
+                                    routing_dropdowns = []
+                                    for sel in selects:
+                                        opts = sel.query_selector_all("option")
+                                        vopts = []
+                                        for o in opts:
+                                            t = o.inner_text().strip()
+                                            v = o.get_attribute("value") or ""
+                                            if t and t.lower() not in _DROPDOWN_PLACEHOLDERS:
+                                                vopts.append({"value": v, "text": t})
+                                        if len(vopts) > 1:
+                                            routing_dropdowns.append({
+                                                "select_element": sel,
+                                                "options": vopts,
+                                            })
+                                    log.info("playwright_re_navigated_after_option", url=url)
+                                except Exception as _nav_e:
+                                    log.warning("playwright_re_navigate_failed", error=str(_nav_e))
+                                continue  # Skip this option regardless
+
+                            new_raw_text = page.inner_text("body")
+
+                            # ── Layer 2a: Minimum content check ───────────
+                            new_lines     = [
+                                line.strip()
+                                for line in new_raw_text.split("\n")
+                                if line.strip()
+                            ]
+                            changed_lines = [
+                                line for line in new_lines
+                                if line not in default_lines
+                            ]
+                            dynamic_content = "\n".join(changed_lines)
+
+                            if not dynamic_content or len(dynamic_content.strip()) < 20:
+                                log.warning(
+                                    "playwright_option_no_change",
+                                    url=url,
+                                    option=opt_text,
+                                )
+                                continue
+
+                            # ── Layer 2b: Contact signal validation ───────
+                            # Only index dropdown states that contain genuine
+                            # contact information (phone, address, form link).
+                            # Eliminates: filter controls, form inputs,
+                            # registration routing, navigation tabs.
+                            # No whitelist needed — fully automatic.
+                            if not _has_contact_signals(dynamic_content):
+                                log.info(
+                                    "playwright_option_no_contact_signal",
+                                    url=url,
+                                    option=opt_text,
+                                    chars=len(dynamic_content),
+                                )
+                                continue
+
+                            # ── All 3 layers passed — save this state ─────
+                            safe_value = opt_value if opt_value else opt_text
+                            state_url  = f"{url}#state={urllib.parse.quote(safe_value)}"
+                            content    = dynamic_content.strip()
+
+                            results.append({
+                                "url":              state_url,
+                                # v4.8.0: clean parent URL (no #state= fragment)
+                                # passed through to indexer → retriever so
+                                # citation chips show the real page URL.
+                                "parent_url":       url,
+                                "title":            f"{base_title} — {opt_text}",
+                                "section":          base_page_data["section"],
+                                "content":          content,
+                                "scraped_at":       datetime.now(timezone.utc).isoformat(),
+                                "content_length":   len(content),
+                                "content_hash":     hashlib.sha256(
+                                    content.encode("utf-8")
+                                ).hexdigest(),
+                                # v4.6.0: versioning — inherited from base page run
+                                "scraper_version":  SCRAPER_VERSION,
+                                "metadata_version": METADATA_VERSION,
+                                "scrape_run_id":    SCRAPE_RUN_ID,
+                                "audience":         base_page_data["audience"],
+                                "has_video":        base_page_data["has_video"],
+                                "content_type":     base_page_data["content_type"],
+                                "product_category": base_page_data["product_category"],
+                                "description":      base_page_data["description"],
+                                "thumbnail_url":    base_page_data["thumbnail_url"],
+                                "publish_date":     base_page_data["publish_date"],
+                                "collection_name":  base_page_data["collection_name"],
+                                "read_time_mins":   str(max(1, len(content.split()) // 200)),
+                                "dropdown_state":   opt_text,
+                                "dropdown_value":   opt_value or "",
+                            })
+
+                            log.info(
+                                "playwright_option_scraped",
+                                url=state_url,
+                                option=opt_text,
+                                chars=len(content),
+                            )
+
+                        except Exception as e:
+                            log.warning(
+                                "playwright_option_error",
+                                url=url,
+                                option=opt_text,
+                                error=str(e),
+                            )
+                            continue
+
+            finally:
+                browser.close()
+
+    except Exception as e:
+        log.error("playwright_dropdown_scrape_error", url=url, error=str(e))
+
+    return results
+
+
+# ── Step 3: Scrape a single page ───────────────────────
+# Scrape a single page and return cleaned page data.
+async def scrape_page(
+    crawler: AsyncWebCrawler,
+    page_info: dict,
+    index: int,
+    total: int,
+) -> "list[dict] | dict | None":
+    """
+    Scrape a single page and return cleaned page data.
+
+    Return type (v4.4.0):
+        dict        — standard page (unchanged behaviour)
+        list[dict]  — multi-state dropdown page: first entry is the
+                      base page, subsequent entries are per-option states
+        None        — scrape failed (unchanged behaviour)
+    """
+    url            = page_info["url"]
+    title          = page_info["title"]
+    excel_category = page_info.get("excel_category", "")
+
+    log.info("scraping_page", url=url, index=index, total=total)
+
+    try:
+        run_config = CrawlerRunConfig(
+            css_selector=(
+                "main, article, .content, #content, "
+                ".page-content, .main-content, [role='main']"
+            ),
+            markdown_generator=DefaultMarkdownGenerator(
+                content_filter=PruningContentFilter(
+                    threshold=0.45,
+                    threshold_type="fixed",
+                ),
+                options={
+                    "ignore_links": False,
+                    "ignore_images": True,
+                    "skip_internal_links": True,
+                }
+            ),
+            wait_until="domcontentloaded",
+            page_timeout=30000,
+            verbose=False,
+            excluded_tags=[
+                "nav", "header", "footer", "aside",
+                "script", "style", "noscript",
+            ],
+        )
+
+        result = await crawler.arun(url=url, config=run_config)
+
+        if not result.success:
+            log.error(
+                "scrape_failed",
+                url=url,
+                error=result.error_message,
+            )
+            return None
+
+        page_content = result.markdown.raw_markdown
+
+        if not page_content or len(page_content.strip()) < 100:
+            log.warning(
+                "content_too_short",
+                url=url,
+                length=len(page_content or ""),
+            )
+            return None
+
+        page_content = clean_content(page_content)
+
+        if len(page_content.strip()) < 50:
+            log.warning("content_too_short_after_cleaning", url=url)
+            return None
+
+        # v3.0.0 — extract rich metadata from raw HTML.
+        # result.html is the full rendered HTML already fetched
+        # by crawl4ai — no extra HTTP call needed.
+        # Falls back to safe defaults if HTML unavailable.
+        raw_html = getattr(result, "html", "") or ""
+        metadata = extract_page_metadata(raw_html, url)
+
+        # v4.0.0: re-normalise at output — defence for redirects
+        url = normalize_url(url)
+
+        page_data = {
+            # ── Core fields ────────────────────────────────────
+            "url":            url,
+            "title":          title,
+            "section":        derive_section(url),
+            "content":        page_content.strip(),
+            "scraped_at":     datetime.now(timezone.utc).isoformat(),
+            "content_length": len(page_content.strip()),
+            # v4.0.0: SHA-256 for freshness detection (content_freshness.py)
+            "content_hash":   hashlib.sha256(
+                page_content.strip().encode("utf-8")
+            ).hexdigest(),
+
+            # ── Versioning fields (v4.6.0) ────────────────────
+            # Passed through to AI Search by chunk_and_index_hqaV5.py
+            # so every chunk can be traced back to which scrape run
+            # and which logic version produced it.
+            "scraper_version":  SCRAPER_VERSION,
+            "metadata_version": METADATA_VERSION,
+            "scrape_run_id":    SCRAPE_RUN_ID,
+
+            # ── Enrichment fields (v3.0.0) ────────────────────
+            # All extracted from HTML already fetched by crawl4ai.
+            # Zero extra HTTP calls. Safe defaults if extraction fails.
+            "audience":         metadata["audience"],
+            "has_video":        metadata["has_video"],
+            # v4.3.0: Excel Category takes priority; URL-pattern is fallback.
+            "content_type":     map_excel_category_to_content_type(excel_category, url),
+            "product_category": metadata["product_category"],
+            "description":      metadata["description"],
+            "thumbnail_url":    metadata["thumbnail_url"],
+            "publish_date":     metadata["publish_date"],
+            "collection_name":  metadata["collection_name"],
+            "read_time_mins":   metadata["read_time_mins"],
+        }
+
+        log.info(
+            "scrape_success",
+            url=url,
+            index=index,
+            total=total,
+            content_length=page_data["content_length"],
+            has_video=metadata["has_video"],
+            content_type=page_data["content_type"],
+            product_category=metadata["product_category"],
+            excel_category=excel_category or "none",
+        )
+
+        # v4.5.0 — detect routing dropdowns from already-fetched HTML.
+        # BeautifulSoup check on result.html — zero extra network call.
+        # If routing <select> elements found, use Playwright (in thread
+        # pool executor) to scrape each option state — mirrors proven
+        # crawler.py v0.1.0 approach that captured all 13 bereavement
+        # policy options correctly.
+        raw_html = getattr(result, "html", "") or ""
+
+        if _has_routing_dropdowns_in_html(raw_html):
+            # Truncate base page content at dropdown marker —
+            # removes repeated option content Royal London renders
+            # inline (all hidden panels in DOM simultaneously).
+            truncated_content = _truncate_base_content_at_dropdown(
+                page_data["content"]
+            )
+            page_data["content"]        = truncated_content
+            page_data["content_length"] = len(truncated_content)
+            page_data["content_hash"]   = hashlib.sha256(
+                truncated_content.encode("utf-8")
+            ).hexdigest()
+
+            log.info("dropdown_page_detected_via_html", url=url)
+
+            # Run Playwright in thread pool — non-blocking for asyncio
+            try:
+                loop     = asyncio.get_event_loop()
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                dropdown_states = await loop.run_in_executor(
+                    executor,
+                    _scrape_dropdown_states_playwright,
+                    url,
+                    page_data["title"],
+                    page_data,
+                )
+            except Exception as _de:
+                log.warning(
+                    "playwright_dropdown_skipped",
+                    url=url,
+                    error=str(_de),
+                )
+                dropdown_states = []
+
+            if dropdown_states:
+                log.info(
+                    "multi_state_page_scraped",
+                    url=url,
+                    option_count=len(dropdown_states),
+                )
+                return [page_data] + dropdown_states
+
+        return page_data
+
+    except Exception as e:
+        log.error("scrape_error", url=url, error=str(e))
+        return None
+
+
+
+# Load approved URLs from local Excel or Blob Storage.
+def load_url_source(excel_path: str) -> list[dict]:
+    """
+    Load approved URLs from local Excel or Blob Storage.
+
+    Local development (AZURE_STORAGE_CONNECTION not set):
+        Reads from Excel file at excel_path — same as v1.0.0.
+        No behaviour change for local development workflow.
+
+    Production (AZURE_STORAGE_CONNECTION set):
+        Reads from Azure Blob Storage JSON file instead.
+        JSON format: [{"url": "...", "title": "..."}, ...]
+        DevOps uploads this JSON to Blob Storage; brand/marketing
+        team maintains the URL list in agreed format.
+
+    TODO: Production URL source format to be agreed with client.
+    Until decided, this falls back to Excel for all environments.
+    """
+    # ── Production: read from Blob Storage ───────────────────
+    # TODO (DevOps): uncomment when AZURE_STORAGE_CONNECTION
+    # is configured in Key Vault and URL source format agreed.
+    #
+    # if BLOB_STORAGE_CONNECTION:
+    #     from azure.storage.blob import BlobServiceClient
+    #     blob_service = BlobServiceClient.from_connection_string(
+    #         BLOB_STORAGE_CONNECTION
+    #     )
+    #     blob_client = blob_service.get_blob_client(
+    #         container=BLOB_CONTAINER_NAME,
+    #         blob="approved_urls.json",   # DevOps agrees this name
+    #     )
+    #     data  = blob_client.download_blob().readall()
+    #     pages = json.loads(data)
+    #     log.info(
+    #         "url_source_loaded_from_blob",
+    #         container=BLOB_CONTAINER_NAME,
+    #         count=len(pages),
+    #     )
+    #     return pages   # [{"url": ..., "title": ...}]
+
+    # ── Local development: read from Excel ───────────────────
+    # Current behaviour — unchanged from v1.0.0.
+    return load_approved_pages(excel_path)
+
+
+# Save scraped pages to local file or Azure Blob Storage.
+def save_scraped_pages(
+    results: list[dict],
+    output_file: "Path",
+) -> str:
+    """
+    Save scraped pages to local file or Azure Blob Storage.
+
+    Local development (AZURE_STORAGE_CONNECTION not set):
+        Saves JSON to scraper/data/ as before.
+        Returns local file path string.
+
+    Production (AZURE_STORAGE_CONNECTION set):
+        Uploads JSON to Azure Blob Storage.
+        chunk_and_index.py reads from the same Blob container.
+        Returns blob filename string.
+
+    Args:
+        results:     List of scraped page dicts
+        output_file: Local Path object (used in local mode,
+                     filename used as blob name in production)
+
+    Returns:
+        str — local file path or blob filename
+    """
+    # ── Production: upload to Blob Storage ───────────────────
+    # TODO (DevOps): uncomment when AZURE_STORAGE_CONNECTION
+    # is configured in Key Vault.
+    #
+    # if BLOB_STORAGE_CONNECTION:
+    #     from azure.storage.blob import BlobServiceClient
+    #     blob_service = BlobServiceClient.from_connection_string(
+    #         BLOB_STORAGE_CONNECTION
+    #     )
+    #     blob_name   = BLOB_SCRAPED_FILENAME
+    #     blob_client = blob_service.get_blob_client(
+    #         container=BLOB_CONTAINER_NAME,
+    #         blob=blob_name,
+    #     )
+    #     data = json.dumps(results, ensure_ascii=False, indent=2)
+    #     blob_client.upload_blob(data, overwrite=True)
+    #     log.info(
+    #         "scraped_pages_saved_to_blob",
+    #         container=BLOB_CONTAINER_NAME,
+    #         blob=blob_name,
+    #         pages=len(results),
+    #     )
+    #     print(f"   ✅ Uploaded to Blob Storage: {blob_name}")
+    #     return blob_name
+
+    # v4.4.0 BUG FIX: guard against empty results — writing [] silently
+    # would cause the next indexer run to wipe the index with no warning.
+    if not results:
+        log.error(
+            "save_scraped_pages_empty",
+            note=(
+                "No pages to save — all URLs failed to scrape. "
+                "Output file NOT written. Check scrape errors above."
+            ),
+        )
+        return ""
+
+    # ── Local development: save to local file ────────────────
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    log.info(
+        "scraped_pages_saved_locally",
+        file=str(output_file),
+        pages=len(results),
+    )
+    return str(output_file)
+
+
+# Programmatic entry point for the scraping pipeline.
+def run_scraper(
+    excel_path: str | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Programmatic entry point for the scraping pipeline.
+    Called by DevOps / Azure Container Apps Job.
+
+    Args:
+        excel_path: Path to approved URLs Excel file.
+                    If None, uses APPROVED_EXCEL constant.
+                    Production: override via APPROVED_EXCEL_PATH env var.
+        dry_run:    If True, detect columns + count URLs but do NOT
+                    scrape or save anything. Use to validate the Excel
+                    file is correctly parsed before a production run.
+
+    Returns:
+        dict with keys:
+            success        (bool) — True if completed without error
+            pages_scraped  (int)  — pages scraped (0 if dry_run)
+            pages_failed   (int)  — pages that failed to scrape
+            output_path    (str)  — local file path or blob filename
+            dry_run        (bool) — whether this was a dry run
+            error          (str)  — error message if success=False
+
+    TODO (DevOps — Sprint 2):
+    Wrap in Azure Container Apps Job entrypoint script.
+    Container Apps Job: digital-assistance-scraper-job
+
+        # In job entrypoint (e.g. entrypoint.py):
+        import os
+        from scraper.scrape_approved_urls_updatedV5 import run_scraper
+
+        dry_run    = os.getenv("DRY_RUN", "false").lower() == "true"
+        excel_path = os.getenv("APPROVED_EXCEL_PATH", None)
+        result     = run_scraper(excel_path=excel_path, dry_run=dry_run)
+
+        if not result["success"]:
+            raise RuntimeError(f"Scrape failed: {result['error']}")
+
+        print(f"Scraped {result['pages_scraped']} pages → {result['output_path']}")
+
+    ADO pipeline trigger (runs digital-assistance-scraper-job, then digital-assistance-indexer-job):
+
+        az containerapp job start \
+            --name digital-assistance-scraper-job \
+            --resource-group <rg> \
+            --env-vars DRY_RUN=false
+
+    Required env vars in Key Vault (see production section in module docstring).
+    """
+    result = {
+        "success":       False,
+        "pages_scraped": 0,
+        "pages_failed":  0,
+        "output_path":   "",
+        "dry_run":       dry_run,
+        "error":         "",
+    }
+
+    try:
+        excel = excel_path or os.getenv("APPROVED_EXCEL_PATH") or APPROVED_EXCEL
+
+        if dry_run:
+            # Dry run: detect columns + count URLs, no scraping
+            pages = load_url_source(excel)
+            print(f"\n✅ DRY RUN COMPLETE — no scraping performed.")
+            print(f"   Excel file:       {excel}")
+            print(f"   URLs detected:    {len(pages)}")
+            print(f"\n   Remove --dry-run or set DRY_RUN=false to scrape for real.")
+            result["success"]       = True
+            result["pages_scraped"] = 0
+            result["output_path"]   = ""
+            return result
+
+        # Inner coroutine: scrape every URL and collect results.
+        async def _run():
+            pages_to_scrape = load_url_source(excel)
+            # v4.5.2: Use _make_browser_config() — handles CDP mode
+            # (VDI) vs normal Playwright (production) automatically.
+            browser_config  = _make_browser_config()
+            scraped      = []
+            failed_urls  = []
+            total        = len(pages_to_scrape)
+
+            log.info(
+                "scraper_pipeline_started",
+                total_urls=total,
+                excel=excel,
+                blob_storage=bool(BLOB_STORAGE_CONNECTION),
+            )
+
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                for batch_start in range(0, total, BATCH_SIZE):
+                    batch  = pages_to_scrape[
+                        batch_start:batch_start + BATCH_SIZE
+                    ]
+                    tasks  = [
+                        scrape_page(
+                            crawler, page_info,
+                            batch_start + i + 1, total,
+                        )
+                        for i, page_info in enumerate(batch)
+                    ]
+                    results = await asyncio.gather(*tasks)
+                    for page_info, r in zip(batch, results):
+                        if r is None:
+                            failed_urls.append(page_info["url"])
+                        elif isinstance(r, list):
+                            # v4.4.0: multi-state dropdown page —
+                            # flatten all option entries into scraped.
+                            # Minimum content_length 20 chars (a phone
+                            # number + label is valid at short length).
+                            scraped.extend(
+                                entry for entry in r
+                                if entry.get("content_length", 0) >= 20
+                            )
+                        else:
+                            scraped.append(r)
+                    if batch_start + BATCH_SIZE < total:
+                        await asyncio.sleep(BATCH_DELAY_SECONDS)
+
+            return scraped, failed_urls
+
+        # v4.4.0 BUG FIX: asyncio.run() raises RuntimeError when called
+        # from an already-running event loop (Azure Functions, FastAPI,
+        # Jupyter). Use nest_asyncio when available; fall back to plain
+        # asyncio.run() for normal script execution.
+        if _NEST_ASYNCIO_AVAILABLE:
+            _nest_asyncio.apply()
+            loop = asyncio.get_event_loop()
+            scraped, failed = loop.run_until_complete(_run())
+        else:
+            # nest_asyncio not installed — plain script context, safe to use.
+            # Install nest_asyncio if calling from async host environments.
+            scraped, failed = asyncio.run(_run())
+
+        timestamp   = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        output_file = (
+            Path("scraper/data") /
+            f"royal_london_faq_approved_{timestamp}.json"
+        )
+        output_path = save_scraped_pages(scraped, output_file)
+
+        # v4.4.0: save_scraped_pages returns "" when results are empty
+        if not output_path:
+            result["error"] = (
+                "All URLs failed to scrape — output file not written. "
+                "Check scrape errors in the log."
+            )
+            result["pages_failed"] = len(failed)
+            return result
+
+        log.info(
+            "scraper_pipeline_complete",
+            pages_scraped=len(scraped),
+            pages_failed=len(failed),
+            output_path=output_path,
+        )
+
+        result["success"]       = True
+        result["pages_scraped"] = len(scraped)
+        result["pages_failed"]  = len(failed)
+        result["output_path"]   = output_path
+        return result
+
+    except Exception as e:
+        result["error"] = str(e)
+        log.error(
+            "scraper_pipeline_error",
+            error=str(e),
+            traceback=traceback.format_exc(),
+        )
+        return result
+
+# ── Main ────────────────────────────────────────────────
+async def main():
+    parser = argparse.ArgumentParser(
+        description="RLG FAQ Scraper — scrapes customer-approved URLs"
+    )
+    parser.add_argument(
+        "--file", default=None,
+        help="Path to approved URLs Excel file. "
+             "Default: APPROVED_EXCEL constant.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Detect Excel columns + count URLs, do NOT scrape. "
+             "Validates the Excel file is parsed correctly.",
+    )
+    args = parser.parse_args()
+
+    print("\n" + "=" * 60)
+    print("RLG FAQ SCRAPER — Customer Approved URLs Only")
+    print("=" * 60)
+
+    excel_path = Path(
+        args.file
+        or os.getenv("APPROVED_EXCEL_PATH")
+        or APPROVED_EXCEL
+    )
+    if not excel_path.exists():
+        print(f"\nERROR: Excel file not found: {excel_path}")
+        sys.exit(1)
+
+    pages_to_scrape = load_url_source(str(excel_path))
+    print(f"\nExcel file:       {excel_path}")
+    print(f"Approved URLs:    {len(pages_to_scrape)}")
+
+    if args.dry_run:
+        print("\n✅ DRY RUN COMPLETE — no scraping performed.")
+        print("   Run without --dry-run to scrape for real.")
+        return
+
+    # ── Scrape in batches ───────────────────────────────
+    # v4.5.2: CDP mode on VDI, normal Playwright on production.
+    browser_config = _make_browser_config()
+
+    results = []
+    failed_urls = []
+    total = len(pages_to_scrape)
+
+    try:
+        async with AsyncWebCrawler(config=browser_config) as crawler:
+            for batch_start in range(0, total, BATCH_SIZE):
+                batch = pages_to_scrape[batch_start:batch_start + BATCH_SIZE]
+                batch_num = batch_start // BATCH_SIZE + 1
+                total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+
+                print(f"\nBatch {batch_num}/{total_batches}")
+
+                tasks = [
+                    scrape_page(crawler, page_info, batch_start + i + 1, total)
+                    for i, page_info in enumerate(batch)
+                ]
+                batch_results = await asyncio.gather(*tasks)
+
+                for page_info, result in zip(batch, batch_results):
+                    if result is None:
+                        failed_urls.append(page_info["url"])
+                    elif isinstance(result, list):
+                        # v4.4.0: multi-state dropdown page — flatten entries.
+                        results.extend(
+                            entry for entry in result
+                            if entry.get("content_length", 0) >= 20
+                        )
+                    else:
+                        results.append(result)
+
+                if batch_start + BATCH_SIZE < total:
+                    await asyncio.sleep(BATCH_DELAY_SECONDS)
+
+    finally:
+        # Always stop Chrome CDP subprocess if we started it
+        _stop_chrome_cdp()
+
+    # ── v4.8.0: Dedup results by URL before save ────────
+    # Belt-and-braces guard: load_approved_pages() already deduplicates
+    # the Excel input by normalised URL, but post-normalisation collisions
+    # (http/https, trailing slash) or scraper retries can still produce
+    # duplicate entries. Keeps first occurrence; logs warnings for dropped.
+    _seen_urls: set = set()
+    _deduped:   list = []
+    for _entry in results:
+        _key = _entry.get("url", "")
+        if _key and _key not in _seen_urls:
+            _seen_urls.add(_key)
+            _deduped.append(_entry)
+        elif _key:
+            log.warning("duplicate_url_suppressed_before_save", url=_key)
+    if len(_deduped) < len(results):
+        log.info(
+            "dedup_results_summary",
+            original=len(results),
+            kept=len(_deduped),
+            removed=len(results) - len(_deduped),
+        )
+    results = _deduped
+
+    # ── Save output ─────────────────────────────────────
+    # v2.0.0: save_scraped_pages() abstracts local file vs
+    # Blob Storage. Local: saves to scraper/data/ as before.
+    # Production: uploads to Azure Blob Storage when
+    # AZURE_STORAGE_CONNECTION env var is set.
+    timestamp   = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    output_file = (
+        Path("scraper/data") /
+        f"royal_london_faq_approved_{timestamp}.json"
+    )
+    output_path = save_scraped_pages(results, output_file)
+
+    # ── Summary ───────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("SCRAPE SUMMARY")
+    print("=" * 60)
+    print(f"Approved URLs:    {total}")
+    print(f"Scraped success:  {len(results)}")
+    print(f"Failed:           {len(failed_urls)}")
+
+    if failed_urls:
+        print("\nFailed URLs:")
+        for url in failed_urls:
+            print(f"  - {url}")
+
+    if results:
+        total_chars = sum(r["content_length"] for r in results)
+        lengths     = [r["content_length"] for r in results]
+        print(f"\nTotal content:    {total_chars:,} chars")
+        print(f"Shortest page:    {min(lengths):,} chars")
+        print(f"Longest page:     {max(lengths):,} chars")
+        print(f"Average page:     {total_chars // len(results):,} chars")
+
+        # v3.0.0 — enrichment summary
+        video_pages = sum(1 for r in results if r.get("has_video"))
+        type_counts = {}
+        cat_counts  = {}
+        for r in results:
+            ct = r.get("content_type", "article")
+            pc = r.get("product_category", "general")
+            type_counts[ct] = type_counts.get(ct, 0) + 1
+            cat_counts[pc]  = cat_counts.get(pc, 0) + 1
+
+        print(f"\nPages with video: {video_pages}")
+        print("\nContent types:")
+        for ct, count in sorted(type_counts.items(), key=lambda x: -x[1]):
+            print(f"  {ct:<20} {count}")
+        print("\nProduct categories:")
+        for pc, count in sorted(cat_counts.items(), key=lambda x: -x[1]):
+            print(f"  {pc:<25} {count}")
+
+    print(f"\nSaved to: {output_path}")
+    print("=" * 60)
+    print(f"\n👉 Next step: index the scraped content:")
+    print(f"   python scraper/chunk_and_index_hqaV5.py --full --file {output_path}")
+    print(f"   python scraper/chunk_and_index_hqaV5.py --full --no-hqa --file {output_path}  # baseline")
+
+
+if __name__ == "__main__":
+    # Suppress asyncio ProactorEventLoop GC noise on Windows.
+    # The ValueError: I/O operation on closed pipe and
+    # ResourceWarning: unclosed transport errors occur DURING
+    # Python interpreter shutdown (after asyncio.run() returns),
+    # when the GC collects subprocess transport objects. A custom
+    # event loop exception handler cannot catch these because the
+    # loop is already closed at that point.
+    # Fix: filter at the warnings level before interpreter exit,
+    # and patch sys.unraisablehook to suppress the specific errors.
+    # On Linux (Azure Container Apps): sys.platform != "win32"
+    # — complete no-op in production.
+    # Real errors surface via structlog, result dict, sys.exit(1).
+    import sys as _sys
+    if _sys.platform == "win32":
+        import warnings as _warnings
+        _warnings.filterwarnings(
+            "ignore",
+            message=".*I/O operation on closed pipe.*",
+            category=ResourceWarning,
+        )
+        _warnings.filterwarnings(
+            "ignore",
+            message=".*unclosed transport.*",
+            category=ResourceWarning,
+        )
+
+        # sys.unraisablehook: called for "Exception ignored in:"
+        # tracebacks that appear during GC/interpreter shutdown.
+        # These are exactly the ValueError: I/O on closed pipe lines.
+        _orig_unraisablehook = _sys.unraisablehook
+
+        # Suppress the noisy Windows ProactorEventLoop GC warning.
+        def _unraisablehook(unraisable):
+            msg = str(unraisable.exc_value)
+            if "I/O operation on closed pipe" in msg:
+                return  # suppress — Windows asyncio GC noise
+            _orig_unraisablehook(unraisable)
+
+        _sys.unraisablehook = _unraisablehook
+
+    asyncio.run(main())
