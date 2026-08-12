@@ -496,6 +496,37 @@ v1.7.2 — August 2026 | Mukesh Kund
     chunks (pipeline_version=1.0.0) would report DIFFERENT versions
     despite both being produced by the same element-aware chunking
     logic — misleading for anyone auditing the index by this field.
+
+v1.7.3 — August 2026 | Mukesh Kund
+    ROOT-CAUSE FIX: chunk_id changed from random uuid.uuid4() to a
+    deterministic SHA-256 hash of (source_url, chunk_index, content).
+    Applied in parallel with chunk_and_index_hqaV5.py v5.10.2 — see
+    that file's changelog for the full incident writeup (5,194
+    duplicate chunks found in rlg-faq-index-v5 after its first
+    --full build, root cause: random UUIDs don't survive accidental
+    re-processing without creating duplicates).
+
+    compute_chunk_id() [NEW] — byte-identical hash construction to
+    chunk_and_index_hqaV5.py's version of the same function, so a
+    chunk built by either script for the same (url, index, content)
+    always resolves to the same ID — whether written by a --full
+    run or a nightly freshness delta. Duplicated rather than
+    imported, per this file's zero-cross-file-dependency principle
+    (see module header) — same accepted tradeoff as every other
+    piece of logic this file intentionally duplicates.
+
+    chunk_page() [MODIFIED — both dropdown atomic and regular paths]:
+    - "chunk_id": str(uuid.uuid4()) → compute_chunk_id(url, index, content)
+    - Dropdown atomic chunks use index=0 (matches existing
+      chunk_index=0 / total_chunks=1 convention).
+
+    WHY THIS MATTERS FOR FRESHNESS SPECIFICALLY: the nightly job
+    already deletes a changed URL's existing chunks before re-adding
+    fresh ones (see Step 8 in run_freshness_job()) — deterministic
+    IDs don't change that flow, but they DO mean if the delete step
+    ever partially fails or a page is (re)processed twice within one
+    run, re-adding the same content self-heals via overwrite instead
+    of accumulating an orphaned duplicate.
 """
 
 from __future__ import annotations
@@ -1578,6 +1609,32 @@ def compute_content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+# v1.7.2 — deterministic chunk_id, replaces uuid.uuid4().
+def compute_chunk_id(source_url: str, chunk_index: int, content: str) -> str:
+    """
+    Deterministic chunk_id — SHA-256 of (source_url, chunk_index,
+    content). Replaces uuid.uuid4() (random, non-deterministic).
+
+    Byte-identical hash construction to chunk_and_index_hqaV5.py's
+    compute_chunk_id() — see that file's v5.10.2 changelog entry for
+    the full root-cause writeup (5,194 duplicate chunks found in
+    rlg-faq-index-v5 after its first --full build, caused by random
+    UUIDs not surviving accidental re-processing without creating
+    duplicates). Duplicated here rather than imported — this file's
+    stated design principle is zero cross-file dependency (see
+    module header) — but kept byte-identical so a chunk built by
+    either script for the same (url, index, content) always resolves
+    to the same ID, whether it was written by a --full run or a
+    nightly freshness delta.
+
+    chunk_index is part of the hash (not just url+content) so two
+    genuinely different chunks containing identical text (e.g. a
+    repeated boilerplate paragraph) don't collide into one ID.
+    """
+    key_material = f"{source_url}|{chunk_index}|{content}"
+    return hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+
+
 # ══════════════════════════════════════════════════════════════
 # ELEMENT-AWARE CHUNKING — v1.7.0
 # ══════════════════════════════════════════════════════════════
@@ -2585,7 +2642,8 @@ def chunk_page(
             return []
         log.info("dropdown_atomic_chunk", url=page.get("url", ""), chars=len(content_with_title))
         return [{
-            "chunk_id":            str(uuid.uuid4()),
+            # v1.7.2: deterministic chunk_id — see compute_chunk_id()
+            "chunk_id":            compute_chunk_id(page["url"], 0, content_with_title.strip()),
             "content":             content_with_title.strip(),
             "source_url":          page["url"],
             "title":               title,
@@ -2628,7 +2686,8 @@ def chunk_page(
     for idx, piece in enumerate(valid_pieces):
         split = piece["text"]
         chunks.append({
-            "chunk_id":            str(uuid.uuid4()),
+            # v1.7.2: deterministic chunk_id — see compute_chunk_id()
+            "chunk_id":            compute_chunk_id(page["url"], idx, split.strip()),
             "content":             split.strip(),
             "source_url":          page["url"],
             "title":               title,

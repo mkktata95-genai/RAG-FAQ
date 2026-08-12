@@ -1139,6 +1139,51 @@ v5.10.0 — August 2026 | Mukesh Kund
            - video_url / has_video enrichment — dropped, not deferred
              (only 2 pages had incidental video links, not worth the
              schema/scraper change).
+
+v5.10.2 — August 2026 | Mukesh Kund
+    ROOT-CAUSE FIX: chunk_id changed from random uuid.uuid4() to a
+    deterministic SHA-256 hash of (source_url, chunk_index, content).
+
+    INCIDENT THIS FIXES:
+    First --full build of rlg-faq-index-v5 (16 hrs) produced 8,310
+    documents, of which 5,194 were true content duplicates (confirmed
+    via audit_duplicates.py v2, hashing actual chunk text — not the
+    page-level content_hash field, which is deliberately shared
+    across a page's chunks and unsuitable for this check). Root cause:
+    chunk_id was a random UUID, generated fresh every time chunk_pages()
+    ran. Any accidental re-processing of the same page during that long
+    run — network retry, a resumed/re-launched segment, anything —
+    produced brand-new "unique" document IDs for identical content,
+    so Azure Search's upload_documents() inserted duplicates instead
+    of overwriting. --full only wipes the index ONCE at the very
+    start; it has no protection against double-processing after that.
+    Remediated on the already-built index via cleanup_duplicate_
+    chunks.py (deleted the 5,194 duplicates, kept oldest survivor per
+    group) — confirmed 0 true duplicates remain afterward.
+
+    FIX — compute_chunk_id() [NEW]:
+    chunk_id = sha256(f"{source_url}|{chunk_index}|{content}").
+    Same URL + same position in that page's chunk sequence + same
+    text now ALWAYS produces the same ID. Re-processing the same
+    content (retry, re-run, resumed segment) naturally overwrites
+    the existing document instead of creating a duplicate —
+    self-healing instead of accumulating. chunk_index is included
+    (not just url+content) so two genuinely different chunks that
+    happen to contain identical text (e.g. a repeated boilerplate
+    paragraph at two positions in the same page) don't collide into
+    one ID and silently lose a chunk.
+
+    chunk_pages() [MODIFIED — both dropdown atomic and regular paths]:
+    - "chunk_id": str(uuid.uuid4()) → compute_chunk_id(url, index, content)
+    - Dropdown atomic chunks always use index=0 (matches their
+      existing chunk_index=0 / total_chunks=1 convention).
+
+    Same fix applied in parallel to content_freshnessV1.py (which
+    has its own independent copy of chunk_id generation — see that
+    file's design principle of zero cross-file imports). Both files'
+    fixes use byte-identical hash construction so a chunk built by
+    either script for the same (url, index, content) always resolves
+    to the same ID.
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -1737,6 +1782,53 @@ def compute_content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+# v5.10.2 — deterministic chunk_id, replaces uuid.uuid4().
+def compute_chunk_id(source_url: str, chunk_index: int, content: str) -> str:
+    """
+    Deterministic chunk_id — SHA-256 of (source_url, chunk_index,
+    content). Replaces the old uuid.uuid4() (random, non-deterministic)
+    chunk_id generation.
+
+    ROOT CAUSE THIS FIXES:
+    A random UUID means any accidental re-processing of the same page
+    during a run — network retry, resumed/re-launched --full build,
+    any duplicate entry in the input JSON — produces a BRAND NEW
+    "unique" document ID for IDENTICAL content. Azure Search's
+    upload_documents() has no way to recognise these as the same
+    chunk, so it inserts a genuine duplicate instead of overwriting.
+    Confirmed root cause of 5,194 duplicate chunks found in
+    rlg-faq-index-v5 after its first --full build (see
+    audit_duplicates.py v2 + cleanup_duplicate_chunks.py — that
+    incident's remediation).
+
+    WHY THIS FIXES IT:
+    Same URL + same position in that page's chunk sequence + same
+    text → same ID, every single time, regardless of how many times
+    it's (re)computed. Azure Search's upload_documents() call treats
+    a document with an EXISTING key as a merge/overwrite by default
+    behaviour for this SDK's usage pattern here — so a second pass
+    over the same content harmlessly overwrites itself instead of
+    accumulating a duplicate.
+
+    WHY chunk_index IS PART OF THE HASH (not just url + content):
+    If a page happens to legitimately repeat identical text at two
+    different positions (e.g. a boilerplate paragraph appearing
+    twice), hashing only (url, content) would collide the two real,
+    distinct chunks into the same ID — silently losing one of them
+    on upload. Including chunk_index keeps them distinct, since each
+    genuinely occupies a different position in that page's chunk
+    sequence — and chunk_index itself is deterministic (same content
+    run through the same chunking logic always produces chunks in
+    the same order), so this doesn't reopen the non-determinism
+    problem being fixed.
+
+    Returns a 64-char hex string — safe as an Azure Search key
+    (alphanumeric only, well under the key length limit).
+    """
+    key_material = f"{source_url}|{chunk_index}|{content}"
+    return hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+
+
 # Split pages into chunks for indexing.
 def chunk_pages(pages: list[dict]) -> list[dict]:
     """
@@ -1828,7 +1920,8 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
             # chunk_index=0, total_chunks=1 so HQA pipeline is unaffected
             if len(content_with_title.strip()) >= 50:
                 chunks.append({
-                    "chunk_id":             str(uuid.uuid4()),
+                    # v5.10.2: deterministic chunk_id — see compute_chunk_id()
+                    "chunk_id":             compute_chunk_id(url, 0, content_with_title.strip()),
                     "content":              content_with_title.strip(),
                     "source_url":           url,
                     "title":                title,
@@ -1905,7 +1998,8 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
         for i, piece in enumerate(valid_pieces):
             split = piece["text"]
             chunks.append({
-                "chunk_id":             str(uuid.uuid4()),
+                # v5.10.2: deterministic chunk_id — see compute_chunk_id()
+                "chunk_id":             compute_chunk_id(url, i, split.strip()),
                 "content":              split.strip(),
                 "source_url":           url,
                 "title":                title,
