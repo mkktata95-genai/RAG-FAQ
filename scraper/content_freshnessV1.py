@@ -567,6 +567,27 @@ v1.7.4 — August 2026 | Mukesh Kund
     zero index writes regardless of classification, confirmed via
     "Main Chunks Deleted: 0" on every row of the affected report.
     This was a signal-quality bug, not a data-safety incident.
+
+v1.7.5 — August 2026 | Mukesh Kund
+    DIAGNOSTIC FIX: scrape_failed log line only recorded the URL, not
+    the actual failure reason — every scrape failure was undiagnosable
+    from logs alone. Found during a --mode report run where 5-7 URLs
+    failed with no visible cause (unlike playwright_option_error a few
+    lines later in the same run, which DID include a full error
+    message and clearly showed a real "Execution context was destroyed
+    — navigation" race condition on a dropdown/filter click).
+
+    scrape_page() [MODIFIED]: log.warning("scrape_failed", url=url) →
+    now also logs error=result.error_message, success=result.success,
+    has_markdown=bool(result.markdown). Same pattern already used in
+    scrape_approved_urls_updatedV5.py's scrape_page() — this file just
+    hadn't carried it over into its own independent copy.
+
+    NOT YET FIXED: the underlying navigation-race-condition itself
+    (confirmed real via playwright_option_error's error detail) is
+    still open — root cause needs investigating with the new error
+    detail from this fix before deciding on a code change. Logged
+    here as a known follow-up, not resolved by this entry.
 """
 
 from __future__ import annotations
@@ -2538,7 +2559,18 @@ async def scrape_url_with_dropdowns(
             result = await crawler.arun(url=url, config=run_cfg)
 
             if not result.success or not result.markdown:
-                log.warning("scrape_failed", url=url)
+                # v1.7.5: log the actual failure reason — previously
+                # only the URL was logged, making every scrape_failed
+                # occurrence undiagnosable from logs alone. See
+                # scrape_approved_urls_updatedV5.py's scrape_page()
+                # for the same result.error_message pattern.
+                log.warning(
+                    "scrape_failed",
+                    url=url,
+                    error=result.error_message or "no error_message from crawl4ai",
+                    success=result.success,
+                    has_markdown=bool(result.markdown),
+                )
                 return None
 
             raw_content = result.markdown.raw_markdown
