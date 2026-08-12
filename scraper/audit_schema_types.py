@@ -1,7 +1,23 @@
 """
-Schema Type Audit — v2
+Schema Type Audit — v3
 Checks field assignments in scraper, indexer, freshness against Azure AI Search schema.
 Excludes run_pipeline() return dicts (internal counters, not uploaded to Azure).
+
+CHANGELOG
+---------
+v3 — Fixed two bugs found during v5 rebuild rollout:
+      1. base path was hardcoded to "/mnt/project" (a sandbox-only
+         path) — every file lookup silently failed on VDI/Windows.
+         Now resolves relative to this script's own location via
+         Path(__file__).parent, so it works regardless of cwd.
+      2. "All clear" was printed whenever ISSUES was empty — which
+         is also true when ALL files failed to be found (zero
+         fields ever checked). Script now aborts loudly instead of
+         reporting false success when any file is missing.
+      Also: FILES dict updated to the renamed v5/V1 filenames, and
+      SCHEMA extended with parent_url (v4.8.0) and element_type
+      (v5.10.0) — both were missing from v2's coverage.
+v2 — Original two-bug-affected version (superseded).
 """
 import re
 from pathlib import Path
@@ -34,20 +50,24 @@ SCHEMA = {
     "publish_date":        (str,   "Edm.String"),
     "collection_name":     (str,   "Edm.String"),
     "read_time_mins":      (str,   "Edm.String"),
+    "parent_url":          (str,   "Edm.String"),   # v4.8.0 — clean citation URL for dropdown_state chunks
+    "element_type":        (str,   "Edm.String"),   # v5.10.0 — "prose" | "table" | "dropdown_state"
 }
 
 # Functions whose return dicts are internal (not uploaded to Azure Search)
 EXCLUDED_FUNCTIONS = {"run_pipeline", "main"}
 
 FILES = {
-    "scraper":   "scrape_approved_urls_updatedV4.py",
-    "indexer":   "chunk_and_index_hqaV4.py",
-    "freshness": "content_freshness.py",
+    "scraper":   "scrape_approved_urls_updatedV5.py",
+    "indexer":   "chunk_and_index_hqaV5.py",
+    "freshness": "content_freshnessV1.py",
 }
 
 ISSUES = []
 
+# Classify the Python type a field-assignment expression will produce at runtime.
 def classify_expr(expr):
+    """Classify the Python type a field-assignment expression will produce at runtime."""
     expr = expr.strip()
     if expr.startswith('"') or expr.startswith("'") or expr.startswith('f"') or expr.startswith("f'"):
         return str
@@ -79,7 +99,9 @@ def classify_expr(expr):
         return str
     return None
 
+# Scan one file for SCHEMA-field assignments and flag any type mismatches.
 def audit_file(filepath, label):
+    """Scan one file for SCHEMA-field assignments and flag any type mismatches."""
     src = Path(filepath).read_text(encoding="utf-8", errors="ignore")
     lines = src.splitlines()
 
@@ -130,20 +152,30 @@ def audit_file(filepath, label):
                 "raw": stripped[:90]
             })
 
-base = Path("/mnt/project")
+# v3: resolve relative to this script's own location, not a hardcoded
+# sandbox path. Works from any cwd — RAG\, RAG\scraper\, wherever.
+base = Path(__file__).parent
+
+files_found = 0
 for label, fname in FILES.items():
     fpath = base / fname
     if fpath.exists():
         audit_file(fpath, label)
+        files_found += 1
     else:
         print(f"⚠️  Not found: {fpath}")
 
 print("\n" + "="*70)
-print("SCHEMA TYPE AUDIT REPORT v2")
+print("SCHEMA TYPE AUDIT REPORT v3")
 print("="*70)
 
-if not ISSUES:
-    print("\n✅ All clear — no type mismatches found across all 3 files.")
+# v3: fail loudly if any file was missing — "no issues found" and
+# "no files were ever read" must never look identical to the reader.
+if files_found < len(FILES):
+    print(f"\n🛑 ABORTED — only {files_found}/{len(FILES)} files found.")
+    print("   Fix the paths above before trusting any result from this run.")
+elif not ISSUES:
+    print(f"\n✅ All clear — no type mismatches found across all {files_found} files.")
 else:
     print(f"\n❌ {len(ISSUES)} type mismatch(es) found:\n")
     current_file = None
@@ -156,5 +188,6 @@ else:
 
 print("\n" + "="*70)
 print(f"Schema fields audited: {len(SCHEMA)}")
-print(f"Files audited: {', '.join(FILES.keys())}")
+print(f"Files found:           {files_found}/{len(FILES)}")
+print(f"Files audited:         {', '.join(FILES.keys())}")
 print("="*70)
