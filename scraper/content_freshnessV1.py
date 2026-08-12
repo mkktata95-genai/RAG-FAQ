@@ -527,6 +527,46 @@ v1.7.3 — August 2026 | Mukesh Kund
     ever partially fails or a page is (re)processed twice within one
     run, re-adding the same content self-heals via overwrite instead
     of accumulating an orphaned duplicate.
+
+v1.7.4 — August 2026 | Mukesh Kund
+    BUGFIX: 100% false-positive rate on URL health check — every
+    single approved URL (297/297) was being flagged as
+    "internal_redirect: add new URL to Excel" on a --mode report run,
+    despite the scraper (real Chrome via CDP) successfully fetching
+    every one of those same URLs minutes earlier with no issue.
+
+    ROOT CAUSE: check_single_url() used allow_redirects=False and
+    inspected only the FIRST redirect hop's Location header,
+    truncated at 80 characters for the report note. Royal London's
+    site/CDN appears to issue a single transparent redirect on every
+    URL (trailing slash / scheme canonicalisation) — exactly what a
+    real browser follows silently without it being a "moved page" in
+    any meaningful sense. The 80-char truncation was hiding that the
+    redirect target and the source URL were IDENTICAL once you looked
+    past the truncation point — confirmed by inspecting
+    freshness_report_report_20260812_161133.xlsx directly: every
+    "Reason" cell showed "Redirects to <same URL, cut off> — add new
+    URL to Excel", with 0 actual content difference.
+
+    FIX — check_single_url() [MODIFIED]:
+    - allow_redirects=False → allow_redirects=True, max_redirects=5.
+      Follows the full redirect chain to its actual destination,
+      same as a real browser would.
+    - Compares the FINAL resolved URL (resp.url after following all
+      hops) against the original, both passed through
+      normalise_url_path() (case/trailing-slash/query insensitive —
+      already used elsewhere in this file for the same purpose).
+    - If normalised final URL == normalised original URL: genuinely
+      "live" — the redirect was transparent, no action needed.
+    - Only flags internal_redirect / external_redirect when the
+      final URL actually resolves to a DIFFERENT page or domain —
+      meaning these flags can now be trusted as real signal, not
+      noise from an artifact of the check method itself.
+
+    NO DATA WAS LOST from the false-positive run: report mode makes
+    zero index writes regardless of classification, confirmed via
+    "Main Chunks Deleted: 0" on every row of the affected report.
+    This was a signal-quality bug, not a data-safety incident.
 """
 
 from __future__ import annotations
@@ -2114,26 +2154,56 @@ def _scrape_dropdown_states_playwright(
 
 # HTTP HEAD one URL, classify as live/redirect/dead_404/dead_5xx/timeout.
 async def check_single_url(session: aiohttp.ClientSession, entry: dict) -> dict:
+    """
+    v1.7.4 FIX: previously used allow_redirects=False and inspected only
+    the FIRST hop's Location header, truncated at 80 chars. Royal
+    London's site (or its WAF/CDN) appears to 301/302 EVERY URL on a
+    single transparent hop (trailing slash / scheme canonicalisation —
+    confirmed via freshness_report_report_20260812_161133.xlsx: all
+    297 approved URLs showed "Redirects to <same-url-prefix, truncated>"
+    — the truncation was hiding that source and destination were the
+    same page). A real browser (and our crawl4ai scraper) follows that
+    hop silently and lands on the live page with no issue — but this
+    check flagged every single URL as "internal_redirect: add new URL
+    to Excel", a 100% false-positive rate with zero real signal in it.
+
+    FIX: follow redirects (allow_redirects=True, capped at 5 hops) and
+    compare the FINAL resolved URL against the original, normalised
+    (normalise_url_path — case/trailing-slash/query insensitive). If
+    they match, this was a transparent single-hop redirect — genuinely
+    "live", no action needed. Only if the final URL resolves to a
+    DIFFERENT page (or a different domain) does this get flagged as
+    internal_redirect / external_redirect — meaning the flag can now
+    actually be trusted.
+    """
     url    = entry["url"]
     result = {"url": url, "status": "unknown", "status_code": None, "redirect_note": ""}
     try:
         async with session.head(
             url,
-            allow_redirects=False,
+            allow_redirects=True,
+            max_redirects=5,
             timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS),
         ) as resp:
-            code = resp.status
+            code      = resp.status
+            final_url = str(resp.url)
             result["status_code"] = code
+
             if code < 300:
-                result["status"] = "live"
-            elif 300 <= code < 400:
-                location = resp.headers.get("Location", "")
-                if location and EXPECTED_DOMAIN in location:
+                if normalise_url_path(final_url) == normalise_url_path(url):
+                    # Transparent redirect (trailing slash, scheme, etc.)
+                    # — resolves to the same page. Genuinely live.
+                    result["status"] = "live"
+                elif EXPECTED_DOMAIN in final_url:
                     result["status"]        = "internal_redirect"
-                    result["redirect_note"] = f"Redirects to {location[:80]} — add new URL to Excel."
+                    result["redirect_note"] = (
+                        f"Redirects to {final_url} — add new URL to Excel."
+                    )
                 else:
                     result["status"]        = "external_redirect"
-                    result["redirect_note"] = f"Redirects to {location[:80]} — removing."
+                    result["redirect_note"] = (
+                        f"Redirects to {final_url} — removing."
+                    )
             elif code < 500:
                 result["status"] = "dead_404"
             else:
