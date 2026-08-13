@@ -588,6 +588,49 @@ v1.7.5 — August 2026 | Mukesh Kund
     still open — root cause needs investigating with the new error
     detail from this fix before deciding on a code change. Logged
     here as a known follow-up, not resolved by this entry.
+
+v1.7.6 — August 2026 | Mukesh Kund
+    ROOT-CAUSE FIX: concurrent per-URL AsyncWebCrawler instances
+    racing over the same shared CDP Chrome connection. Diagnosed
+    using the error detail unlocked by v1.7.5's scrape_failed fix —
+    a --mode report run showed:
+      scrape_exception error="BrowserType.connect_over_cdp:
+        Connection closed while reading from the driver"
+      scrape_failed error="Page.goto: net::ERR_ABORTED ...
+        Failed on navigating ACS-GOTO"
+
+    ROOT CAUSE: scrape_url_with_dropdowns() created a BRAND NEW
+    AsyncWebCrawler (async with AsyncWebCrawler(...) as crawler)
+    for every single URL, internally. With SCRAPE_CONCURRENCY=3,
+    three concurrent scrape tasks each independently opened and
+    closed their own CDP connection to the SAME shared Chrome
+    instance at nearly the same moment. One task's connection
+    teardown could kill another concurrent task's in-flight CDP
+    session or abort its navigation — a genuine race condition, not
+    a site issue, not a WAF, not a timing fluke.
+
+    CONFIRMED via direct comparison: scrape_approved_urls_updatedV5.py's
+    scrape_page() has ALWAYS created exactly ONE AsyncWebCrawler
+    outside its entire batch loop and passed that single instance
+    into every scrape_page() call across all batches — the working,
+    proven pattern this file's independent copy had drifted from.
+
+    FIX:
+    - scrape_url_with_dropdowns() [MODIFIED]: now takes `crawler` as
+      a parameter instead of creating its own. No longer opens/closes
+      a CDP connection per URL.
+    - scrape_urls_batch() [MODIFIED]: creates ONE AsyncWebCrawler
+      before the semaphore-gated concurrent tasks start, wraps the
+      whole asyncio.gather() call inside that single `async with`
+      block, passes the shared `crawler` into every
+      scrape_url_with_dropdowns() call.
+
+    NOT FIXED BY THIS ENTRY: playwright_option_error ("Execution
+    context was destroyed... navigation") on dropdown/filter option
+    clicks — that's a separate code path
+    (_scrape_dropdown_states_playwright(), its own independent
+    Playwright browser launch via thread-pool executor, not the
+    shared CDP crawler touched here). Still open, tracked separately.
 """
 
 from __future__ import annotations
@@ -2517,6 +2560,7 @@ def invalidate_cache_for_urls(urls: list[str], dry_run: bool = False) -> int:
 
 # Scrape a URL and any routing dropdown states.
 async def scrape_url_with_dropdowns(
+    crawler,
     entry:            dict,
     freshness_run_id: str = "",
 ) -> list[dict] | None:
@@ -2525,6 +2569,34 @@ async def scrape_url_with_dropdowns(
     Full metadata extraction via extract_page_metadata() — matches
     full scraper quality including has_video, content_type, etc.
     SCRAPER_VERSION and METADATA_VERSION stamped on every page dict.
+
+    v1.7.6 FIX: now takes `crawler` (an already-open AsyncWebCrawler)
+    as a parameter instead of creating a fresh one internally. Found
+    via a --mode report run with real error detail (see v1.7.5's
+    scrape_failed fix — this is what that fix was FOR): concurrent
+    scrape tasks were EACH opening and closing their own
+    AsyncWebCrawler (CDP connection) around a single URL, and with
+    SCRAPE_CONCURRENCY=3 those 3 concurrent connect/disconnect
+    cycles against the SAME shared Chrome CDP instance raced each
+    other — one task's teardown could kill another's in-flight
+    connection or navigation. Confirmed by comparison against
+    scrape_approved_urls_updatedV5.py's scrape_page(), which has
+    always created ONE AsyncWebCrawler outside its entire batch loop
+    and passed it into every call — this function now does the same
+    (the shared instance is created once in scrape_urls_batch() and
+    passed down). Symptoms this fixes:
+      - scrape_exception: "BrowserType.connect_over_cdp: Connection
+        closed while reading from the driver"
+      - scrape_failed: "Page.goto: net::ERR_ABORTED" /
+        "Failed on navigating ACS-GOTO"
+
+    NOTE: does NOT fix playwright_option_error ("Execution context
+    was destroyed... navigation") seen on dropdown/filter option
+    clicks (e.g. "Our first cohort" on the changemakers page) — that
+    happens inside _scrape_dropdown_states_playwright(), which uses
+    its OWN separate Playwright browser launch (thread pool executor,
+    not the shared CDP crawler) and is a different code path. Left
+    as a separate, still-open follow-up.
 
     Returns:
         list[dict] — [base_page, *dropdown_states] or [base_page]
@@ -2536,8 +2608,6 @@ async def scrape_url_with_dropdowns(
     url      = entry["url"]
     title    = entry.get("title", "")
     category = entry.get("category", "")
-
-    browser_cfg = _cf_make_browser_config()
 
     run_cfg = CrawlerRunConfig(
         css_selector=(
@@ -2555,90 +2625,89 @@ async def scrape_url_with_dropdowns(
     )
 
     try:
-        async with AsyncWebCrawler(config=browser_cfg) as crawler:
-            result = await crawler.arun(url=url, config=run_cfg)
+        result = await crawler.arun(url=url, config=run_cfg)
 
-            if not result.success or not result.markdown:
-                # v1.7.5: log the actual failure reason — previously
-                # only the URL was logged, making every scrape_failed
-                # occurrence undiagnosable from logs alone. See
-                # scrape_approved_urls_updatedV5.py's scrape_page()
-                # for the same result.error_message pattern.
-                log.warning(
-                    "scrape_failed",
-                    url=url,
-                    error=result.error_message or "no error_message from crawl4ai",
-                    success=result.success,
-                    has_markdown=bool(result.markdown),
+        if not result.success or not result.markdown:
+            # v1.7.5: log the actual failure reason — previously
+            # only the URL was logged, making every scrape_failed
+            # occurrence undiagnosable from logs alone. See
+            # scrape_approved_urls_updatedV5.py's scrape_page()
+            # for the same result.error_message pattern.
+            log.warning(
+                "scrape_failed",
+                url=url,
+                error=result.error_message or "no error_message from crawl4ai",
+                success=result.success,
+                has_markdown=bool(result.markdown),
+            )
+            return None
+
+        raw_content = result.markdown.raw_markdown
+        if not raw_content or len(raw_content.strip()) < 100:
+            log.warning("content_too_short", url=url)
+            return None
+
+        status_code = getattr(result, "status_code", None)
+        if status_code and status_code >= 400:
+            log.warning("scrape_http_error", url=url, status_code=status_code)
+            return None
+
+        page_content     = remove_duplicate_content(raw_content.strip())
+        content_for_hash = clean_content(page_content)
+        content_hash     = compute_content_hash(content_for_hash)
+
+        raw_html = getattr(result, "html", "") or ""
+        metadata = extract_page_metadata(raw_html, url)
+
+        # Excel Category overrides URL-pattern for content_type
+        content_type = map_excel_category_to_content_type(category, url)
+
+        base_page = {
+            "url":              normalise_url_path(url),
+            "title":            title,
+            "section":          derive_section(url),
+            "content":          page_content,
+            "scraped_at":       datetime.now(timezone.utc).isoformat(),
+            "content_length":   len(page_content),
+            "content_hash":     content_hash,
+            # Versioning — stamped here, passed through to chunk_page()
+            "scraper_version":  SCRAPER_VERSION,
+            "metadata_version": METADATA_VERSION,
+            # Rich metadata
+            "audience":         metadata["audience"],
+            "has_video":        metadata["has_video"],
+            "content_type":     content_type,
+            "product_category": metadata["product_category"],
+            "description":      metadata["description"],
+            "thumbnail_url":    metadata["thumbnail_url"],
+            "publish_date":     metadata["publish_date"],
+            "collection_name":  metadata["collection_name"],
+            "read_time_mins":   str(metadata["read_time_mins"]),
+            # Dropdown — empty for base page
+            "dropdown_state":   "",
+            "dropdown_value":   "",
+        }
+
+        # Dropdown detection and scraping
+        dropdown_states: list[dict] = []
+        if _has_routing_dropdowns_in_html(raw_html):
+            log.info("dropdown_page_detected", url=url)
+            try:
+                loop     = asyncio.get_event_loop()
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                dropdown_states = await loop.run_in_executor(
+                    executor,
+                    _scrape_dropdown_states_playwright,
+                    url, title, base_page, freshness_run_id,
                 )
-                return None
+            except Exception as e:
+                log.warning("playwright_dropdown_skipped", url=url, error=str(e))
+                dropdown_states = []
 
-            raw_content = result.markdown.raw_markdown
-            if not raw_content or len(raw_content.strip()) < 100:
-                log.warning("content_too_short", url=url)
-                return None
-
-            status_code = getattr(result, "status_code", None)
-            if status_code and status_code >= 400:
-                log.warning("scrape_http_error", url=url, status_code=status_code)
-                return None
-
-            page_content     = remove_duplicate_content(raw_content.strip())
-            content_for_hash = clean_content(page_content)
-            content_hash     = compute_content_hash(content_for_hash)
-
-            raw_html = getattr(result, "html", "") or ""
-            metadata = extract_page_metadata(raw_html, url)
-
-            # Excel Category overrides URL-pattern for content_type
-            content_type = map_excel_category_to_content_type(category, url)
-
-            base_page = {
-                "url":              normalise_url_path(url),
-                "title":            title,
-                "section":          derive_section(url),
-                "content":          page_content,
-                "scraped_at":       datetime.now(timezone.utc).isoformat(),
-                "content_length":   len(page_content),
-                "content_hash":     content_hash,
-                # Versioning — stamped here, passed through to chunk_page()
-                "scraper_version":  SCRAPER_VERSION,
-                "metadata_version": METADATA_VERSION,
-                # Rich metadata
-                "audience":         metadata["audience"],
-                "has_video":        metadata["has_video"],
-                "content_type":     content_type,
-                "product_category": metadata["product_category"],
-                "description":      metadata["description"],
-                "thumbnail_url":    metadata["thumbnail_url"],
-                "publish_date":     metadata["publish_date"],
-                "collection_name":  metadata["collection_name"],
-                "read_time_mins":   str(metadata["read_time_mins"]),
-                # Dropdown — empty for base page
-                "dropdown_state":   "",
-                "dropdown_value":   "",
-            }
-
-            # Dropdown detection and scraping
-            dropdown_states: list[dict] = []
-            if _has_routing_dropdowns_in_html(raw_html):
-                log.info("dropdown_page_detected", url=url)
-                try:
-                    loop     = asyncio.get_event_loop()
-                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                    dropdown_states = await loop.run_in_executor(
-                        executor,
-                        _scrape_dropdown_states_playwright,
-                        url, title, base_page, freshness_run_id,
-                    )
-                except Exception as e:
-                    log.warning("playwright_dropdown_skipped", url=url, error=str(e))
-                    dropdown_states = []
-
-            pages = [base_page] + dropdown_states
-            if dropdown_states:
-                log.info("multi_state_page_scraped", url=url, states=len(dropdown_states))
-            return pages
+        pages = [base_page] + dropdown_states
+        if dropdown_states:
+            log.info("multi_state_page_scraped", url=url, states=len(dropdown_states))
+        return pages
 
     except Exception as e:
         log.error("scrape_exception", url=url, error=str(e))
@@ -2651,15 +2720,32 @@ async def scrape_urls_batch(
     concurrency:      int = SCRAPE_CONCURRENCY,
     freshness_run_id: str = "",
 ) -> list[list[dict] | None]:
-    """Scrape multiple URLs with limited concurrency."""
-    sem = asyncio.Semaphore(concurrency)
+    """
+    Scrape multiple URLs with limited concurrency.
 
-    # Cap concurrent scrape tasks via the semaphore.
-    async def _bounded(entry):
-        async with sem:
-            return await scrape_url_with_dropdowns(entry, freshness_run_id=freshness_run_id)
+    v1.7.6 FIX: AsyncWebCrawler is now created ONCE here, before the
+    semaphore-gated concurrent tasks start, and shared across all of
+    them — see scrape_url_with_dropdowns() docstring for the full
+    incident this fixes (concurrent per-URL AsyncWebCrawler instances
+    racing over the same CDP connection). Mirrors
+    scrape_approved_urls_updatedV5.py's proven batch-loop pattern:
+    one AsyncWebCrawler for the whole run, not one per URL.
+    """
+    if not _CRAWL4AI_AVAILABLE:
+        raise RuntimeError("crawl4ai not installed.")
 
-    return await asyncio.gather(*[_bounded(e) for e in entries])
+    sem         = asyncio.Semaphore(concurrency)
+    browser_cfg = _cf_make_browser_config()
+
+    async with AsyncWebCrawler(config=browser_cfg) as crawler:
+        # Cap concurrent scrape tasks via the semaphore.
+        async def _bounded(entry):
+            async with sem:
+                return await scrape_url_with_dropdowns(
+                    crawler, entry, freshness_run_id=freshness_run_id
+                )
+
+        return await asyncio.gather(*[_bounded(e) for e in entries])
 
 
 # ══════════════════════════════════════════════════════════════
