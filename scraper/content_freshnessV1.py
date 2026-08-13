@@ -743,6 +743,58 @@ v1.7.8 — August 2026 | Mukesh Kund
     "changed" classification are computed by different code paths.
     The "changed" count on a fresh test run still needs independent
     verification against this fix.
+
+v1.7.9 — August 2026 | Mukesh Kund
+    ROOT-CAUSE FIX: understanding-compound-growth (and, by the same
+    mechanism, likely most/all pages) hashed as MISMATCH against the
+    index even with v1.7.7/v1.7.8 applied. Verified via a standalone
+    3-way comparison script (verify_hash_3way.py, not part of this
+    file) that computed content_hash three ways from ONE live scrape:
+    [1] scraper's own formula, [2] this file's clean_scraped_content()
+    formula (v1.7.7), [3] indexer's actual stored formula. Result:
+    [1] == [2], but [3] differed from both.
+
+    ROOT CAUSE: chunk_and_index_hqaV5.py's chunk_pages() computes the
+    STORED content_hash as compute_content_hash(clean_content(
+    scraper_cleaned_content)) — i.e. its OWN clean_content() (external-
+    URL stripper) runs a SECOND TIME, on top of the scraper's cleaning,
+    BEFORE hashing (see chunk_and_index_hqaV5.py lines ~1806-1814).
+    v1.7.7's fix computed content_hash directly on clean_scraped_
+    content()'s output only — matching the SCRAPER's own internal
+    hash, not the INDEXER's stored hash, which is the one that
+    actually matters for freshness comparison.
+
+    The effect is NOT limited to pages with external links: clean_
+    content()'s Step 3 (`re.sub(r'  +', ' ', text)`, double-space
+    collapse) runs unconditionally on every page regardless of
+    whether any URL was actually stripped — confirmed on understanding-
+    compound-growth, which has zero external links, where this single
+    step alone changed 8184 -> 8092 chars and flipped the hash.
+
+    FIX:
+    - scrape_url_with_dropdowns() [MODIFIED]: content_hash for the
+      base page now computed as compute_content_hash(clean_content(
+      clean_scraped_content(raw_content))) — clean_content() here is
+      THIS FILE'S EXISTING function (line ~1966, already a byte-
+      identical port of the indexer's URL-stripper, already used
+      correctly in chunk_page()). base_page["content"] itself is left
+      as clean_scraped_content()'s output, unchanged — chunk_page()
+      re-applies clean_content() anyway when building content_with_
+      title, and that call is idempotent on already-cleaned text, so
+      nothing downstream of "content" is affected, only the hash.
+    - Dropdown-state hash [MODIFIED]: same fix applied to the
+      compute_content_hash(content) call inside the routing-dropdown
+      results.append() block — indexer's chunk_pages() applies its
+      clean_content() to ALL pages uniformly, including dropdown-
+      state ones, before branching on is_dropdown_state, so parity
+      requires the same second pass here.
+
+    NOT CHANGED: chunk_page()'s own two compute_content_hash(content)
+    fallback calls (page.get("content_hash", compute_content_hash(
+    content))) were already correct — that "content" variable had
+    already been through this file's clean_content() at the top of
+    chunk_page(), matching the indexer exactly. Only the two scrape-
+    time hash sites were wrong.
 """
 
 from __future__ import annotations
@@ -899,7 +951,13 @@ METADATA_VERSION      = "1.0.0"
 # chunks report a consistent version for chunks produced by the same
 # logic. Bump again if chunking/HQA/embedding/schema logic changes.
 PIPELINE_VERSION      = "1.1.0"
-FRESHNESS_JOB_VERSION = "1.0.0"
+# v1.7.9: bumped 1.0.0 -> 1.1.0 — content_hash comparison formula
+# fixed to match what chunk_and_index_hqaV5.py actually stores
+# (second clean_content() pass before hashing, see v1.7.9 changelog
+# entry). PIPELINE_VERSION untouched — chunking/schema output itself
+# is unaffected, only the hash-comparison logic used for change
+# detection.
+FRESHNESS_JOB_VERSION = "1.1.0"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2469,7 +2527,15 @@ def _scrape_dropdown_states_playwright(
                                 "content":          content,
                                 "scraped_at":       datetime.now(timezone.utc).isoformat(),
                                 "content_length":   len(content),
-                                "content_hash":     compute_content_hash(content),
+                                # v1.7.9 FIX: indexer's chunk_pages()
+                                # applies clean_content() to ALL pages
+                                # uniformly — including dropdown-state
+                                # ones — before branching on
+                                # is_dropdown_state, so this hash must
+                                # go through the same second cleaning
+                                # pass as the base-page fix above for
+                                # parity with what's actually indexed.
+                                "content_hash":     compute_content_hash(clean_content(content)),
                                 "scraper_version":  SCRAPER_VERSION,
                                 "metadata_version": METADATA_VERSION,
                                 "audience":         base_page_data["audience"],
@@ -3026,12 +3092,27 @@ async def scrape_url_with_dropdowns(
         # v1.7.7: use clean_scraped_content() (full boilerplate strip,
         # exact port of scraper's clean_content()) — NOT the other
         # clean_content() in this file (URL-stripper, chunk-time only).
-        # Hash computed directly on this output, no separate
-        # URL-stripping step in between — matches exactly how the
-        # scraper computes the content_hash that's already stored
-        # in the index.
         page_content = clean_scraped_content(raw_content.strip())
-        content_hash = compute_content_hash(page_content.strip())
+
+        # v1.7.9 FIX: content_hash must match what chunk_and_index_
+        # hqaV5.py ACTUALLY stores in the index, not the scraper's own
+        # internal hash. The indexer applies its OWN clean_content()
+        # (external-URL stripper + unconditional double-space
+        # collapse) a SECOND time, on top of scraper-cleaned content,
+        # BEFORE hashing (chunk_and_index_hqaV5.py lines ~1806-1814).
+        # v1.7.7 skipped this second pass, matching the scraper's hash
+        # instead of the indexer's — verified via verify_hash_3way.py
+        # on understanding-compound-growth (zero external links, but
+        # the double-space collapse alone changed 8184->8092 chars and
+        # flipped the hash). clean_content() here is THIS FILE'S
+        # EXISTING function (byte-identical port of the indexer's,
+        # already used correctly in chunk_page()) — only applied to
+        # the hash input, NOT to page_content/base_page["content"]
+        # itself, since chunk_page() re-applies clean_content() anyway
+        # (idempotent on already-cleaned text) when building the real
+        # chunk content later.
+        hash_input   = clean_content(page_content)
+        content_hash = compute_content_hash(hash_input.strip())
 
         raw_html = getattr(result, "html", "") or ""
         metadata = extract_page_metadata(raw_html, url)
