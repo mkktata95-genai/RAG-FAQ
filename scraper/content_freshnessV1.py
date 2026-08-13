@@ -795,6 +795,56 @@ v1.7.9 — August 2026 | Mukesh Kund
     already been through this file's clean_content() at the top of
     chunk_page(), matching the indexer exactly. Only the two scrape-
     time hash sites were wrong.
+
+v1.7.10 — August 2026 | Mukesh Kund
+    ROOT-CAUSE FIX: on a 10-URL end-to-end test against a scratch
+    index (rlg-faq-index-v6-test, built via chunk_and_index_hqaV5.py
+    --full --dry-run then --full for real — see session notes), 8/10
+    URLs matched cleanly with v1.7.9 applied. The remaining 2 —
+    find-a-lost-pension and tell-us-about-a-bereavement — both still
+    showed "changed". These are the only 2 URLs in the subset with a
+    genuine contact-routing dropdown.
+
+    ROOT CAUSE: scrape_approved_urls_updatedV5.py has a function,
+    _truncate_base_content_at_dropdown(), that this file never had at
+    all. Royal London renders every dropdown option's content
+    simultaneously in the DOM (hidden panels shown via JS); crawl4ai
+    captures all of it, so the raw markdown for these pages contains
+    the contact/policy text 3x repeated. The scraper explicitly
+    truncates the base page's content down to just the intro
+    paragraph (before the dropdown widget) and REHASHES the truncated
+    version before storing content_hash. Because chunk_and_index_
+    hqaV5.py's clean_content() + hashing runs on whatever page.get(
+    "content") already is (truncated, for these 2 pages), the actual
+    stored index hash is built from the SHORT intro-only text — while
+    this file's scrape_url_with_dropdowns() was hashing the FULL,
+    3x-repeated raw content. Guaranteed mismatch, independent of
+    v1.7.9 — that fix only ever addressed the OTHER, non-dropdown
+    hash gap.
+
+    FIX:
+    - _truncate_base_content_at_dropdown() [NEW]: inlined, byte-
+      identical port of the scraper's function, placed next to the
+      existing _has_routing_dropdowns_in_html() helper. Self-
+      contained per this file's design principle — no import from
+      scrape_approved_urls_updatedV5.py.
+    - scrape_url_with_dropdowns() [MODIFIED]: dropdown detection
+      (_has_routing_dropdowns_in_html(raw_html)) MOVED earlier, to
+      before content_hash is computed (previously ran afterward,
+      purely for the separate dropdown-state scraping step). If a
+      routing dropdown is detected, page_content is truncated BEFORE
+      both the v1.7.9 clean_content() pass and hashing — mirroring
+      the scraper's exact order: clean -> truncate (if dropdown) ->
+      hash. base_page["content"]/["content_length"] now reflect the
+      truncated text too, matching page_data["content"] in the
+      scraper's JSON output. has_dropdown is computed once and reused
+      for the later dropdown_states scraping branch, instead of
+      calling _has_routing_dropdowns_in_html() a second time.
+
+    NOT CHANGED: the dropdown-STATE hash site (v1.7.9's second fix,
+    for individual #state=/#policy= variant pages) — those already
+    only ever contained one option's content each, no repetition
+    issue, so no truncation was ever needed there.
 """
 
 from __future__ import annotations
@@ -957,7 +1007,12 @@ PIPELINE_VERSION      = "1.1.0"
 # entry). PIPELINE_VERSION untouched — chunking/schema output itself
 # is unaffected, only the hash-comparison logic used for change
 # detection.
-FRESHNESS_JOB_VERSION = "1.1.0"
+# v1.7.10: bumped 1.1.0 -> 1.2.0 — dropdown-page base content now
+# truncated at the dropdown marker BEFORE hashing, matching the
+# scraper's own truncation (see v1.7.10 changelog entry). Same
+# reasoning as v1.7.9: hash-comparison logic only, PIPELINE_VERSION
+# untouched.
+FRESHNESS_JOB_VERSION = "1.2.0"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2400,6 +2455,68 @@ def _has_routing_dropdowns_in_html(html: str) -> bool:
         return False
 
 
+# v1.7.10 FIX: for dropdown pages, truncate base page content at the
+# first dropdown-related marker — INLINED, exact port of
+# scrape_approved_urls_updatedV5.py's _truncate_base_content_at_
+# dropdown(). Self-contained per this file's design principle (no
+# imports from the scraper/indexer scripts).
+#
+# ROOT CAUSE this fixes: on find-a-lost-pension and tell-us-about-a-
+# bereavement (the only 2 dropdown pages in a 10-URL test subset),
+# BOTH showed "changed" even after the v1.7.9 hash-formula fix.
+# Traced to: this function was MISSING entirely — base_page["content"]
+# was hashed as the FULL raw markdown, including Royal London's
+# dropdown panels which render ALL options' content simultaneously in
+# the DOM (hidden via JS, but crawl4ai captures everything — the
+# contact details/policy text appear 3x). The scraper explicitly
+# strips this before hashing (see its own docstring below); the
+# indexer's stored hash is therefore built from the TRUNCATED content.
+# Without this step, freshness could never match the index for any
+# dropdown page, regardless of the v1.7.9 fix.
+#
+# Royal London renders all dropdown option content in the DOM
+# simultaneously (hidden panels shown via JS). crawl4ai captures
+# everything, causing the contact details to appear 3x in the
+# markdown output (once per visible render pass).
+#
+# We keep only the intro paragraph — the part before the dropdown
+# widget appears. This matches exactly what the Playwright script
+# captured as the default state (clean intro, no repeated options).
+def _truncate_base_content_at_dropdown(content: str) -> str:
+    DROPDOWN_MARKERS = [
+        "please select an option",
+        "please select",
+        "select an option",
+        "getting in touch",
+        "get in touch",
+        "to show you how best",
+        "we need to know what kind of policy",
+        "don't worry if you don't know",
+        "choose from the list below",
+        "select from the list",
+    ]
+
+    content_lower = content.lower()
+    earliest_cut  = len(content)
+
+    for marker in DROPDOWN_MARKERS:
+        idx = content_lower.find(marker)
+        if idx != -1 and idx < earliest_cut:
+            earliest_cut = idx
+
+    if earliest_cut < len(content):
+        truncated = content[:earliest_cut].strip()
+        # Only truncate if we still have meaningful content
+        if len(truncated) >= 100:
+            log.info(
+                "base_content_truncated_at_dropdown",
+                original_chars=len(content),
+                truncated_chars=len(truncated),
+            )
+            return truncated
+    return content
+
+
 # Scrape per-option content from routing dropdown page using Playwright.
 def _scrape_dropdown_states_playwright(
     url:              str,
@@ -3094,6 +3211,23 @@ async def scrape_url_with_dropdowns(
         # clean_content() in this file (URL-stripper, chunk-time only).
         page_content = clean_scraped_content(raw_content.strip())
 
+        raw_html   = getattr(result, "html", "") or ""
+        metadata   = extract_page_metadata(raw_html, url)
+        has_dropdown = _has_routing_dropdowns_in_html(raw_html)
+
+        # v1.7.10 FIX: dropdown detection MOVED before hashing (was
+        # previously done further down, after content_hash was
+        # already computed). Truncation must happen BEFORE hashing to
+        # match the scraper/indexer's actual stored hash — see
+        # _truncate_base_content_at_dropdown() docstring above for
+        # the root cause this fixes (find-a-lost-pension and
+        # tell-us-about-a-bereavement both showed "changed" even with
+        # the v1.7.9 formula fix, because the full untruncated,
+        # 3x-repeated dropdown-panel content was being hashed instead
+        # of the truncated intro-only content the scraper hashes).
+        if has_dropdown:
+            page_content = _truncate_base_content_at_dropdown(page_content)
+
         # v1.7.9 FIX: content_hash must match what chunk_and_index_
         # hqaV5.py ACTUALLY stores in the index, not the scraper's own
         # internal hash. The indexer applies its OWN clean_content()
@@ -3110,12 +3244,11 @@ async def scrape_url_with_dropdowns(
         # the hash input, NOT to page_content/base_page["content"]
         # itself, since chunk_page() re-applies clean_content() anyway
         # (idempotent on already-cleaned text) when building the real
-        # chunk content later.
+        # chunk content later. page_content here is the (possibly
+        # v1.7.10-truncated) version, matching what the scraper stores
+        # as page_data["content"] for dropdown pages.
         hash_input   = clean_content(page_content)
         content_hash = compute_content_hash(hash_input.strip())
-
-        raw_html = getattr(result, "html", "") or ""
-        metadata = extract_page_metadata(raw_html, url)
 
         # Excel Category overrides URL-pattern for content_type
         content_type = map_excel_category_to_content_type(category, url)
@@ -3146,9 +3279,11 @@ async def scrape_url_with_dropdowns(
             "dropdown_value":   "",
         }
 
-        # Dropdown detection and scraping
+        # Dropdown detection and scraping — has_dropdown already
+        # computed above (before hashing); reused here so
+        # _has_routing_dropdowns_in_html() isn't called twice.
         dropdown_states: list[dict] = []
-        if _has_routing_dropdowns_in_html(raw_html):
+        if has_dropdown:
             log.info("dropdown_page_detected", url=url)
             try:
                 loop     = asyncio.get_event_loop()
