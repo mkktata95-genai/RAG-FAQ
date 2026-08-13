@@ -53,11 +53,49 @@ from content_freshnessV1 import (
     fetch_current_hashes_from_index,
     normalise_url,
     get_base_url,
+    get_search_client,
     INDEX_NAME,
 )
 from crawl4ai import AsyncWebCrawler
 
 SEP = "=" * 70
+
+
+def fetch_indexed_content(url: str, index_name: str = INDEX_NAME) -> str | None:
+    """
+    Fetch the actual STORED content (not just the hash) for a URL's
+    base-page chunk from the index — lets us show a real diff on
+    mismatch instead of just "hashes differ, here's a preview of one
+    side". Pages a full match-all scan (same pagination pattern as
+    content_freshnessV1.py's own index-query functions) and returns
+    the chunk_index=0 content for the first matching source_url.
+    """
+    client  = get_search_client(index_name)
+    norm    = normalise_url(get_base_url(url))
+    skip    = 0
+    page_sz = 1000
+    try:
+        while True:
+            results = client.search(
+                search_text="*",
+                select=["source_url", "chunk_index", "content"],
+                top=page_sz,
+                skip=skip,
+            )
+            batch = list(results)
+            if not batch:
+                break
+            for r in batch:
+                src = r.get("source_url", "")
+                if normalise_url(get_base_url(src)) == norm and r.get("chunk_index") == 0:
+                    return r.get("content", "")
+            if len(batch) < page_sz:
+                break
+            skip += page_sz
+    except Exception as e:
+        print(f"  (could not fetch indexed content for diff: {e})")
+    return None
+
 
 
 async def verify_url(crawler, url: str, indexed_hashes: dict) -> dict:
@@ -116,10 +154,31 @@ def print_result(r: dict):
         print(f"     This page's content is genuinely unchanged.")
     else:
         print(f"\n  ❌ MISMATCH — hashes differ.")
-        print(f"     Could be: (a) genuine content change on the live")
-        print(f"     site, or (b) a remaining cleaning-pipeline gap.")
-        print(f"     Content preview (first 300 chars):")
-        print(f"     {r['fresh_content'][:300]!r}")
+        indexed_content = fetch_indexed_content(r["url"])
+        if indexed_content is None:
+            print(f"     Could not fetch indexed content for a real diff —")
+            print(f"     fresh content preview (first 300 chars):")
+            print(f"     {r['fresh_content'][:300]!r}")
+        else:
+            diff = list(difflib.unified_diff(
+                indexed_content.splitlines(),
+                r["fresh_content"].splitlines(),
+                fromfile="INDEXED (old)",
+                tofile="FRESH (live now)",
+                lineterm="",
+                n=1,
+            ))
+            if not diff:
+                print(f"     ⚠ Hashes differ but line-level diff is EMPTY —")
+                print(f"     likely a whitespace-only or invisible-character")
+                print(f"     difference. Indexed length={len(indexed_content)},")
+                print(f"     fresh length={len(r['fresh_content'])}.")
+            else:
+                print(f"     Real diff (indexed vs fresh, {len(diff)} changed lines):")
+                for line in diff[:40]:
+                    print(f"     {line}")
+                if len(diff) > 40:
+                    print(f"     ... ({len(diff) - 40} more diff lines truncated)")
 
 
 def print_diff_if_available(results: list):
@@ -172,4 +231,40 @@ async def main():
 
 
 if __name__ == "__main__":
+    # v1.1.0 — Suppress asyncio ProactorEventLoop GC noise on Windows.
+    # Exact port of the proven pattern already used in
+    # scrape_approved_urls_updatedV5.py and content_freshnessV1.py —
+    # NOT a blanket "swallow all stderr" approach. This targets ONLY
+    # the one known cosmetic message (ValueError: I/O operation on
+    # closed pipe, from crawl4ai's browser subprocess cleanup during
+    # interpreter shutdown). Every other error — including genuine
+    # bugs in scrape_url_with_dropdowns() or anywhere else in this
+    # script — still surfaces normally. A blanket sys.stderr =
+    # io.StringIO() around the whole run would hide real tracebacks
+    # too, which defeats the entire point of a diagnostic script.
+    # On Linux: sys.platform != "win32" — complete no-op.
+    if sys.platform == "win32":
+        import warnings
+        warnings.filterwarnings(
+            "ignore",
+            message=".*I/O operation on closed pipe.*",
+            category=ResourceWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=".*unclosed transport.*",
+            category=ResourceWarning,
+        )
+
+        _orig_unraisablehook = sys.unraisablehook
+
+        # Suppress the noisy Windows ProactorEventLoop GC warning only.
+        def _unraisablehook(unraisable):
+            msg = str(unraisable.exc_value)
+            if "I/O operation on closed pipe" in msg:
+                return  # suppress — Windows asyncio GC noise
+            _orig_unraisablehook(unraisable)
+
+        sys.unraisablehook = _unraisablehook
+
     asyncio.run(main())
