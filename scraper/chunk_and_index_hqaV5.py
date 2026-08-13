@@ -4622,6 +4622,32 @@ def main():
         print(f"   Chunks with HQA questions:    {hqa_count:,}")
         print(f"   Chunks with title_questions:  {tq_count:,}")
         print(f"   Target index:                 {active_index}")
+
+        # DIAGNOSTIC ONLY (dry-run branch, never reached on a real
+        # run) — dumps the actual content_hash chunk_pages() would
+        # produce, so it can be compared directly against a live
+        # content_freshnessV1.py scrape hash for the SAME URLs
+        # without needing to create/write any Azure Search index.
+        # Decouples "is the hash formula correct" from "is the
+        # PRODUCTION index stale" — the two questions this session's
+        # freshness debugging kept conflating. No PIPELINE_VERSION
+        # bump — this adds no chunking/HQA/embedding/schema change,
+        # per this file's own bumping rule (see PIPELINE_VERSION
+        # comment above).
+        hash_dump_path = Path(scraped_file).parent / "dry_run_chunk_hashes.json"
+        hash_dump = [
+            {
+                "source_url":   c["source_url"],
+                "chunk_index":  c["chunk_index"],
+                "total_chunks": c["total_chunks"],
+                "content_hash": c["content_hash"],
+            }
+            for c in chunks
+        ]
+        with open(hash_dump_path, "w", encoding="utf-8") as f:
+            json.dump(hash_dump, f, indent=2)
+        print(f"   Chunk hash dump:               {hash_dump_path}")
+
         print(f"\n   Remove --dry-run to run for real.")
         return
 
