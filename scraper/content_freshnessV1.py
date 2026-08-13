@@ -631,6 +631,65 @@ v1.7.6 — August 2026 | Mukesh Kund
     (_scrape_dropdown_states_playwright(), its own independent
     Playwright browser launch via thread-pool executor, not the
     shared CDP crawler touched here). Still open, tracked separately.
+
+v1.7.7 — August 2026 | Mukesh Kund
+    ROOT-CAUSE FIX: --mode report showed 293/297 approved URLs as
+    "changed" — implausible given the short window since the index
+    was last built. Investigated on user's reasonable skepticism
+    rather than accepted at face value.
+
+    TWO COMPOUNDING BUGS FOUND, both in scrape_url_with_dropdowns()'s
+    content-hash computation:
+
+    BUG 1 — wrong clean_content() used for hashing:
+    scrape_approved_urls_updatedV5.py has ONE clean_content() that
+    strips breadcrumbs, social-share sections, footer boilerplate,
+    and duplicate article copy — used at SCRAPE time, and the
+    content_hash stored in the index is computed DIRECTLY on its
+    output (URL-stripping happens separately, later, at CHUNK time,
+    inside chunk_and_index_hqaV5.py — AFTER the hash is already
+    computed and stored). This file only ever ported THAT LATER,
+    chunk-time clean_content() (URL-stripper only) and was using it
+    — at scrape time — to compute content_hash. Every freshly-scraped
+    page still had breadcrumb/social/footer noise in it when hashed,
+    while the indexed hash was computed from properly-cleaned
+    content. Comparing "still noisy" against "already clean"
+    mismatches on nearly every page regardless of whether the real
+    article text changed at all.
+
+    BUG 2 — remove_duplicate_content() had drifted:
+    This file's copy used a naive half-content character-position
+    comparison (split at the midpoint, compare last/first 200 chars).
+    The scraper's actual algorithm finds H1/H2 headings and compares
+    WORD-SET overlap between the sections they bound — a completely
+    different algorithm, producing different output on the same
+    input. Even after fixing Bug 1, hashes would still have mismatched
+    on any page where this function's behaviour diverged.
+
+    FIX:
+    - remove_duplicate_content() [REPLACED]: now an exact copy of
+      the scraper's H1/H2 + word-overlap algorithm.
+    - clean_scraped_content() [NEW]: exact port of the scraper's full
+      clean_content() (breadcrumbs/social/footer/whitespace, calls
+      the now-fixed remove_duplicate_content() internally). Named
+      differently from this file's existing clean_content() (URL-
+      stripper) since that name was already taken by the chunk-time
+      function and both are legitimately needed for their own
+      distinct purposes.
+    - scrape_url_with_dropdowns() [MODIFIED]: page_content and
+      content_hash both now computed via clean_scraped_content(),
+      hash taken directly on its output with NO separate URL-
+      stripping step in between — matching the scraper's exact
+      hash-computation timing.
+
+    IMPACT: also fixes the STORED content quality, not just the
+    hash — previously, if apply mode had ever run, freshly re-scraped
+    pages would have stored breadcrumb/footer noise INTO the index
+    (the existing clean_content() URL-stripper does not remove that
+    noise), silently degrading content quality below what the
+    original --full build produced. No apply-mode run had happened
+    yet with the buggy code, so no index content was actually
+    polluted — caught in report mode before any write occurred.
 """
 
 from __future__ import annotations
@@ -1664,18 +1723,190 @@ def extract_page_metadata(html: str, url: str) -> dict:
     return metadata
 
 
-# Remove duplicate article copy that crawl4ai sometimes produces.
+# Remove exact duplicate article content (crawl4ai sometimes scrapes a page twice).
 def remove_duplicate_content(content: str) -> str:
-    """Remove duplicate article copy that crawl4ai sometimes produces."""
-    half = len(content) // 2
-    if half < 500:
+    """
+    Remove exact duplicate of article content.
+    crawl4ai sometimes scrapes the page twice.
+
+    v1.7.7 FIX: this function had DRIFTED from
+    scrape_approved_urls_updatedV5.py's version — the previous
+    implementation here split content into two raw character-count
+    HALVES and compared the last/first 200 characters positionally.
+    The scraper's actual algorithm finds H1/H2 HEADINGS and compares
+    WORD-SET overlap between the two sections they bound. These are
+    genuinely different algorithms producing genuinely different
+    output on the same input — one contributing factor (alongside
+    the missing full clean_content(), see clean_scraped_content()
+    below) to a --mode report run showing 293/297 URLs as "changed"
+    when it's implausible that much real site content shifted in
+    such a short window. Replaced with an exact copy of the
+    scraper's H1/H2 + word-overlap algorithm.
+
+    Finds H1/H2 headings — if the second one starts after
+    40% of content AND has >60% word overlap with the first
+    chunk, it's a true duplicate → cut it.
+    """
+    h1_pattern = re.compile(r'^#{1,2}\s+\S', re.MULTILINE)
+    matches = list(h1_pattern.finditer(content))
+
+    if len(matches) < 2:
         return content
-    first_chunk  = content[:half]
-    second_chunk = content[half:]
-    overlap = sum(1 for a, b in zip(first_chunk[-200:], second_chunk[:200]) if a == b)
-    if (overlap / 200) > 0.60:
+
+    second_pos  = matches[1].start()
+    content_len = len(content)
+
+    if second_pos < content_len * 0.40:
+        return content
+
+    first_chunk  = content[:second_pos].strip()
+    second_chunk = content[second_pos:].strip()
+
+    first_words  = set(first_chunk.split()[:200])
+    second_words = set(second_chunk.split()[:200])
+
+    if not first_words:
+        return content
+
+    overlap_pct = len(first_words & second_words) / len(first_words)
+
+    if overlap_pct > 0.60:
+        log.info(
+            "duplicate_removed",
+            overlap_pct=round(overlap_pct, 2),
+            chars_removed=len(second_chunk),
+        )
         return first_chunk
+
     return content
+
+
+# v1.7.7 — full scrape-time content cleaner, mirrors scraper exactly.
+def clean_scraped_content(content: str) -> str:
+    """
+    Safe content cleaning — removes pure UI noise (breadcrumbs,
+    social-share sections, footer boilerplate, duplicate article
+    copy). Exact port of scrape_approved_urls_updatedV5.py's
+    clean_content() — same function name was already taken in THIS
+    file by a different function (URL-stripper, used at chunk time
+    inside chunk_page() — see that function's docstring: "Mirrors
+    clean_content() from chunk_and_index_hqaV5.py exactly"), hence
+    the distinct name here.
+
+    v1.7.7 FIX — WHY THIS WAS MISSING:
+    scrape_url_with_dropdowns() was previously computing both the
+    STORED page content AND the content_hash using only
+    remove_duplicate_content() + the WRONG clean_content() (the
+    chunk-time URL-stripper). Neither breadcrumb navigation, social-
+    share sections, nor footer boilerplate were ever stripped from
+    freshly-scraped content before hashing or storing — while the
+    indexed content_hash (and indexed content itself) WAS built from
+    the scraper's fully-cleaned output. Comparing "still has
+    breadcrumbs/footer noise" against "already clean" produces a
+    hash mismatch on nearly every page, regardless of whether the
+    actual article text changed — the direct cause of a --mode
+    report run showing 293/297 URLs as "changed".
+
+    NOTE ON HASH TIMING: the scraper computes content_hash directly
+    on THIS function's output — URL-stripping (the other
+    clean_content() in this file) is applied later, at CHUNK time,
+    AFTER the hash is already computed and stored. This function
+    must be used the same way here: page_content = clean_scraped_
+    content(raw), content_hash = compute_content_hash(page_content) —
+    with NO separate URL-stripping step in between.
+    """
+    # Step 1: Remove duplicate article copy
+    content = remove_duplicate_content(content)
+
+    # Step 2: Remove breadcrumb navigation
+    content = re.sub(
+        r'^\s*\d+\.\s*\[.*?\]\(.*?\)\s*>\s*$',
+        '', content, flags=re.MULTILINE,
+    )
+    content = re.sub(
+        r'^\s*\d+\.\s*\[.*?\]\(.*?\)\s*$',
+        '', content, flags=re.MULTILINE,
+    )
+    content = re.sub(
+        r'^\s*\d+\.\s+[A-Z][^\n]{3,60}$',
+        '', content, flags=re.MULTILINE,
+    )
+
+    # Step 3: Remove social share sections
+    content = re.sub(
+        r'Share\s*\n(\s*\*\s*(\[?\s*\]?\([^\)]*\))?\s*\n)+',
+        '', content,
+    )
+    content = re.sub(
+        r'^\s*\*\s*\[?\s*\]?\(\s*[^\)]{0,10}\)\s*$',
+        '', content, flags=re.MULTILINE,
+    )
+    content = re.sub(
+        r'^Share\s*$',
+        '', content, flags=re.MULTILINE,
+    )
+
+    # Step 4: Remove Twitter share links
+    content = re.sub(
+        r'\[?\s*\]?\(https://twitter\.com/intent/tweet[^\)]*\)\s*',
+        '', content,
+    )
+
+    # Step 5: Remove other social media URLs
+    content = re.sub(
+        r'https://www\.(facebook|instagram|linkedin|x|youtube|twitter)\.com/\S+',
+        '', content,
+    )
+
+    # Step 6: Remove empty markdown links
+    content = re.sub(r'\[\s*\]\(\s*\)', '', content)
+    content = re.sub(
+        r'^\s*\*\s*\[\s*\]\s*$', '', content, flags=re.MULTILINE,
+    )
+
+    # Step 7: Remove Previous/Next Item labels
+    content = re.sub(
+        r'^(Previous Item|Next Item)\s*$',
+        '', content, flags=re.MULTILINE | re.IGNORECASE,
+    )
+
+    # Step 8: Remove footer boilerplate
+    content = re.sub(
+        r'Your browser is not supported\..*?×\s*',
+        '', content, flags=re.DOTALL,
+    )
+    content = re.sub(
+        r'#{1,3}\s*Connect with us.*$',
+        '', content, flags=re.DOTALL | re.MULTILINE,
+    )
+    content = re.sub(
+        r'#{1,3}\s*Products and services.*$',
+        '', content, flags=re.DOTALL | re.MULTILINE,
+    )
+    content = re.sub(
+        r'#{1,3}\s*About Royal London.*$',
+        '', content, flags=re.DOTALL | re.MULTILINE,
+    )
+    content = re.sub(
+        r'#{1,3}\s*Useful links.*$',
+        '', content, flags=re.DOTALL | re.MULTILINE,
+    )
+    content = re.sub(
+        r'\*\*The Royal London Mutual Insurance.*$',
+        '', content, flags=re.DOTALL | re.MULTILINE,
+    )
+    content = re.sub(
+        r'©\s*Royal London \d{4}.*$',
+        '', content, flags=re.DOTALL | re.MULTILINE,
+    )
+    content = re.sub(r'\[Back to top\].*?\n', '', content)
+
+    # Step 9: Normalize whitespace
+    content = re.sub(r'\n{3,}', '\n\n', content)
+    content = re.sub(r'[ \t]+\n', '\n', content)
+    content = re.sub(r'\n[ \t]+\n', '\n\n', content)
+
+    return content.strip()
 
 
 # Remove external URLs from page content before chunking.
@@ -2652,9 +2883,15 @@ async def scrape_url_with_dropdowns(
             log.warning("scrape_http_error", url=url, status_code=status_code)
             return None
 
-        page_content     = remove_duplicate_content(raw_content.strip())
-        content_for_hash = clean_content(page_content)
-        content_hash     = compute_content_hash(content_for_hash)
+        # v1.7.7: use clean_scraped_content() (full boilerplate strip,
+        # exact port of scraper's clean_content()) — NOT the other
+        # clean_content() in this file (URL-stripper, chunk-time only).
+        # Hash computed directly on this output, no separate
+        # URL-stripping step in between — matches exactly how the
+        # scraper computes the content_hash that's already stored
+        # in the index.
+        page_content = clean_scraped_content(raw_content.strip())
+        content_hash = compute_content_hash(page_content.strip())
 
         raw_html = getattr(result, "html", "") or ""
         metadata = extract_page_metadata(raw_html, url)
