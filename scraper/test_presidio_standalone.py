@@ -23,10 +23,22 @@ PII_PATTERNS = {
     "postcode":       r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b",
 }
 
-BLOCK_PII_TYPES = {"policy_number", "ni_number", "email", "phone", "sort_code"}
+# v1.3.0: postcode added — replaces LOCATION as the address signal
+# (see PRESIDIO_ENTITIES note below)
+BLOCK_PII_TYPES = {
+    "policy_number", "ni_number", "email", "phone", "sort_code", "postcode",
+}
 
-PRESIDIO_ENTITIES = ["PERSON", "LOCATION"]
-PRESIDIO_SCORE_THRESHOLD = 0.6
+# v1.3.0: LOCATION dropped. Presidio flags "London" as LOCATION at
+# both 0.6 AND 0.85 confidence regardless of context — confirmed on
+# VDI this isn't a threshold problem, it's a category problem.
+# Unusable as a blocking signal for an insurer named Royal London.
+# PERSON alone still covers every contextual-PII case regex
+# couldn't (names in free text). Structured addresses are now
+# caught via the postcode regex pattern (added to BLOCK_PII_TYPES
+# above) instead of NER.
+PRESIDIO_ENTITIES = ["PERSON"]
+PRESIDIO_SCORE_THRESHOLD = 0.85
 
 
 def detect_regex(text: str) -> list[str]:
@@ -127,8 +139,9 @@ def main():
         "my policy is under my late husband Robert Smith's name", True,
         "name in free text — regex CANNOT catch this, Presidio should"))
     results.append(run_case(
-        "I live at 42 Baker Street, London, is my postcode covered", True,
-        "address in free text — Presidio LOCATION"))
+        "I live at 42 Baker Street, SW1A 1AA, is that covered", True,
+        "postcode present — regex block (was Presidio LOCATION, "
+        "now postcode regex per v1.3.0)"))
     results.append(run_case(
         "can you update the beneficiary to Sarah Johnson please", True,
         "name as beneficiary update — Presidio PERSON"))
