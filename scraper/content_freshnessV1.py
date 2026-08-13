@@ -845,6 +845,39 @@ v1.7.10 — August 2026 | Mukesh Kund
     for individual #state=/#policy= variant pages) — those already
     only ever contained one option's content each, no repetition
     issue, so no truncation was ever needed there.
+
+v1.7.11 — August 2026 | Mukesh Kund
+    NEW: retry mechanism for URLs that fail on the first scrape pass
+    during report/apply runs — this file had no retry at all;
+    scrape_urls_batch() returning None for an entry was final, and
+    the caller (Step 7 of the main freshness pipeline) marked it
+    scrape_failed immediately. Companion fix to scrape_approved_
+    urls_updatedV5.py's v5.1.0 retry mechanism, same design and same
+    rationale (most failures here are transient — page timeout,
+    momentary rate limit, dropdown navigation race).
+
+    ADDED:
+    - RETRY_DELAY_SECONDS / MAX_RETRY_ATTEMPTS — new config constants
+      near SCRAPE_CONCURRENCY. Deliberately reuse the SAME env var
+      names as the scraper (SCRAPE_RETRY_DELAY_SECONDS,
+      SCRAPE_MAX_RETRY_ATTEMPTS) so one config change tunes both
+      scripts — each still reads its own os.getenv() independently,
+      so this file's self-contained/zero-external-dependency design
+      is unaffected; this is config-sharing by convention, not an
+      import.
+    - scrape_urls_batch() [MODIFIED]: after the main asyncio.gather()
+      pass, if any entries came back None, waits RETRY_DELAY_SECONDS
+      then retries exactly those entries — still inside the same
+      AsyncWebCrawler/CDP session the main pass used (no extra
+      browser/CDP startup cost, matches the scraper's approach).
+      Successes overwrite the None slot in-place; the function's
+      return shape (list[list[dict] | None], same length/order as
+      the input entries) is unchanged, so the caller in Step 7 of the
+      main pipeline needed NO changes — it already just checks
+      `if pages is None`.
+
+    FRESHNESS_JOB_VERSION bumped 1.2.0 -> 1.3.0 — see that constant's
+    comment. PIPELINE_VERSION untouched: no chunking/schema change.
 """
 
 from __future__ import annotations
@@ -1012,7 +1045,12 @@ PIPELINE_VERSION      = "1.1.0"
 # scraper's own truncation (see v1.7.10 changelog entry). Same
 # reasoning as v1.7.9: hash-comparison logic only, PIPELINE_VERSION
 # untouched.
-FRESHNESS_JOB_VERSION = "1.2.0"
+# v1.7.11: bumped 1.2.0 -> 1.3.0 — added a scrape-failure retry pass
+# (see v1.7.11 changelog entry). Not a hash-formula change like
+# v1.7.9/v1.7.10, but still run-behaviour, not chunking/schema —
+# PIPELINE_VERSION untouched for the same reason those two didn't
+# bump it either.
+FRESHNESS_JOB_VERSION = "1.3.0"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1165,6 +1203,17 @@ HTTP_TIMEOUT_SECONDS = 12
 
 # Scraping concurrency — capped at 3 for container memory safety
 SCRAPE_CONCURRENCY = 3
+
+# v1.7.11: retry mechanism for URLs that fail on the first scrape
+# pass, mirroring scrape_approved_urls_updatedV5.py's v5.1.0 retry
+# mechanism. Deliberately reuses the SAME env var names as that
+# script (SCRAPE_RETRY_DELAY_SECONDS / SCRAPE_MAX_RETRY_ATTEMPTS) so
+# one operational config change tunes both scripts consistently —
+# this is a config-sharing choice only, NOT an import; each script
+# still reads its own os.getenv() independently, so this file's
+# self-contained/zero-external-dependency design is unaffected.
+RETRY_DELAY_SECONDS = int(os.getenv("SCRAPE_RETRY_DELAY_SECONDS", "20"))
+MAX_RETRY_ATTEMPTS  = int(os.getenv("SCRAPE_MAX_RETRY_ATTEMPTS", "1"))
 
 # Local output dir
 LOCAL_DATA_DIR = Path("scraper/data")
@@ -3323,6 +3372,17 @@ async def scrape_urls_batch(
     racing over the same CDP connection). Mirrors
     scrape_approved_urls_updatedV5.py's proven batch-loop pattern:
     one AsyncWebCrawler for the whole run, not one per URL.
+
+    v1.7.11 FIX: entries that come back None (scrape_url_with_
+    dropdowns() failed) now get ONE retry pass, after
+    RETRY_DELAY_SECONDS, still inside this same crawler/CDP session —
+    mirrors scrape_approved_urls_updatedV5.py's v5.1.0 retry
+    mechanism exactly (same rationale: most failures here are
+    transient — page timeout, momentary rate limit, dropdown
+    navigation race — so a single delayed retry at the end of the
+    run catches stragglers without a full backoff framework).
+    Previously a None here was final; the caller (Step 7 of the main
+    freshness pipeline) would mark it scrape_failed with zero retry.
     """
     if not _CRAWL4AI_AVAILABLE:
         raise RuntimeError("crawl4ai not installed.")
@@ -3338,7 +3398,39 @@ async def scrape_urls_batch(
                     crawler, entry, freshness_run_id=freshness_run_id
                 )
 
-        return await asyncio.gather(*[_bounded(e) for e in entries])
+        results = await asyncio.gather(*[_bounded(e) for e in entries])
+
+        retry_attempt = 0
+        while retry_attempt < MAX_RETRY_ATTEMPTS:
+            failed_indices = [i for i, r in enumerate(results) if r is None]
+            if not failed_indices:
+                break
+            retry_attempt += 1
+            log.info(
+                "retry_pass_starting",
+                attempt=retry_attempt,
+                max_attempts=MAX_RETRY_ATTEMPTS,
+                failed_count=len(failed_indices),
+                delay_seconds=RETRY_DELAY_SECONDS,
+            )
+            await asyncio.sleep(RETRY_DELAY_SECONDS)
+
+            retry_results = await asyncio.gather(
+                *[_bounded(entries[i]) for i in failed_indices]
+            )
+            recovered = 0
+            for idx, new_result in zip(failed_indices, retry_results):
+                if new_result is not None:
+                    results[idx] = new_result
+                    recovered += 1
+            log.info(
+                "retry_pass_complete",
+                attempt=retry_attempt,
+                recovered=recovered,
+                still_failed=len(failed_indices) - recovered,
+            )
+
+        return results
 
 
 # ══════════════════════════════════════════════════════════════

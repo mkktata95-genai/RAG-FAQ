@@ -785,6 +785,44 @@ v5.0.0 — August 2026 | Mukesh Kund
       accurate as written, same convention as chunk_and_index_hqaV5.py
       and content_freshnessV1.py's inline version markers.
 
+v5.1.0 — August 2026 | Mukesh Kund
+    NEW: retry mechanism for URLs that fail on the first scrape pass.
+    Previously, any URL scrape_page() returned None for was logged to
+    failed_urls and simply left out of the run — no automatic retry
+    at all, despite a comment near the dedup logic ("...or scraper
+    retries can still produce duplicate entries") that implied one
+    existed. It didn't; that comment described a theoretical future
+    case, not actual behaviour.
+
+    ADDED:
+    - RETRY_DELAY_SECONDS (env: SCRAPE_RETRY_DELAY_SECONDS, default
+      20s) and MAX_RETRY_ATTEMPTS (env: SCRAPE_MAX_RETRY_ATTEMPTS,
+      default 1) — new config constants near BATCH_SIZE/
+      BATCH_DELAY_SECONDS.
+    - main(): after the entire main batch loop completes (still
+      inside the same AsyncWebCrawler/CDP session — no extra browser
+      startup cost), if failed_urls is non-empty, waits
+      RETRY_DELAY_SECONDS then re-attempts scrape_page() for exactly
+      those URLs, looked up from pages_to_scrape (preserves original
+      category/title, not bare {"url": ...} stubs). Successes are
+      appended to results (including the v4.4.0 multi-state dropdown
+      list-flattening path); genuine re-failures replace failed_urls
+      for the final summary. Single pass by default, deliberately —
+      this catches transient failures (page timeouts, momentary
+      rate-limiting, a dropdown navigation race) at the end of a run,
+      not a full per-URL exponential-backoff framework.
+    - Summary output now reports how many retry passes ran and
+      relabels the failed-URL list "still failing after retry" for
+      clarity when a retry did happen.
+
+    SCRAPER_VERSION intentionally left at "1.0.0" — per this file's
+    own bumping rule (v4.6.0 entry), it tracks per-PAGE scraping
+    logic (CDP mode, dropdown detection, content extraction, crawl4ai
+    config). This change is run-level orchestration around
+    scrape_page(), not a change to scrape_page() itself or to what/
+    how any individual page is scraped — same category as
+    BATCH_SIZE/BATCH_DELAY_SECONDS, which also don't bump it.
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -870,6 +908,19 @@ SCRAPE_RUN_ID    = str(_uuid.uuid4())
 APPROVED_EXCEL = "scraper/data/royal_london_verification_retried.xlsx"
 BATCH_SIZE = 5
 BATCH_DELAY_SECONDS = 2
+
+# v5.1.0: retry mechanism for URLs that fail on the first pass.
+# Runs ONCE, after the entire main batch loop completes, still inside
+# the same AsyncWebCrawler session. RETRY_DELAY_SECONDS is deliberately
+# much longer than BATCH_DELAY_SECONDS — most observed failures here
+# are transient (page timeouts, momentary rate-limiting, a dropdown
+# navigation race), so giving the site time to settle before retrying
+# is the point, not just re-trying immediately. MAX_RETRY_ATTEMPTS is
+# a single pass by default (not per-URL exponential backoff) — matches
+# what was actually asked for: catch the stragglers at the end of a
+# run, not build a full retry-with-backoff framework.
+RETRY_DELAY_SECONDS  = int(os.getenv("SCRAPE_RETRY_DELAY_SECONDS", "20"))
+MAX_RETRY_ATTEMPTS   = int(os.getenv("SCRAPE_MAX_RETRY_ATTEMPTS", "1"))
 
 # ── Production: Azure Blob Storage ─────────────────────────────
 # TODO (DevOps): Set these in Azure Key Vault before go-live.
@@ -2913,6 +2964,75 @@ async def main():
                 if batch_start + BATCH_SIZE < total:
                     await asyncio.sleep(BATCH_DELAY_SECONDS)
 
+            # ── v5.1.0: retry pass for URLs that failed above ──
+            # Runs ONCE (MAX_RETRY_ATTEMPTS=1 by default) after the
+            # entire main batch loop, still inside this same
+            # AsyncWebCrawler session — no new browser/CDP startup
+            # cost. See RETRY_DELAY_SECONDS/MAX_RETRY_ATTEMPTS
+            # definitions near BATCH_SIZE for why this waits
+            # (transient failures) rather than retrying immediately.
+            retry_attempt = 0
+            while failed_urls and retry_attempt < MAX_RETRY_ATTEMPTS:
+                retry_attempt += 1
+                print(
+                    f"\n{'=' * 60}\n"
+                    f"RETRY PASS {retry_attempt}/{MAX_RETRY_ATTEMPTS} — "
+                    f"{len(failed_urls)} failed URL(s), waiting "
+                    f"{RETRY_DELAY_SECONDS}s before retrying...\n"
+                    f"{'=' * 60}"
+                )
+                log.info(
+                    "retry_pass_starting",
+                    attempt=retry_attempt,
+                    max_attempts=MAX_RETRY_ATTEMPTS,
+                    failed_count=len(failed_urls),
+                    delay_seconds=RETRY_DELAY_SECONDS,
+                )
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
+
+                # pages_to_scrape is the full approved list; failed_urls
+                # is always a subset of it — look up original page_info
+                # dicts (category, title, etc.) rather than re-building
+                # bare {"url": ...} entries.
+                retry_lookup = {p["url"]: p for p in pages_to_scrape}
+                retry_batch = [
+                    retry_lookup[u] for u in failed_urls if u in retry_lookup
+                ]
+                still_failed: list = []
+
+                retry_tasks = [
+                    scrape_page(crawler, page_info, i + 1, len(retry_batch))
+                    for i, page_info in enumerate(retry_batch)
+                ]
+                retry_results = await asyncio.gather(*retry_tasks)
+
+                for page_info, result in zip(retry_batch, retry_results):
+                    if result is None:
+                        still_failed.append(page_info["url"])
+                    elif isinstance(result, list):
+                        # v4.4.0 pattern: multi-state dropdown page.
+                        results.extend(
+                            entry for entry in result
+                            if entry.get("content_length", 0) >= 20
+                        )
+                        log.info("retry_succeeded", url=page_info["url"])
+                    else:
+                        results.append(result)
+                        log.info("retry_succeeded", url=page_info["url"])
+
+                recovered = len(failed_urls) - len(still_failed)
+                print(
+                    f"Retry pass {retry_attempt}: {recovered} recovered, "
+                    f"{len(still_failed)} still failing."
+                )
+                log.info(
+                    "retry_pass_complete",
+                    attempt=retry_attempt,
+                    recovered=recovered,
+                    still_failed=len(still_failed),
+                )
+                failed_urls = still_failed
+
     finally:
         # Always stop Chrome CDP subprocess if we started it
         _stop_chrome_cdp()
@@ -2958,10 +3078,11 @@ async def main():
     print("=" * 60)
     print(f"Approved URLs:    {total}")
     print(f"Scraped success:  {len(results)}")
-    print(f"Failed:           {len(failed_urls)}")
+    print(f"Failed:           {len(failed_urls)}", end="")
+    print(f"  (after {retry_attempt} retry pass(es))" if retry_attempt else "")
 
     if failed_urls:
-        print("\nFailed URLs:")
+        print("\nFailed URLs (still failing after retry):")
         for url in failed_urls:
             print(f"  - {url}")
 
