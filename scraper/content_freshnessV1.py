@@ -690,6 +690,59 @@ v1.7.7 — August 2026 | Mukesh Kund
     original --full build produced. No apply-mode run had happened
     yet with the buggy code, so no index content was actually
     polluted — caught in report mode before any write occurred.
+
+v1.7.8 — August 2026 | Mukesh Kund
+    ROOT-CAUSE FIX: 4 index-query functions missing pagination —
+    found investigating a 10-URL test report showing "Main Chunks
+    Before: 0" for EVERY row, including pages known to have real
+    indexed chunks (tell-us-about-a-bereavement, confirmed 13
+    dropdown states earlier this session). This was unrelated to the
+    v1.7.7 content-hash fix — a completely separate bug class.
+
+    ROOT CAUSE: get_chunk_ids_for_url(), get_all_urls_to_delete(),
+    get_refresh_count_for_url(), and the archive-before-delete
+    function each called client.search(top=N) ONCE with no skip
+    loop — meaning only the FIRST N documents of an unsorted
+    match-all query were ever checked, out of ~3,116+ total
+    documents in the index post-cleanup:
+      get_chunk_ids_for_url        top=1000
+      get_all_urls_to_delete       top=5000 (accidentally "safe"
+                                    only because index size is
+                                    currently under 5000 — would
+                                    silently break again after any
+                                    rebuild that grows the index)
+      get_refresh_count_for_url    top=1    (worst case — checks
+                                    ONE arbitrary document)
+      archive-before-delete        top=500
+
+    IMPACT PER FUNCTION:
+      get_chunk_ids_for_url: silently returned [] for most URLs —
+        this is what "Main Chunks Before: 0" was actually showing.
+      get_all_urls_to_delete: would silently miss dropdown #state=
+        variants for deletion in apply mode once index size exceeds
+        5000 documents.
+      get_refresh_count_for_url: returned 0 for nearly every URL
+        (top=1 against a multi-thousand-document index) — refresh_
+        count would never correctly increment across freshness runs,
+        every re-indexed chunk incorrectly stamped refresh_count=1
+        regardless of true history.
+      archive-before-delete: silently produced an EMPTY archive for
+        most URLs right before their real chunks were deleted in
+        apply mode — archive failure is designed to be non-fatal
+        (see v1.5.0), so this failed completely silently, defeating
+        the rollback-safety feature's entire purpose with no error
+        surfaced anywhere.
+
+    FIX: all 4 functions now use the same skip/page_sz pagination
+    loop already used correctly in fetch_current_hashes_from_index()
+    since this file's original version — that function was never
+    affected by this bug class.
+
+    NOTE: this fix does NOT confirm or deny whether v1.7.7's content-
+    hash fix is working correctly — "Main Chunks Before" and the
+    "changed" classification are computed by different code paths.
+    The "changed" count on a fresh test run still needs independent
+    verification against this fix.
 """
 
 from __future__ import annotations
@@ -2565,21 +2618,46 @@ def fetch_current_hashes_from_index(index_name: str = INDEX_NAME) -> dict[str, s
 
 # Get all chunk IDs for a URL including dropdown #state= variants.
 def get_chunk_ids_for_url(url: str, index_name: str = INDEX_NAME) -> list[str]:
-    """Get all chunk IDs for a URL including dropdown #state= variants."""
+    """
+    Get all chunk IDs for a URL including dropdown #state= variants.
+
+    v1.7.8 FIX: previously used a single client.search(top=1000) call
+    with NO pagination — only the first 1000 documents (arbitrary
+    order, unsorted match-all query) were ever checked. With ~3,116+
+    documents in the index post-cleanup, most URLs' actual chunks
+    simply weren't in that first arbitrary batch, so the function
+    silently returned [] for the majority of genuinely-indexed pages.
+    Confirmed via a 10-URL test report showing "Main Chunks Before: 0"
+    for every row, including pages known to have real indexed chunks
+    (e.g. tell-us-about-a-bereavement, confirmed 13 dropdown states
+    earlier in this session). Fixed with the same skip/page_sz
+    pagination loop already used correctly in
+    fetch_current_hashes_from_index().
+    """
     client = get_search_client(index_name)
     base   = get_base_url(url)
     norm   = normalise_url(base)
     ids    = []
+    skip    = 0
+    page_sz = 1000
     try:
-        results = client.search(
-            search_text="*",
-            select=["chunk_id", "source_url"],
-            top=1000,
-        )
-        for r in results:
-            src = r.get("source_url", "")
-            if normalise_url(get_base_url(src)) == norm:
-                ids.append(r["chunk_id"])
+        while True:
+            results = client.search(
+                search_text="*",
+                select=["chunk_id", "source_url"],
+                top=page_sz,
+                skip=skip,
+            )
+            batch = list(results)
+            if not batch:
+                break
+            for r in batch:
+                src = r.get("source_url", "")
+                if normalise_url(get_base_url(src)) == norm:
+                    ids.append(r["chunk_id"])
+            if len(batch) < page_sz:
+                break
+            skip += page_sz
     except Exception as e:
         log.error("get_chunk_ids_error", url=url, index=index_name, error=str(e))
     return ids
@@ -2587,17 +2665,40 @@ def get_chunk_ids_for_url(url: str, index_name: str = INDEX_NAME) -> list[str]:
 
 # Expand base URLs to include all #state= dropdown variants in the index.
 def get_all_urls_to_delete(base_urls: list[str], index_name: str = INDEX_NAME) -> list[str]:
-    """Expand base URLs to include all #state= dropdown variants in the index."""
+    """
+    Expand base URLs to include all #state= dropdown variants in the index.
+
+    v1.7.8 FIX: same missing-pagination bug as get_chunk_ids_for_url()
+    — top=5000 with no skip loop. Currently "accidentally safe" only
+    because the index (~3,116 docs post-cleanup) happens to be under
+    5000 — would silently break again the moment a full rebuild
+    produces more chunks than that. Fixed with the same pagination
+    pattern used throughout this file for index-wide scans.
+    """
     client   = get_search_client(index_name)
     all_urls = set(base_urls)
+    skip     = 0
+    page_sz  = 1000
     try:
-        results = client.search(search_text="*", select=["source_url"], top=5000)
-        for r in results:
-            src = r.get("source_url", "")
-            if src and is_dropdown_url(src):
-                base_norm = normalise_url(get_base_url(src))
-                if any(normalise_url(b) == base_norm for b in base_urls):
-                    all_urls.add(src)
+        while True:
+            results = client.search(
+                search_text="*",
+                select=["source_url"],
+                top=page_sz,
+                skip=skip,
+            )
+            batch = list(results)
+            if not batch:
+                break
+            for r in batch:
+                src = r.get("source_url", "")
+                if src and is_dropdown_url(src):
+                    base_norm = normalise_url(get_base_url(src))
+                    if any(normalise_url(b) == base_norm for b in base_urls):
+                        all_urls.add(src)
+            if len(batch) < page_sz:
+                break
+            skip += page_sz
     except Exception as e:
         log.warning("get_all_urls_error", index=index_name, error=str(e))
     return list(all_urls)
@@ -2642,20 +2743,38 @@ def get_refresh_count_for_url(url: str) -> int:
 
     Called in Step 8 (apply mode) before deleting changed URL chunks
     so the new chunks can be stamped with refresh_count + 1.
+
+    v1.7.8 FIX: same missing-pagination bug as get_chunk_ids_for_url()
+    and get_all_urls_to_delete() — but worse here: top=1 meant this
+    checked a SINGLE arbitrary document from the entire index and
+    almost never matched the target URL. refresh_count would
+    effectively never increment correctly across freshness runs —
+    every re-indexed chunk always got refresh_count=1 (0+1) regardless
+    of true history. Fixed with the same pagination pattern.
     """
-    client = get_search_client(INDEX_NAME)
-    base   = get_base_url(url)
-    norm   = normalise_url(base)
+    client  = get_search_client(INDEX_NAME)
+    base    = get_base_url(url)
+    norm    = normalise_url(base)
+    skip    = 0
+    page_sz = 1000
     try:
-        results = client.search(
-            search_text="*",
-            select=["source_url", "refresh_count"],
-            top=1,
-        )
-        for r in results:
-            src = r.get("source_url", "")
-            if normalise_url(get_base_url(src)) == norm:
-                return int(r.get("refresh_count") or 0)
+        while True:
+            results = client.search(
+                search_text="*",
+                select=["source_url", "refresh_count"],
+                top=page_sz,
+                skip=skip,
+            )
+            batch = list(results)
+            if not batch:
+                break
+            for r in batch:
+                src = r.get("source_url", "")
+                if normalise_url(get_base_url(src)) == norm:
+                    return int(r.get("refresh_count") or 0)
+            if len(batch) < page_sz:
+                break
+            skip += page_sz
     except Exception as e:
         log.warning("get_refresh_count_error", url=url, error=str(e))
     return 0
@@ -2687,6 +2806,17 @@ def save_deleted_chunks_to_blob(
     "What happens if web-page content change impacts model response quality?"
     Archive gives ops a point-in-time snapshot of what was in the index
     before the change, enabling manual comparison and rollback if needed.
+
+    v1.7.8 FIX: same missing-pagination bug as get_chunk_ids_for_url(),
+    get_all_urls_to_delete(), and get_refresh_count_for_url() — top=500
+    with no skip loop meant only the first arbitrary 500 of ~3,116+
+    documents were ever checked. For most URLs this silently produced
+    an EMPTY archive (no chunks found → early return None) right
+    before their real chunks were deleted in apply mode — defeating
+    the rollback-safety purpose of this function entirely, with no
+    error surfaced (archive failure is designed to be non-fatal, so
+    this failed completely silently). Fixed with the same pagination
+    pattern used throughout this file.
     """
     if not BLOB_STORAGE_CONNECTION:
         log.debug("archive_skipped_no_blob", url=url)
@@ -2697,24 +2827,34 @@ def save_deleted_chunks_to_blob(
     norm   = normalise_url(base)
 
     try:
-        results = client.search(
-            search_text="*",
-            select=[
-                "chunk_id", "source_url", "title", "content",
-                "section", "chunk_index", "total_chunks",
-                "content_hash", "scraped_at", "indexed_at",
-                "scraper_version", "metadata_version",
-                "pipeline_version", "index_run_id", "scrape_run_id",
-                "refresh_count", "augmented_questions", "title_questions",
-                "has_video", "content_type", "product_category",
-            ],
-            top=500,
-        )
-        chunks = []
-        for r in results:
-            src = r.get("source_url", "")
-            if normalise_url(get_base_url(src)) == norm:
-                chunks.append(dict(r))
+        chunks  = []
+        skip    = 0
+        page_sz = 500
+        while True:
+            results = client.search(
+                search_text="*",
+                select=[
+                    "chunk_id", "source_url", "title", "content",
+                    "section", "chunk_index", "total_chunks",
+                    "content_hash", "scraped_at", "indexed_at",
+                    "scraper_version", "metadata_version",
+                    "pipeline_version", "index_run_id", "scrape_run_id",
+                    "refresh_count", "augmented_questions", "title_questions",
+                    "has_video", "content_type", "product_category",
+                ],
+                top=page_sz,
+                skip=skip,
+            )
+            batch = list(results)
+            if not batch:
+                break
+            for r in batch:
+                src = r.get("source_url", "")
+                if normalise_url(get_base_url(src)) == norm:
+                    chunks.append(dict(r))
+            if len(batch) < page_sz:
+                break
+            skip += page_sz
 
         if not chunks:
             return None
