@@ -92,6 +92,21 @@ def check_pii(text: str) -> tuple[bool, list[str], list[str]]:
     return bool(regex_hits or presidio_hits), regex_hits, presidio_hits
 
 
+def run_known_risk_case(text: str, label: str) -> bool:
+    """
+    For cases where a block is a KNOWN spaCy ambiguity, not a code
+    bug — e.g. capitalized "Will"/"May"/"Grace" doubling as domain
+    terms. Reports the outcome without asserting pass/fail, since
+    "should this block?" here is a product decision (accept the
+    false-positive risk vs. build an allowlist), not a regression.
+    Returns True if it triggered (for the summary tally only).
+    """
+    blocked, regex_hits, presidio_hits = check_pii(text)
+    flag = "⚠️  BLOCKED" if blocked else "   clear  "
+    print(f"{flag} | presidio={presidio_hits} | {label} | text={text!r}")
+    return blocked
+
+
 def section(title: str):
     print(f"\n{'=' * 70}\n{title}\n{'=' * 70}")
 
@@ -149,7 +164,31 @@ def main():
         "my adviser John Williams recommended this policy", True,
         "name mid-sentence, no structural marker"))
 
-    section("STEP 3: False positives — should NOT block")
+    section(
+        "STEP 3: Known ambiguity — domain words that are also "
+        "names (v1.4.0 flagged risk, soft-fail — a block here is "
+        "a product decision, not a code bug)"
+    )
+    known_risk = []
+    known_risk.append(run_known_risk_case(
+        "how do I update my will", "will (lowercase, legal doc sense)"))
+    known_risk.append(run_known_risk_case(
+        "How do I write a Will for my pension beneficiaries",
+        "Will (capitalized, sentence-initial — highest ambiguity risk)"))
+    known_risk.append(run_known_risk_case(
+        "is there a grace period for missed payments",
+        "grace period (lowercase, insurance term)"))
+    known_risk.append(run_known_risk_case(
+        "What is the Grace period on my policy",
+        "Grace period (Title Case — ambiguity risk)"))
+    known_risk.append(run_known_risk_case(
+        "my premium payment is due in May",
+        "May (calendar month, capitalized)"))
+    known_risk.append(run_known_risk_case(
+        "will my payment due in May affect my cover",
+        "will + May combined — worst case of both risks"))
+
+    section("STEP 4: False positives — should NOT block")
     results.append(run_case(
         "what is Royal London's income protection policy", False,
         "company name should not trigger PERSON/LOCATION"))
@@ -163,13 +202,13 @@ def main():
         "how do I contact customer service", False,
         "no PII present"))
 
-    section("STEP 4: Mixed regex + Presidio in same query")
+    section("STEP 5: Mixed regex + Presidio in same query")
     results.append(run_case(
         "my policy RL123456 is under Robert Smith, is that correct", True,
         "both regex (policy#) and Presidio (name) should fire — "
         "either alone is sufficient to block"))
 
-    section("STEP 5: Edge cases")
+    section("STEP 6: Edge cases")
     results.append(run_case("", False, "empty string"))
     results.append(run_case("   ", False, "whitespace only"))
     results.append(run_case(
@@ -180,17 +219,31 @@ def main():
     section("SUMMARY")
     passed = sum(results)
     total = len(results)
-    print(f"{passed}/{total} passed")
+    print(f"Hard cases:  {passed}/{total} passed")
+
+    risk_triggered = sum(known_risk)
+    risk_total = len(known_risk)
+    print(f"Known-risk cases (Step 3): {risk_triggered}/{risk_total} "
+          f"blocked (⚠️  count)")
+    if risk_triggered:
+        print(
+            "  → these are real, expected ambiguities (spaCy weighs "
+            "capitalization heavily) — not bugs. Decide: accept the "
+            "false-positive risk on 'Will'/'May'/'Grace'-shaped "
+            "queries, or build a small allowlist/exception path for "
+            "them before production sign-off."
+        )
+
     if not _PRESIDIO_AVAILABLE:
         print(
-            "NOTE: Presidio was unavailable during this run — STEP 2 "
-            "failures are expected until the install is fixed, not a "
-            "code bug."
+            "\nNOTE: Presidio was unavailable during this run — STEP 2 "
+            "failures and STEP 3 all-clear results are expected until "
+            "the install is fixed, not a code bug."
         )
     if passed != total and _PRESIDIO_AVAILABLE:
         print(
-            "Review FAIL lines above — if STEP 2 under-triggers or "
-            "STEP 3 over-triggers, tune PRESIDIO_SCORE_THRESHOLD "
+            "\nReview FAIL lines above — if STEP 2 under-triggers or "
+            "STEP 4 over-triggers, tune PRESIDIO_SCORE_THRESHOLD "
             f"(currently {PRESIDIO_SCORE_THRESHOLD}) in this script, "
             "then apply the same change in core/safety.py."
         )
