@@ -12,6 +12,7 @@ class RefusalReason(Enum):
     GENERAL = "general"
     OUT_OF_SCOPE = "out_of_scope"
     UNSAFE_OUTPUT = "unsafe_output"
+    PII_DETECTED = "pii"
 
 
 REFUSAL_TEMPLATES = {
@@ -49,6 +50,13 @@ REFUSAL_TEMPLATES = {
     RefusalReason.UNSAFE_OUTPUT: (
         "I'm unable to process your request at the moment. "
         "Please see our contact page below."
+    ),
+
+    RefusalReason.PII_DETECTED: (
+        "For your security, I can't process messages that "
+        "contain personal or account details. Please rephrase "
+        "your question without this information, or see our "
+        "contact page below for account-specific help."
     ),
 }
 

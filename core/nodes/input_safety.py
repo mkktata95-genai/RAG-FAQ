@@ -18,6 +18,7 @@ def input_safety_node(state: AgentState) -> AgentState:
     Refusal types:
     - irrelevant → OUT_OF_SCOPE (no contact number)
     - harmful    → HARMFUL (no contact number)
+    - pii        → PII_DETECTED (v1.2.0 — Layer 1B, safety.py)
     - other      → GENERAL (with contact number)
     """
     start = time.time()
@@ -50,6 +51,17 @@ def input_safety_node(state: AgentState) -> AgentState:
                 log.warning(
                     "query_harmful",
                     query=state.query[:50],
+                    latency_ms=round(latency),
+                )
+            elif reason == "pii":
+                # PII detected — v1.2.0, safety.py Layer 1B.
+                # Query never reaches classifier/cache_check/LLM.
+                # Log line uses masked query only (never raw PII).
+                state.final_response = get_refusal(
+                    RefusalReason.PII_DETECTED
+                )
+                log.warning(
+                    "query_pii_detected",
                     latency_ms=round(latency),
                 )
             else:

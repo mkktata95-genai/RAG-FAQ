@@ -1,6 +1,7 @@
 """
 Multi-layer safety system for Royal London FAQ chatbot.
 Layer 1:  Relevance check
+Layer 1B: PII detection (regex + Presidio NER) — v1.2.0
 Layer 2:  Crime/fraud detection
 Layer 2B: Weapons/explosives detection
 Layer 3A: Prompt Shields (Azure ML — jailbreak + injection)
@@ -127,6 +128,162 @@ v1.1.0 — July 2026 | Mukesh Kund
            executor:` (re-introduces the shutdown-blocking bug —
            not recommended).
 
+v1.2.0 — August 2026 | Mukesh Kund
+         Layer 1B: PII Detection [NEW] — blocks queries containing
+         customer PII before they reach cache_check (which
+         generates an embedding unconditionally at its Step 1,
+         before even the needs_empathy skip check — the only
+         layer position that guarantees PII never reaches
+         embeddings, cache, or the LLM).
+         - PII_PATTERNS/PII_REPLACEMENTS [MOVED from middleware.py]:
+           single source of truth here now; middleware.py imports
+           them for log-masking instead of duplicating.
+         - detect_pii() [MOVED from middleware.py, was dead code
+           there — zero callers]: regex detection, all 8 types.
+         - detect_presidio_entities() [NEW]: Presidio NER for
+           contextual PII (names, addresses) regex structurally
+           cannot catch. Optional dependency — fails open to
+           regex-only if presidio-analyzer isn't installed (no
+           crash, same posture as Prompt Shields/Content Safety).
+         - check_pii() [NEW]: Layer 1B. BLOCK_PII_TYPES restricts
+           hard-blocking to high-confidence regex types (policy#,
+           NI#, email, phone, sort code) — account_number (any
+           8-digit number) and date_of_birth stay mask-only, too
+           broad to block on without false-positive risk.
+         - Wired into check_input() as Layer 1B, immediately after
+           Layer 1 (relevance) — earliest possible position, so a
+           block also skips Prompt Shields (3A)/Content Safety (5)
+           API cost.
+         - refusal.py: new RefusalReason.PII_DETECTED, no phone
+           number (matches file convention).
+         - input_safety.py: new elif branch, logs query_pii_detected
+           with no query text at all (nothing to leak).
+         ROLLBACK: remove check_pii(), detect_pii(),
+         detect_presidio_entities(), PII_PATTERNS, PII_REPLACEMENTS,
+         BLOCK_PII_TYPES from this file and its call in
+         check_input(); restore local PII_PATTERNS/PII_REPLACEMENTS/
+         detect_pii() in middleware.py; remove PII_DETECTED from
+         refusal.py; remove the elif branch in input_safety.py.
+
+v1.3.0 — August 2026 | Mukesh Kund
+         BUG FIX — Presidio LOCATION false positive on "London":
+         - ROOT CAUSE: PRESIDIO_ENTITIES included LOCATION at
+           launch. Confirmed live (VDI testing, test_presidio_
+           standalone.py) that Presidio flags "London" as LOCATION
+           at both 0.6 AND 0.85 confidence regardless of context —
+           "what does the London stock exchange do" blocked at
+           both thresholds. Not a threshold-tuning problem; a
+           category problem. Unusable as a blocking signal for an
+           insurer named Royal London — would false-positive on a
+           large share of ordinary traffic.
+         - FIX: PRESIDIO_ENTITIES reduced to ["PERSON"] only.
+           PERSON alone still covers every contextual-PII case
+           regex couldn't (names in free text) — confirmed via all
+           4 name-detection test cases still passing.
+         - Structured addresses (the coverage LOCATION was
+           partially providing) now caught via the existing
+           postcode regex pattern, added to BLOCK_PII_TYPES.
+         - PRESIDIO_SCORE_THRESHOLD raised 0.6 → 0.85 (kept from
+           the failed tuning attempt — doesn't hurt PERSON-only
+           accuracy, no reason to revert).
+         ROLLBACK: PRESIDIO_ENTITIES = ["PERSON", "LOCATION"];
+         remove "postcode" from BLOCK_PII_TYPES; PRESIDIO_SCORE_
+         THRESHOLD = 0.6 (not recommended — reintroduces the
+         false-positive).
+
+v1.4.0 — August 2026 | Mukesh Kund
+         Production-hardening pass on Layer 1B (PII), found via
+         strict edge-case review before go-live sign-off. Four
+         changes, all in this file only:
+
+         FIX 1 — Presidio timeout [GAP]:
+         - ROOT CAUSE: check_prompt_shields() and
+           check_azure_content_safety() both wrap their calls in
+           ThreadPoolExecutor with a hard 10s timeout (see v1.1.0
+           FIX 3). detect_presidio_entities() had none — a
+           synchronous call with nothing bounding it. Since Layer
+           1B now runs first (see FIX 3 below), an unbounded call
+           here would stall every request that reaches it, not
+           just PII cases.
+         - FIX: same ThreadPoolExecutor pattern, PRESIDIO_TIMEOUT_
+           SECONDS = 10, executor.shutdown(wait=False) on both
+           success and timeout paths (same FIX-3 shutdown-blocking
+           avoidance as v1.1.0).
+
+         FIX 2 — Singleton race under concurrency [GAP]:
+         - ROOT CAUSE: get_presidio_analyzer()'s lazy init had no
+           lock. Fine under VDI single-threaded testing; under real
+           ACA production concurrency, simultaneous first-requests
+           could each construct their own AnalyzerEngine() before
+           the global was set — not corrupting (GIL-safe
+           assignment) but wasteful (duplicate multi-second model
+           loads under load).
+         - FIX: double-checked locking with threading.Lock().
+           Written for production concurrency assumptions, not
+           validated only against single-user VDI testing.
+
+         FIX 3 — Execution order: PII before Relevance [DECISION]:
+         - ROOT CAUSE: Layer 1 (Relevance) ran before Layer 1B
+           (PII). A message containing PII that ALSO trips an
+           irrelevant-keyword match (e.g. PII plus an off-topic
+           aside in the same message) was blocked and logged with
+           reason "irrelevant" — Layer 1B never ran. Still safe
+           (blocked before embeddings either way) but undercounts
+           true PII incidents in the FCA audit trail.
+         - DECISION: PII is a security/compliance event and must
+           be the logged reason whenever present, regardless of
+           what else accompanies it. check_pii() now runs before
+           check_relevance() in check_input(). Layer label kept as
+           "1B" (not renumbered) — only call order changed, to
+           minimise diff against existing comments/tests
+           referencing "Layer 1B".
+
+         NOTED, not yet fixed — needs dedicated test coverage
+         before production sign-off, tracked here rather than only
+         in chat history:
+         - Presidio PERSON entity risk: words that are simultaneously
+           common domain vocabulary and person names — "Will" (legal
+           document, core to probate/beneficiary domain), "May"
+           (calendar month), "Grace" ("grace period" is an actual
+           insurance term). spaCy weighs capitalization heavily;
+           sentence-initial capitalized instances are genuinely
+           ambiguous. None of these were in the original test set.
+         - postcode regex (BLOCK_PII_TYPES, v1.3.0) was validated
+           for true positives only, not stress-tested for false
+           positives against fund codes/product references — lower
+           risk than LOCATION was (bounded match length via \\b
+           anchors) but not yet confirmed clean.
+
+         ROLLBACK:
+         - FIX 1: remove ThreadPoolExecutor wrapper in
+           detect_presidio_entities(), revert to direct
+           analyzer.analyze() call (not recommended).
+         - FIX 2: remove _presidio_lock and the `with` block in
+           get_presidio_analyzer(), revert to unlocked lazy init
+           (not recommended for production).
+         - FIX 3: swap check_pii()/check_relevance() call order
+           back in check_input() (not recommended — reintroduces
+           audit undercounting).
+
+v1.5.0 — August 2026 | Mukesh Kund
+         VALIDATION — Presidio live on VDI (presidio-analyzer +
+         en_core_web_lg installed), full run via
+         test_presidio_standalone.py:
+         - Hard cases (regex + Presidio true/false positives,
+           mixed, edge cases): 15/15 passed.
+         - Known-risk cases (v1.4.0 NOTED item — "Will"/"May"/
+           "Grace" domain-vocabulary ambiguity): 0/6 triggered a
+           block at current settings (PRESIDIO_ENTITIES=["PERSON"],
+           PRESIDIO_SCORE_THRESHOLD=0.85). Closes that open item —
+           not a theoretical risk anymore, tested and clean as of
+           this run. Re-run this test if PRESIDIO_SCORE_THRESHOLD
+           changes, the spaCy model version changes, or query
+           patterns drift meaningfully from what's in the test set.
+         - postcode regex false-positive stress testing (the other
+           v1.4.0 NOTED item — fund codes/product references) was
+           NOT part of this run — still outstanding.
+         No code changes in this entry — validation record only.
+
 # ─────────────────────────────────────────────────────────────
 # TODO: PRODUCTION READINESS
 # Before go-live replace/enhance the following:
@@ -134,6 +291,24 @@ v1.1.0 — July 2026 | Mukesh Kund
 # Layer 1 - Relevance Check:
 #      Current  → keyword matching (may over-block edge cases)
 #      Enhance  → Use gpt-4o-mini for smarter relevance scoring
+#
+# Layer 1B - PII Detection:
+#      Current  → LIVE as of v1.2.0/v1.3.0. Regex (policy#, NI#,
+#                 email, phone, sort code, postcode) always on,
+#                 no dependency. Presidio NER (PERSON only, since
+#                 v1.3.0) is an OPTIONAL dependency — fails open
+#                 to regex-only if presidio-analyzer isn't
+#                 installed, meaning name-in-free-text PII is NOT
+#                 caught until this is resolved.
+#      BLOCKER  → Presidio's NER model (en_core_web_lg) normally
+#                 downloads from spaCy's CDN at runtime — conflicts
+#                 with RLG's no-external-pull, Azure-contained
+#                 posture (same constraint as Playwright Chromium).
+#                 Needs the model vendored/baked into the container
+#                 image at build time, not pulled in ACA at runtime.
+#                 Get RLG security sign-off before relying on
+#                 Presidio coverage in production; until then only
+#                 the regex half is a guaranteed control.
 #
 # Layer 2B - Weapons/Explosives:
 #      Current  → regex patterns (v1.1.0 — good but not exhaustive)
@@ -161,6 +336,7 @@ v1.1.0 — July 2026 | Mukesh Kund
 
 import os
 import re
+import threading
 import concurrent.futures
 import requests
 from azure.ai.contentsafety import ContentSafetyClient
@@ -218,6 +394,193 @@ def get_safety_client() -> ContentSafetyClient:
             endpoint=SAFETY_ENDPOINT,
         )
     return _safety_client
+
+
+# ── Layer 1B: PII Detection (v1.2.0 — NEW) ────────────────────
+# Blocks queries containing customer PII BEFORE cache_check —
+# cache_check_node generates an embedding unconditionally at its
+# Step 1 (before even the needs_empathy skip check), so this is
+# the only layer position that guarantees PII never reaches
+# embeddings, cache, or the LLM. Runs early (Layer 1B) so a block
+# also skips the cost of Prompt Shields (3A) and Content Safety
+# (5) API calls.
+#
+# Single source of truth for PII patterns — middleware.py imports
+# PII_PATTERNS/PII_REPLACEMENTS from here for log-masking. Two
+# consumers, one detector:
+#   - check_pii() (below)            → blocks the request
+#   - mask_pii_for_logging() (middleware.py) → masks for logs only,
+#     defense-in-depth for anything that still reaches a log line
+#
+# Full pattern set (all 8 types) is used for MASKING. Only a
+# subset is used for BLOCKING — account_number (\d{8}) and
+# date_of_birth are too broad as hard-block triggers (any 8-digit
+# number, any date-shaped string) and would false-positive on
+# ordinary questions. Masking them in logs is still correct;
+# blocking on them is not.
+PII_PATTERNS = {
+    "policy_number":  r"\b(RL|rl)\d{6,10}\b",
+    "ni_number":      r"\b[A-Z]{2}\d{6}[A-D]\b",
+    "date_of_birth":  r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
+    "email":          r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
+    "phone":          r"\b(\+44|0)\d{9,10}\b",
+    "sort_code":      r"\b\d{2}-\d{2}-\d{2}\b",
+    "account_number": r"\b\d{8}\b",
+    "postcode":       r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b",
+}
+
+PII_REPLACEMENTS = {
+    "policy_number":  "[POLICY_NUMBER]",
+    "ni_number":      "[NI_NUMBER]",
+    "date_of_birth":  "[DATE]",
+    "email":          "[EMAIL]",
+    "phone":          "[PHONE]",
+    "sort_code":      "[SORT_CODE]",
+    "account_number": "[ACCOUNT_NUMBER]",
+    "postcode":       "[POSTCODE]",
+}
+
+# High-confidence types only — safe to hard-block on.
+# v1.3.0: postcode added — replaces LOCATION as the address
+# signal (see PRESIDIO_ENTITIES note below).
+BLOCK_PII_TYPES = {
+    "policy_number", "ni_number", "email", "phone", "sort_code",
+    "postcode",
+}
+
+# Presidio NER — catches contextual PII regex structurally cannot
+# (names in free text). Optional dependency: if presidio-analyzer
+# isn't installed (e.g. pending security review for offline model
+# hosting), fails open to regex-only — never crashes the pipeline.
+_presidio_analyzer = None
+_presidio_lock = threading.Lock()
+_PRESIDIO_AVAILABLE = True
+try:
+    from presidio_analyzer import AnalyzerEngine
+except ImportError:
+    _PRESIDIO_AVAILABLE = False
+
+# v1.3.0: LOCATION dropped — confirmed live that Presidio flags
+# "London" as LOCATION at >=0.85 confidence regardless of context
+# ("London stock exchange" blocked). Not a threshold problem, a
+# category problem: unusable for an insurer named Royal London.
+# PERSON alone still covers every contextual-PII gap regex can't
+# (names in free text). Addresses now caught via postcode regex
+# (BLOCK_PII_TYPES above) instead of NER.
+PRESIDIO_ENTITIES = ["PERSON"]
+PRESIDIO_SCORE_THRESHOLD = 0.85
+
+# v1.4.0: hard timeout for Presidio inference — same 10s cap as
+# Prompt Shields (3A) / Content Safety (5). Layer 1B runs earliest
+# (before those two), so an unbounded call here would have stalled
+# every request that reaches it, not just PII cases.
+PRESIDIO_TIMEOUT_SECONDS = 10
+
+
+def get_presidio_analyzer():
+    """
+    Singleton AnalyzerEngine — model loaded once, not per-request.
+
+    v1.4.0: double-checked locking. Original lazy-init had a race
+    under concurrent requests (fine on single-threaded VDI testing,
+    real under ACA production concurrency) — multiple simultaneous
+    first-requests could each spawn their own AnalyzerEngine()
+    before the global was set. Not corrupting (GIL-safe assignment)
+    but wasteful (duplicate multi-second model loads). Lock ensures
+    only one thread ever constructs it.
+    """
+    global _presidio_analyzer
+    if _presidio_analyzer is None and _PRESIDIO_AVAILABLE:
+        with _presidio_lock:
+            if _presidio_analyzer is None:
+                _presidio_analyzer = AnalyzerEngine()
+                log.info("presidio_analyzer_loaded")
+    return _presidio_analyzer
+
+
+def detect_pii(text: str) -> list[str]:
+    """
+    Detect PII types present in text via regex (all 8 types).
+    Used for masking (middleware.py) and as the regex half of
+    check_pii()'s blocking decision.
+    """
+    found = []
+    for pii_type, pattern in PII_PATTERNS.items():
+        if re.search(pattern, text, re.IGNORECASE):
+            found.append(pii_type)
+    return found
+
+
+def detect_presidio_entities(text: str) -> list[str]:
+    """
+    Detect contextual PII (names) via Presidio NER.
+    Local model inference — no network call, but still unbounded
+    without an explicit cap (v1.4.0: added hard timeout, same
+    ThreadPoolExecutor pattern as check_prompt_shields()/
+    check_azure_content_safety(), since a slow/adversarially long
+    query would otherwise stall this layer indefinitely — Layer 1B
+    runs before Prompt Shields/Content Safety, so it would delay
+    every request that reaches it, not just PII cases). Fails open
+    (returns []) on timeout, any other error, or if
+    presidio-analyzer isn't installed — regex remains the
+    always-on backstop regardless of this layer's availability.
+    """
+    if not _PRESIDIO_AVAILABLE or not text or not text.strip():
+        return []
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        analyzer = get_presidio_analyzer()
+        future = executor.submit(
+            analyzer.analyze,
+            text=text,
+            entities=PRESIDIO_ENTITIES,
+            language="en",
+            score_threshold=PRESIDIO_SCORE_THRESHOLD,
+        )
+        results = future.result(timeout=PRESIDIO_TIMEOUT_SECONDS)
+        return list({r.entity_type for r in results})
+    except concurrent.futures.TimeoutError:
+        log.warning(
+            "presidio_timeout", timeout=PRESIDIO_TIMEOUT_SECONDS
+        )
+        return []
+    except Exception as e:
+        log.warning("presidio_detection_failed", error=str(e))
+        return []
+    finally:
+        # FIX 3 pattern (v1.1.0): shutdown(wait=False) — don't
+        # block on an abandoned thread after a timeout.
+        executor.shutdown(wait=False)
+
+
+def check_pii(text: str) -> tuple[bool, str | None]:
+    """
+    Layer 1B: Block queries containing customer PII.
+
+    Regex (BLOCK_PII_TYPES subset — policy#, NI#, email, phone,
+    sort code, postcode) always runs, no dependency. Presidio NER
+    (names) adds contextual coverage when available. Either hit →
+    block. Never sends the raw query onward to embeddings/cache/
+    LLM.
+    """
+    if not text or not text.strip():
+        return True, None
+
+    regex_hits = [
+        t for t in detect_pii(text) if t in BLOCK_PII_TYPES
+    ]
+    presidio_hits = detect_presidio_entities(text)
+
+    if regex_hits or presidio_hits:
+        log.warning(
+            "pii_detected",
+            regex_types=regex_hits,
+            presidio_types=presidio_hits,
+        )
+        return False, "pii"
+
+    return True, None
 
 
 # ── Layer 1: Relevance ────────────────────────────────────────
@@ -628,7 +991,17 @@ def check_input(text: str) -> tuple[bool, str | None]:
     Full multi-layer input check.
     Returns (is_safe, reason) where reason is None if safe.
 
-    Layer order (v1.1.0):
+    Layer order (v1.4.0):
+    1B. PII Detection (regex + Presidio, no network call) — v1.2.0.
+        Runs FIRST as of v1.4.0 (was after Relevance in v1.2.0/
+        v1.3.0). A message containing PII is a security/compliance
+        event regardless of what else it contains — if it also
+        happens to trip Layer 1's irrelevant-keyword check, PII
+        must still be the reason logged for accurate FCA audit
+        trail, not silently absorbed into "irrelevant". Layer label
+        kept as "1B" (not renumbered to "1") to avoid churn across
+        existing comments/changelog referring to it by that name —
+        only the execution order changed.
     1.  Relevance (regex, no API)
     2.  Crime/Fraud (regex, no API)
     2B. Weapons/Explosives (regex, no API)
@@ -640,6 +1013,14 @@ def check_input(text: str) -> tuple[bool, str | None]:
     """
     if not text or not text.strip():
         return False, "irrelevant"
+
+    # Layer 1B: PII Detection (regex, no dependency; Presidio NER,
+    # no network call but has its own 10s timeout — v1.4.0) — must
+    # run before cache_check (embeds unconditionally at its Step 1)
+    # AND before Layer 1 (v1.4.0 reorder, see docstring above).
+    safe, reason = check_pii(text)
+    if not safe:
+        return False, reason
 
     # Layer 1: Relevance (no API call)
     safe, reason = check_relevance(text)

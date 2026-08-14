@@ -5,6 +5,18 @@ P3 - Request ID tracking
 P5 - Token usage tracking
 P2 - PII detection/masking
 
+v1.2.0 — August 2026 | Mukesh Kund
+         PII blocking moved upstream to safety.py Layer 1B.
+         PII_PATTERNS/PII_REPLACEMENTS/detect_pii() now imported
+         from core.safety (single source of truth, shared with
+         check_pii()'s blocking decision) instead of being
+         duplicated here. mask_pii_for_logging() unchanged in
+         behaviour — still masks for logging, now defense-in-depth
+         rather than the only PII control.
+         ROLLBACK: restore local PII_PATTERNS/PII_REPLACEMENTS/
+         detect_pii() definitions here; remove the import from
+         core.safety; remove check_pii()/Layer 1B from safety.py.
+
 Migration: Mistral model names → gpt-4.1 / gpt-4o-mini in cost tracking
 
 BUG #5/#14 FIX (July 2026, Mukesh Kund): MODEL_COST_PER_1K only had
@@ -32,10 +44,9 @@ ROLLBACK: restore MODEL_COST_PER_1K and the old sum() one-liner.
 #                 Built-in rate limiting policies per IP/user
 #
 # P2 - PII Detection:
-#      Current  → regex patterns (misses contextual PII
-#                 like names, addresses in sentences)
-#      Replace  → Azure AI Content Safety PII detection API
-#                 More accurate, GDPR compliant, FCA aligned
+#      Current  → v1.2.0: BLOCKED upstream in safety.py Layer 1B
+#                 (regex + Presidio NER). Masking here is now
+#                 defense-in-depth only, not the primary control.
 #
 # P5 - Token Usage Tracking:
 #      Current  → in-memory dict (resets on restart,
@@ -115,38 +126,18 @@ def generate_request_id() -> str:
 
 
 # ── P2: PII Detection + Masking ───────────────────────────────
-# TODO: PRODUCTION → Replace regex with Azure AI Content Safety
-# PII detection API for FCA-compliant, accurate PII handling
-PII_PATTERNS = {
-    "policy_number":  r"\b(RL|rl)\d{6,10}\b",
-    "ni_number":      r"\b[A-Z]{2}\d{6}[A-D]\b",
-    "date_of_birth":  r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
-    "email":          r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
-    "phone":          r"\b(\+44|0)\d{9,10}\b",
-    "sort_code":      r"\b\d{2}-\d{2}-\d{2}\b",
-    "account_number": r"\b\d{8}\b",
-    "postcode":       r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b",
-}
-
-PII_REPLACEMENTS = {
-    "policy_number":  "[POLICY_NUMBER]",
-    "ni_number":      "[NI_NUMBER]",
-    "date_of_birth":  "[DATE]",
-    "email":          "[EMAIL]",
-    "phone":          "[PHONE]",
-    "sort_code":      "[SORT_CODE]",
-    "account_number": "[ACCOUNT_NUMBER]",
-    "postcode":       "[POSTCODE]",
-}
-
-
-def detect_pii(text: str) -> list[str]:
-    """Detect PII types present in text."""
-    found = []
-    for pii_type, pattern in PII_PATTERNS.items():
-        if re.search(pattern, text, re.IGNORECASE):
-            found.append(pii_type)
-    return found
+# v1.2.0: Blocking now happens upstream in safety.py Layer 1B
+# (check_pii, regex + Presidio) — a query containing PII never
+# reaches this point for masking in the normal case, since
+# input_safety_node refuses it before cache_check/generator run.
+# mask_pii_for_logging() remains here as defense-in-depth for any
+# log line reached via another path (e.g. errors, edge cases) and
+# for the account-lookup log line in supervisor.py.
+#
+# PII_PATTERNS/PII_REPLACEMENTS are no longer defined here —
+# single source of truth is safety.py (shared with check_pii()'s
+# blocking decision). Imported, not duplicated.
+from core.safety import PII_PATTERNS, PII_REPLACEMENTS, detect_pii  # noqa: E402
 
 
 def mask_pii_for_logging(text: str) -> str:
