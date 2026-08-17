@@ -63,6 +63,26 @@ body {
   color: var(--ink);
 }
 
+/* BUG #10 FIX: the app mounts into #root via a bare <> Fragment
+   (no wrapping div), and #root had NO css rules at all — a plain
+   block div, not a flex container. .messages' `flex:1; min-height:0`
+   (BUG #9 fix) only takes effect when its actual parent is a flex
+   container; since #root wasn't one, that rule was inert. Result:
+   .messages grew to fit all content with no bounded height, and
+   the overflow was silently CLIPPED by body's overflow:hidden —
+   no scrollbar ever appeared, because .messages never became the
+   scroll boundary it was meant to be. This is why scrolling didn't
+   work and only reducing browser zoom (shrinking rendered content
+   height) made everything fit. #root now completes the flex chain:
+   body (flex,column,100vh) -> #root (flex,column,100%) -> header
+   (fixed) + settings-bar (fixed, conditional) + messages (flex:1,
+   overflow-y:auto) + input-area (fixed). */
+#root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.001ms !important;
