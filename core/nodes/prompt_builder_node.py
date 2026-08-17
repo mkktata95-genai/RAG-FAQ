@@ -234,6 +234,39 @@ v1.6.0 — July 2026 | Mukesh Kund
          text inline for both rules, remove ACCOUNT_ACCESS_RESPONSE
          and FINANCIAL_DISCLAIMER_TEXT constants.
 
+v1.7.0 — August 2026 | Mukesh Kund
+         BUG FIX — RESPONSE LENGTH RULE over-triggering bullet
+         points on every answer, including conceptual/definitional
+         questions ("what is income protection?", "explain ISA?").
+         - ROOT CAUSE: original rule said "Use bullet points for
+           lists" with no guidance on what counts as a list.
+           Combined with the CITATION RULE's "cite sources inline
+           as [1][2][3] sequentially" (each fact needs a citation),
+           the model defaulted to one-bullet-per-fact structure for
+           every response — the easiest way to satisfy both rules
+           simultaneously — even when the underlying question had
+           no list-shaped answer at all. Confirmed live: two
+           production responses (income protection, ISA) came back
+           as 6-8 bullet walls of assistant-imposed structure at
+           ~4400-6500 tokens output, contributing to perceived UI
+           scroll problems (each turn very tall) reported the same
+           session.
+         - FIX: rule now explicitly instructs prose (2-4 sentences)
+           for conceptual/definitional questions, reserving bullets
+           for genuinely list-shaped content (steps, options,
+           comparisons). Citations can attach to prose sentences,
+           not just bullet lines — removes the structural incentive
+           that was driving bullet-ification.
+         - Scope: text-only change to SYSTEM_PROMPT's RESPONSE
+           LENGTH RULE. No other rule, constant, or downstream
+           consumer touched.
+         - Not yet re-validated against live output — needs a
+           re-run of the same income protection / ISA queries to
+           confirm prose ratio improves before calling this closed.
+         ROLLBACK: restore v1.6.0 wording — "Keep responses concise
+         and mobile-friendly. Maximum 300 words. Use bullet points
+         for lists. No unnecessary repetition or padding."
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -399,8 +432,13 @@ customer service assistant for RLG (a UK insurance and \
 pensions provider).
 
 RESPONSE LENGTH RULE:
-Keep responses concise and mobile-friendly.
-Maximum 300 words. Use bullet points for lists.
+Keep responses concise and mobile-friendly. Maximum 300 words.
+For conceptual or definitional questions, answer in 2-4 short
+sentences of plain prose — do not bullet a definition just
+because it has several supporting facts.
+Use bullet points only for genuinely list-shaped content: steps,
+options, a set of choices, or a comparison. Citations attach to
+whichever sentence or bullet the fact appears in either way.
 No unnecessary repetition or padding.
 
 RECOMMENDATION RULE:

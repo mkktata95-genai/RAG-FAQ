@@ -284,6 +284,41 @@ v1.5.0 — August 2026 | Mukesh Kund
            NOT part of this run — still outstanding.
          No code changes in this entry — validation record only.
 
+v1.6.0 — August 2026 | Mukesh Kund
+         BUG FIX — Presidio PERSON false positive on the company's
+         own (misspelled) name, blocking a benign contact request.
+         - ROOT CAUSE: live query "Contact Roayal London" (typo of
+           "Royal London") flagged as PERSON at PRESIDIO_SCORE_
+           THRESHOLD (0.85), blocked with reason "pii". A garbled/
+           unfamiliar capitalized token pair is a classic NER
+           false-positive pattern — the misspelling made it look
+           unlike a recognised brand/place name and more like an
+           unfamiliar proper noun, i.e. a person's name. Confirmed
+           correctly-spelled "Royal London" already passed clean in
+           earlier testing (v1.3.0 Step 3/4) — this is specifically
+           a typo-tolerance gap, not a repeat of the LOCATION issue.
+         - FIX: COMPANY_NAME_ALLOWLIST (["Royal London", "RLG"]),
+           fuzzy-matched via rapidfuzz.fuzz.partial_ratio (already
+           a dependency in this codebase — retriever.py,
+           validate_urlsV2.py — reused here, same fail-open-if-
+           missing posture). detect_presidio_entities() now checks
+           each hit's actual matched span (text[r.start:r.end], not
+           just entity_type) against the allowlist before returning
+           — a fuzzy match at >=85 discards that hit, logged as
+           pii_allowlist_matched (not PII, safe to log the span
+           plainly since it's a company/brand term by definition).
+         - Scope: does not weaken genuine PERSON detection — only
+           filters hits that closely resemble the allowlisted
+           terms. "Robert Smith", "Sarah Johnson", etc. from earlier
+           test cases are unaffected (confirmed no fuzzy overlap
+           with "Royal London"/"RLG" at the 85 threshold).
+         - Not yet re-validated against a live re-run of "Contact
+           Roayal London" — needs confirmation before closing.
+         ROLLBACK: remove COMPANY_NAME_ALLOWLIST,
+         ALLOWLIST_FUZZY_THRESHOLD, _is_allowlisted_span(), and the
+         filtering block in detect_presidio_entities() (not
+         recommended — reintroduces the live false-positive).
+
 # ─────────────────────────────────────────────────────────────
 # TODO: PRODUCTION READINESS
 # Before go-live replace/enhance the following:
@@ -448,6 +483,44 @@ BLOCK_PII_TYPES = {
     "postcode",
 }
 
+# v1.6.0: brand-name allowlist — Presidio PERSON false-positived
+# live on "Contact Roayal London" (typo of "Royal London"),
+# blocking a completely benign contact request (17 Aug 2026).
+# Fuzzy-matched (rapidfuzz — already used elsewhere in this
+# codebase: retriever.py, validate_urlsV2.py, same fail-open-if-
+# not-installed pattern reused here) so it catches misspellings
+# of the company's own name, not just exact matches.
+COMPANY_NAME_ALLOWLIST = ["Royal London", "RLG"]
+ALLOWLIST_FUZZY_THRESHOLD = 85  # rapidfuzz partial_ratio, 0-100
+
+
+def _is_allowlisted_span(span_text: str) -> bool:
+    """
+    True if span_text is a fuzzy match for a known company/brand
+    term. Presidio flagging the company's own name (including
+    typos) as a PERSON should never block a query — that's an NER
+    false positive, not PII.
+
+    Fails open on the FILTER (not on blocking) if rapidfuzz isn't
+    installed: the allowlist simply won't apply, so PERSON hits —
+    including brand-name ones — fall through to the normal
+    (stricter) path. This mirrors retriever.py's existing posture
+    for the same dependency.
+    """
+    if not span_text or not span_text.strip():
+        return False
+    try:
+        from rapidfuzz import fuzz
+    except ImportError:
+        return False
+
+    for term in COMPANY_NAME_ALLOWLIST:
+        if fuzz.partial_ratio(span_text.lower(), term.lower()) \
+                >= ALLOWLIST_FUZZY_THRESHOLD:
+            return True
+    return False
+
+
 # Presidio NER — catches contextual PII regex structurally cannot
 # (names in free text). Optional dependency: if presidio-analyzer
 # isn't installed (e.g. pending security review for offline model
@@ -524,6 +597,8 @@ def detect_presidio_entities(text: str) -> list[str]:
     (returns []) on timeout, any other error, or if
     presidio-analyzer isn't installed — regex remains the
     always-on backstop regardless of this layer's availability.
+    v1.6.0: hits matching the company-name allowlist (fuzzy) are
+    filtered before returning — see _is_allowlisted_span().
     """
     if not _PRESIDIO_AVAILABLE or not text or not text.strip():
         return []
@@ -539,7 +614,22 @@ def detect_presidio_entities(text: str) -> list[str]:
             score_threshold=PRESIDIO_SCORE_THRESHOLD,
         )
         results = future.result(timeout=PRESIDIO_TIMEOUT_SECONDS)
-        return list({r.entity_type for r in results})
+
+        # v1.6.0: filter out hits that are actually the company's
+        # own (possibly misspelled) name, not a real person name.
+        filtered = []
+        for r in results:
+            span_text = text[r.start:r.end]
+            if _is_allowlisted_span(span_text):
+                log.info(
+                    "pii_allowlist_matched",
+                    span=span_text,
+                    entity_type=r.entity_type,
+                )
+                continue
+            filtered.append(r)
+
+        return list({r.entity_type for r in filtered})
     except concurrent.futures.TimeoutError:
         log.warning(
             "presidio_timeout", timeout=PRESIDIO_TIMEOUT_SECONDS

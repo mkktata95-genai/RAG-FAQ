@@ -58,6 +58,32 @@ v1.2.0 — July 2026 | Mukesh Kund
            space-split of final_response (defensive).
          - Companion: generator.py v2.3.0, schemas.py v1.1.0.
 
+v1.3.0 — August 2026 | Mukesh Kund
+         BUG FIX — Presidio (Layer 1B PII, safety.py v1.2.0) never
+         warmed, causing elevated first-query latency.
+         - ROOT CAUSE: warmup() warms embeddings, Content Safety,
+           Search, and OpenAI chat clients, but never called
+           get_presidio_analyzer(). safety.py v1.4.0 made Layer 1B
+           run FIRST on every request (before relevance) — so the
+           unwarmed AnalyzerEngine()/spaCy model load (multi-second)
+           sat directly on the critical path of the first real
+           query. Confirmed live: 71.7s first response vs 26.4s
+           second response on comparable output length — throughput
+           math (second query's tok/s applied to first query's
+           token count) implies ~50s of non-generation overhead on
+           the first request alone, consistent with an unwarmed
+           model load stacking with everything downstream of it.
+         - FIX: added get_presidio_analyzer() to warmup(), same
+           run_in_executor pattern as get_embedding() (both are
+           blocking synchronous calls, not native async).
+         - Companion: prompt_builder_node.py v1.7.0 (same testing
+           session — bullet-point over-triggering was inflating
+           output token count, likely compounding the perceived
+           latency on top of this root cause).
+         ROLLBACK: remove the get_presidio_analyzer() warmup block
+         (not recommended — reintroduces first-query latency spike
+         on every fresh deploy).
+
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -122,6 +148,18 @@ async def warmup():
         # Warm up search client
         from core.nodes.retriever import get_search_client
         get_search_client()
+
+        # Warm up Presidio NER (Layer 1B — PII detection).
+        # v1.2.0 added this layer, v1.4.0 made it run FIRST on
+        # every request (before relevance) — but warmup() never
+        # loaded it, so the first real user query paid the full
+        # AnalyzerEngine()/spaCy model cold-start cost (multi-
+        # second) on top of everything else. Same fix as the
+        # OpenAI client below (v1.1.0) — different symptom
+        # (elevated latency on every deploy's first query, not
+        # every server's), same root cause class.
+        from core.safety import get_presidio_analyzer
+        await loop.run_in_executor(None, get_presidio_analyzer)
 
         # Warm up OpenAI chat client (generator) — prevents
         # DefaultAzureCredential cold-start (~5s) on first query.
