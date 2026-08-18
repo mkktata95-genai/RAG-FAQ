@@ -63,11 +63,26 @@ DEFAULT_OUT           = "golden_dataset_seed.csv"
 SELECT_FIELDS = [
     "chunk_id",
     "source_url",
+    "parent_url",
+    "element_type",
     "product_category",
     "chunk_index",
     "title_questions",
     "augmented_questions",
 ]
+
+
+def resolve_citation_url(c: dict) -> str:
+    """
+    Dropdown-state chunks (element_type == 'dropdown_state') store
+    the per-state URL with a #state=... fragment in source_url —
+    not citation-safe. parent_url (v4.8.0) holds the clean page URL
+    for these chunks. Mirrors the same resolution used at generation
+    time for citation pills. Falls back to source_url for all
+    ordinary prose/table chunks where parent_url is empty.
+    """
+    parent = (c.get("parent_url") or "").strip()
+    return parent if parent else c.get("source_url", "")
 
 
 def get_client() -> SearchClient:
@@ -123,7 +138,7 @@ def build_seed_rows(chunks: list[dict], max_per_url: int) -> list[dict]:
     per_url_count = defaultdict(int)
 
     for c in chunks:
-        url = c.get("source_url", "")
+        url = resolve_citation_url(c)
         if not url:
             continue
 
