@@ -35,6 +35,14 @@ OUTPUT
 ═══════════════════════════════════════════════════════════════
 CHANGE LOG
 ═══════════════════════════════════════════════════════════════
+v1.1.0 — Aug 2026 | Mukesh Kund
+         Fix: CSV written with utf-8-sig (BOM) instead of utf-8.
+         Without the BOM, Excel on Windows opens the CSV using the
+         system codepage (cp1252) instead of UTF-8, mangling any
+         non-ASCII character (em dashes, curly quotes, apostrophes)
+         into mojibake, e.g. em dash -> "a€"" garbled sequence.
+         ROLLBACK: change "utf-8-sig" back to "utf-8" in write_csv().
+
 v1.0.0 — Aug 2026 | Mukesh Kund
          Initial version. Pulls augmented_questions + title_questions
          from rlg-faq-index-v5, dedupes near-identical questions,
@@ -173,7 +181,7 @@ def write_csv(rows: list[dict], out_path: str):
         "id", "product_category", "question", "expected_answer",
         "source_url", "chunk_id", "chunk_index",
     ]
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
+    with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
