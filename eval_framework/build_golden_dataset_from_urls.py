@@ -60,6 +60,27 @@ REQUIRES
 ═══════════════════════════════════════════════════════════════
 CHANGE LOG
 ═══════════════════════════════════════════════════════════════
+v1.2.0 — Aug 2026 | Mukesh Kund
+         Fix (more complete): added standalone _build_create_kwargs()
+         mirroring generator.py/classifier_node.py's own GPT-4 vs
+         GPT-5 family handling — GPT-5 family needs
+         max_completion_tokens, not max_tokens, in addition to
+         omitting temperature. v1.1.0 only fixed the temperature half;
+         this fixes the token-param half too, matching the pattern
+         already established elsewhere in the codebase.
+         ROLLBACK: revert to plain max_tokens-only kwargs (breaks on
+         GPT-5-family deployments).
+
+v1.1.0 — Aug 2026 | Mukesh Kund
+         Fix: removed explicit temperature parameter from both LLM
+         calls. gpt-5.6-luna (reasoning-tier model) rejects any
+         temperature value other than the default (1) with a 400 —
+         "Unsupported value: 'temperature' does not support 0.3 with
+         this model." All calls now use the model's default temperature.
+         ROLLBACK: re-add temperature=0.3 (generation/grading) and
+         temperature=0.2 (draft_answer) — only valid if you switch to
+         a non-reasoning-tier model that supports custom temperature.
+
 v1.0.0 — Aug 2026 | Mukesh Kund
          Initial version. Standalone, no imports from pipeline scripts.
          ROLLBACK: n/a — new standalone script.
@@ -104,6 +125,28 @@ GRADE_THRESHOLD = 7  # 0-10 scale; neither candidate scoring >= this means the U
 
 REQUEST_SLEEP_SECONDS = 0.5  # small pause between URLs to be gentle on rate limits
 MAX_RETRIES = 2
+MAX_OUTPUT_TOKENS = 1500  # generous ceiling for question/grading/answer JSON responses
+
+
+def _build_create_kwargs(model: str, max_tokens: int) -> dict:
+    """Model-family-compatible kwargs, mirroring generator.py's
+    _build_create_kwargs / classifier_node.py's equivalent helper.
+
+    GPT-4 family (gpt-4*): supports max_tokens.
+    GPT-5 family (gpt-5*, o*, etc.): uses max_completion_tokens; a
+    custom temperature is REJECTED (400 error) — only the default (1)
+    is supported, so temperature is never set for this family.
+    Standalone copy, not imported, per this script's no-pipeline-
+    dependency design — keep in sync manually if generator.py's
+    version changes.
+    """
+    is_gpt4 = "gpt-4" in model.lower()
+    kwargs: dict = {}
+    if is_gpt4:
+        kwargs["max_tokens"] = max_tokens
+    else:
+        kwargs["max_completion_tokens"] = max_tokens
+    return kwargs
 
 GENERATION_PROMPT = """You are helping build a test set for a customer-facing pensions/ISA/protection/equity-release chatbot.
 
@@ -261,7 +304,7 @@ def _chat_json(client: AzureOpenAI, model: str, prompt: str) -> Optional[dict | 
             resp = client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
+                **_build_create_kwargs(model, MAX_OUTPUT_TOKENS),
             )
             raw = resp.choices[0].message.content.strip()
             cleaned = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -302,7 +345,7 @@ def draft_answer(client: AzureOpenAI, content: str, question: str) -> str:
             resp = client.chat.completions.create(
                 model=GENERATION_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
+                **_build_create_kwargs(GENERATION_MODEL, MAX_OUTPUT_TOKENS),
             )
             return resp.choices[0].message.content.strip()
         except Exception as exc:
