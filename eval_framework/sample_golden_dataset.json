@@ -1,0 +1,26 @@
+[
+  {
+    "id": "SMOKE-001",
+    "product_category": "pensions",
+    "question": "What is the minimum pension age?",
+    "expected_answer": "The minimum pension age is currently 55, rising to 57 from 2028.",
+    "source_url": "https://www.royallondon.com/guides-tools/pension-guides/pension-basics/increase-in-minimum-pension-age-in-2028",
+    "chunk_id": "chunk_pension_age_001"
+  },
+  {
+    "id": "SMOKE-002",
+    "product_category": "customer_support",
+    "question": "How do I report a bereavement?",
+    "expected_answer": "You can report a bereavement online or by calling Royal London customer support.",
+    "source_url": "https://www.royallondon.com/existing-customers/help-and-support/make-a-claim/tell-us-about-a-bereavement",
+    "chunk_id": "chunk_bereavement_001"
+  },
+  {
+    "id": "SMOKE-003",
+    "product_category": "isa",
+    "question": "Can I transfer my ISA to Royal London?",
+    "expected_answer": "Yes, you can transfer an existing ISA to Royal London without affecting your annual ISA allowance.",
+    "source_url": "https://www.royallondon.com/isa/transfer",
+    "chunk_id": "chunk_isa_transfer_001"
+  }
+]
