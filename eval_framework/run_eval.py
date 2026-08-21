@@ -11,6 +11,20 @@ pipeline, any framework). This file has no special status; nothing else
 in the package imports it or depends on its contents.
 
 CHANGE LOG
+v1.3.0 — Aug 2026 | Mukesh Kund
+         Fix: judge_fn's max_completion_tokens raised 500 -> 3000.
+         Real run showed all 3 cases failing with
+         "JSONDecodeError: Expecting value: line 1 column 1 (char 0)" —
+         gpt-5-nano returned empty content. Root cause: GPT-5-family
+         reasoning models spend hidden reasoning tokens out of the same
+         max_completion_tokens budget before writing visible output;
+         500 was fully consumed by reasoning, leaving nothing for the
+         actual JSON response. Added an explicit empty-content check
+         with a clearer error message for next time this class of
+         issue recurs at a different token ceiling.
+         ROLLBACK: revert to max_completion_tokens=500 — will
+         reproduce the empty-response failure on gpt-5-nano.
+
 v1.2.0 — Aug 2026 | Mukesh Kund
          Demo-readiness pass, for a fully-populated 3-query dashboard
          (no metric left n/a):
@@ -180,9 +194,21 @@ def get_judge_fn():
         resp = client.chat.completions.create(
             model=os.getenv("GOLDEN_JUDGE_MODEL", "gpt-5-nano"),
             messages=[{"role": "user", "content": prompt}],
-            max_completion_tokens=500,  # gpt-5 family: no temperature param
+            max_completion_tokens=3000,  # gpt-5 family: reasoning tokens
+            # draw from this same budget before any visible output is
+            # written — too low a value (e.g. 500) can leave nothing
+            # for the actual JSON response, producing an empty string
+            # that fails to parse. 3000 gives headroom for reasoning +
+            # the short JSON scores payload.
         )
-        return resp.choices[0].message.content
+        content = resp.choices[0].message.content
+        if not content or not content.strip():
+            raise ValueError(
+                "Judge LLM returned empty content — likely max_completion_tokens "
+                "still too low (reasoning tokens consumed the full budget). "
+                "Try raising it further."
+            )
+        return content
 
     return example_judge_fn_using_your_llm(llm_call)
 

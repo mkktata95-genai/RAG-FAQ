@@ -41,6 +41,19 @@ All four keys are optional in the returned dict — omit any the judge
 doesn't score. Framework aggregates whatever is present.
 
 CHANGE LOG
+v1.1.0 — Aug 2026 | Mukesh Kund
+         Fix: example_judge_fn_using_your_llm's JSON parser replaced —
+         naive strip/remove-backticks approach failed on real gpt-5-nano
+         responses ("JSONDecodeError: Expecting value: line 1 column 1").
+         Replaced with the same brace-position extraction (find "{" /
+         rfind "}") already established and working in classifier_node
+         .py's classify_intent() for the identical GPT-5-reasoning-model
+         prose-prepended-JSON problem — should have referenced that
+         existing fix from the start instead of guessing a token-budget
+         explanation first.
+         ROLLBACK: revert to raw_text.strip().removeprefix(...) chain —
+         will reproduce the parse failure on prose-prepended responses.
+
 v1.0.0 — Aug 2026 | Mukesh Kund — initial version.
 """
 
@@ -125,6 +138,14 @@ def example_judge_fn_using_your_llm(llm_call_fn: Callable[[str], str]) -> JudgeF
     (gpt-5-mini, gpt-5-nano, etc.) and return raw text. This wrapper
     handles prompt construction and JSON parsing only — no model
     coupling lives in the framework itself.
+
+    JSON extraction mirrors the pattern already established in
+    classifier_node.py's classify_intent() (v1.2.0 FIX 2): GPT-5
+    reasoning models often prepend prose before the JSON object rather
+    than returning it bare or backtick-fenced — a naive
+    strip-and-remove-backticks parser breaks on that. Brace-position
+    extraction (find "{" / rfind "}") handles all cases: plain JSON,
+    fenced JSON, and prose-prepended JSON alike.
     """
     import json
 
@@ -135,8 +156,14 @@ def example_judge_fn_using_your_llm(llm_call_fn: Callable[[str], str]) -> JudgeF
             expected_answer=expected_answer,
             actual_answer=actual_answer,
         )
-        raw_text = llm_call_fn(prompt)
-        cleaned = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        return json.loads(cleaned)
+        raw_text = (llm_call_fn(prompt) or "").strip()
+
+        start = raw_text.find("{")
+        end = raw_text.rfind("}") + 1
+        if start == -1 or end == 0:
+            raise ValueError(f"No JSON object found in judge response: {raw_text[:100]!r}")
+
+        clean = raw_text[start:end]
+        return json.loads(clean)
 
     return judge_fn
