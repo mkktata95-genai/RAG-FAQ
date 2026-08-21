@@ -7,6 +7,18 @@ Two outputs:
     no external assets (safe to email / open offline on VDI).
 
 CHANGE LOG
+v1.3.0 — Aug 2026 | Mukesh Kund
+         Added METRICS_GLOSSARY_HTML — static, plain-language glossary
+         covering every metric on the dashboard (including an
+         LLM-as-judge explainer) with a domain-relevant example per
+         metric, for non-AI-background readers (e.g. PO). Collapsed by
+         default via native <details>/<summary> (no JS needed for a
+         whole-section toggle, unlike the per-cell _expandable()).
+         Same content every report — not dynamic per what metrics are
+         present in a given run.
+         ROLLBACK: remove METRICS_GLOSSARY_HTML constant and its
+         {METRICS_GLOSSARY_HTML} placement in write_html_report().
+
 v1.2.0 — Aug 2026 | Mukesh Kund
          Added tone_note banner next to the KPI row, explaining that
          expected_answer is factual-content-only and doesn't include
@@ -39,6 +51,118 @@ from dataclasses import asdict
 from pathlib import Path
 
 from eval_core import EvalRun
+
+# Static glossary — same content in every report, plain-language,
+# domain-relevant examples so a non-AI-background reader (e.g. PO)
+# can understand each metric without a separate briefing.
+METRICS_GLOSSARY_HTML = """
+<details class="glossary">
+<summary>What do these metrics mean? (click to expand)</summary>
+<div class="glossary-body">
+
+<p><b>How scoring works:</b> Two different methods are used together.
+(1) <b>Automated text-matching</b> — simple algorithms that compare the
+chatbot's answer to a reference answer word-by-word or via similarity
+math. Fast and free, but can be misleading — a correct answer phrased
+differently can score low here. (2) <b>LLM-as-judge</b> — a separate AI
+model (not the same one that answered the question) reads the chatbot's
+answer, the reference answer, and the source content, then rates the
+answer against a rubric — similar to how a human reviewer would, but
+automated so every question gets checked consistently. The judge scores
+below (faithfulness, answer relevance, correctness, context relevance)
+are generally more reliable than the automated text-matching scores.</p>
+
+<table class="glossary-table">
+<tr><th>Metric</th><th>What it means</th><th>Example</th></tr>
+
+<tr><td><b>Faithfulness</b></td>
+<td>Does the answer only state facts that are actually backed by the
+source content the chatbot retrieved? Catches made-up information.</td>
+<td>Source says pension age is 55. Answer says "55" &rarr; faithful (1.0).
+Answer says "50" (not in the source) &rarr; unfaithful, near 0.</td></tr>
+
+<tr><td><b>Answer relevance</b></td>
+<td>Does the answer actually address the question that was asked?</td>
+<td>Question: "How do I report a bereavement?" Answer describes ISA
+transfers instead &rarr; low relevance, even if that content is itself
+accurate about something else.</td></tr>
+
+<tr><td><b>Correctness (judge)</b></td>
+<td>Does the substance of the answer match the true/reference answer,
+even if worded differently?</td>
+<td>Reference: "pension age is 55, rising to 57 in 2028." Answer: "you
+can take your pension from 55, increasing to 57 from 2028" &rarr; correct
+(1.0) despite different wording.</td></tr>
+
+<tr><td><b>Context relevance</b></td>
+<td>Was the content the chatbot pulled from the knowledge base actually
+useful for answering this specific question?</td>
+<td>Question about ISA transfers retrieves a page about pensions instead
+&rarr; low context relevance — signals a retrieval problem even if the
+final answer happens to be okay.</td></tr>
+
+<tr><td><b>Retrieval hit rate</b></td>
+<td>Across all questions, in what percentage did the chatbot find and
+cite at least the correct source page?</td>
+<td>3 questions, correct source cited in all 3 &rarr; hit rate 100%.</td></tr>
+
+<tr><td><b>Retrieval recall</b></td>
+<td>Of the source page(s) that should have been cited for a question,
+how many actually were?</td>
+<td>If a question should cite 1 known page and the chatbot cites it
+&rarr; recall 1.0, regardless of how many other pages it also cited.</td></tr>
+
+<tr><td><b>MRR</b> (Mean Reciprocal Rank)</td>
+<td>When the right source was found, how high up was it in the list of
+citations returned? 1.0 = always the first citation listed.</td>
+<td>Correct source cited 1st &rarr; 1.0. Cited 3rd out of 5 &rarr; 0.33.</td></tr>
+
+<tr><td><b>Precision</b></td>
+<td>How "clean" the citation list was — see the amber note above the
+category table for why this can look artificially low even on good
+answers. Treat as a flag to spot-check, not a pass/fail score.</td>
+<td>Answer correctly cites 1 known-relevant page plus 1 extra
+(unverified, not necessarily wrong) page &rarr; precision 0.5, even
+though nothing was actually incorrect.</td></tr>
+
+<tr><td><b>Avg token F1 / sequence similarity / semantic similarity</b></td>
+<td>Automated wording-comparison checks (not the AI judge) — useful as a
+rough sanity check only. A thorough, correct answer that's longer or
+phrased differently than the short reference answer can score low here
+even when the judge scores above rate it highly correct.</td>
+<td>Reference: "Yes, you can transfer your ISA." Full correct answer with
+extra detail about the process &rarr; low word-overlap score despite
+being a better, fully correct answer.</td></tr>
+
+<tr><td><b>Refusal rate</b></td>
+<td>How often the chatbot declined to answer at all (e.g. for
+out-of-scope or restricted topics).</td>
+<td>Question outside approved content &rarr; chatbot correctly declines
+&rarr; counted here, not as an error.</td></tr>
+
+<tr><td><b>Avg cost / query</b></td>
+<td>Real cost in £/$ per question, based on actual token usage and
+current model pricing.</td>
+<td>A longer, more detailed answer costs more in output tokens than a
+short one — this tracks that real spend.</td></tr>
+
+<tr><td><b>Latency (mean / P95)</b></td>
+<td>How long, in seconds, the chatbot took to respond. P95 shows the
+slower end of typical responses — 95% of queries were faster than this.</td>
+<td>Mean 5s, P95 12s &rarr; most answers come back in ~5s, but the
+slowest 1-in-20 can take up to 12s.</td></tr>
+
+<tr><td><b>Error rate</b></td>
+<td>Percentage of questions where the pipeline itself failed to return
+any answer at all — a technical failure, not a quality/correctness
+issue.</td>
+<td>A timeout or crash mid-request &rarr; counted here, separate from
+whether an answer that WAS returned was good or bad.</td></tr>
+
+</table>
+</div>
+</details>
+"""
 
 
 def _run_to_dict(run: EvalRun) -> dict:
@@ -191,11 +315,19 @@ th {{ background: #f0f0f0; position: sticky; top: 0; }}
 .err-row {{ background: #fff0f0; }}
 .toggle-link {{ font-size: 11px; color: #0066cc; text-decoration: none; white-space: nowrap; }}
 .toggle-link:hover {{ text-decoration: underline; }}
+.glossary {{ margin-bottom: 24px; background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px 16px; }}
+.glossary summary {{ cursor: pointer; font-weight: 600; font-size: 14px; }}
+.glossary-body {{ margin-top: 14px; font-size: 13px; line-height: 1.5; }}
+.glossary-table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+.glossary-table th, .glossary-table td {{ border: 1px solid #e0e0e0; padding: 8px 10px; text-align: left; vertical-align: top; font-size: 12px; }}
+.glossary-table th {{ background: #f0f0f0; }}
+.glossary-table td:first-child {{ white-space: nowrap; width: 160px; }}
 </style></head>
 <body>
 <h1>Model Evaluation Report</h1>
 <div class="meta">Run ID: {_esc(run.run_id)} &nbsp;|&nbsp; Model: {_esc(run.model_label)}</div>
 <div class="kpis">{kpis}</div>
+{METRICS_GLOSSARY_HTML}
 {precision_note}
 {tone_note}
 <h2>By category</h2>
