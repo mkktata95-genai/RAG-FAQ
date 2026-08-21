@@ -3,24 +3,24 @@
     "id": "SMOKE-001",
     "product_category": "pensions",
     "question": "What is the minimum pension age?",
-    "expected_answer": "The minimum pension age is currently 55, rising to 57 from 2028.",
-    "source_url": "https://www.royallondon.com/guides-tools/pension-guides/pension-basics/increase-in-minimum-pension-age-in-2028",
-    "chunk_id": "chunk_pension_age_001"
+    "expected_answer": "The minimum pension age is currently 55, but this will increase to 57 for most people from 6 April 2028, affecting those born after 6 April 1971. Some occupations, pension schemes, or individuals with a protected pension age may still be able to take benefits earlier depending on scheme rules.",
+    "source_url": "https://www.royallondon.com/guides-tools/pension-guides/pension-basics/the-minimum-pension-age-is-changing",
+    "chunk_id": ""
   },
   {
     "id": "SMOKE-002",
     "product_category": "customer_support",
     "question": "How do I report a bereavement?",
-    "expected_answer": "You can report a bereavement online or by calling Royal London customer support.",
+    "expected_answer": "You can report a bereavement by completing Royal London's online notification form. The correct process depends on your policy type, including adviser-arranged pensions, older endowments, savings plans, and whole of life policies. Full details are available on the bereavement support page.",
     "source_url": "https://www.royallondon.com/existing-customers/help-and-support/make-a-claim/tell-us-about-a-bereavement",
-    "chunk_id": "chunk_bereavement_001"
+    "chunk_id": ""
   },
   {
     "id": "SMOKE-003",
     "product_category": "isa",
     "question": "Can I transfer my ISA to Royal London?",
-    "expected_answer": "Yes, you can transfer an existing ISA to Royal London without affecting your annual ISA allowance.",
-    "source_url": "https://www.royallondon.com/isa/transfer",
-    "chunk_id": "chunk_isa_transfer_001"
+    "expected_answer": "Yes, you can transfer some or all of an existing ISA held with another provider into a Royal London Stocks and Shares ISA. There is no charge for transfers, and once your Royal London ISA is set up you can transfer other ISAs into it at any time. Provide your details and Royal London will manage the transfer process with your current provider.",
+    "source_url": "https://www.royallondon.com/isa/stocksandsharesisa",
+    "chunk_id": ""
   }
 ]
