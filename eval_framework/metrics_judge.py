@@ -41,6 +41,17 @@ All four keys are optional in the returned dict — omit any the judge
 doesn't score. Framework aggregates whatever is present.
 
 CHANGE LOG
+v1.2.0 — Aug 2026 | Mukesh Kund
+         Fix: judge prompt now explicitly instructs scoring factual
+         content only, ignoring required empathy/disclaimer framing and
+         citation marker syntax ([1], [2], ...) — these are product/
+         compliance requirements, not correctness signals, and were
+         previously dragging down faithfulness/correctness scores on
+         answers that correctly followed required tone behavior (e.g.
+         bereavement empathy opener).
+         ROLLBACK: revert JUDGE_PROMPT_TEMPLATE to the version without
+         the "IMPORTANT" tone/framing paragraph.
+
 v1.1.0 — Aug 2026 | Mukesh Kund
          Fix: example_judge_fn_using_your_llm's JSON parser replaced —
          naive strip/remove-backticks approach failed on real gpt-5-nano
@@ -117,10 +128,19 @@ Retrieved context: {context}
 Expected answer: {expected_answer}
 Actual answer: {actual_answer}
 
+IMPORTANT — the chatbot has REQUIRED product/compliance behaviors that are
+intentional, not errors: it may open emotionally sensitive answers (e.g.
+bereavement) with an empathy statement, or include mandatory disclaimers.
+The expected_answer above is a factual-content reference only and does NOT
+include this required framing. Do NOT penalize the actual answer for
+including empathy openers, disclaimers, or citation markers like [1] — score
+based on whether the underlying FACTUAL CONTENT is correct and complete,
+ignoring tone, required framing, and citation marker syntax entirely.
+
 Score:
-- faithfulness: does the actual answer ONLY state facts supported by the retrieved context? (1.0 = fully grounded, 0.0 = fabricated/unsupported)
+- faithfulness: does the actual answer's FACTUAL CONTENT only state facts supported by the retrieved context? (1.0 = fully grounded, 0.0 = fabricated/unsupported) — ignore tone/empathy/disclaimer framing
 - answer_relevance: does the actual answer address the question asked? (independent of whether it matches the expected answer)
-- correctness: does the actual answer match the expected answer in substance? (paraphrasing is fine, factual mismatch is not)
+- correctness: does the actual answer's FACTUAL CONTENT match the expected answer in substance? (paraphrasing is fine, factual mismatch is not; required empathy/disclaimer framing is NOT a mismatch)
 - context_relevance: is the retrieved context actually relevant to answering the question?
 
 Respond ONLY with JSON: {{"faithfulness": 0.0, "answer_relevance": 0.0, "correctness": 0.0, "context_relevance": 0.0}}

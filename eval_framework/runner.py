@@ -8,6 +8,14 @@ default (unreviewed seed rows) — pass include_unreviewed=True to include
 them anyway (e.g. for smoke-testing the framework before SME review lands).
 
 CHANGE LOG
+v1.1.0 — Aug 2026 | Mukesh Kund
+         judge_fn now receives citation-marker-stripped actual_answer
+         (belt-and-suspenders alongside the JUDGE_PROMPT_TEMPLATE
+         instruction to ignore them — not every judge model reliably
+         follows prompt instructions on its own).
+         ROLLBACK: pass response.answer directly to score_with_judge()
+         instead of strip_citation_markers(response.answer).
+
 v1.0.0 — Aug 2026 | Mukesh Kund — initial version.
 """
 
@@ -21,7 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 from eval_core import EvalCase, CaseResult, EvalRun, ResponseFn, invoke_response_fn
-from metrics_generation import score_generation, EmbedFn
+from metrics_generation import score_generation, strip_citation_markers, EmbedFn
 from metrics_retrieval import score_retrieval
 from metrics_judge import score_with_judge, JudgeFn
 from metrics_operational import resolve_refusal, resolve_cost
@@ -87,9 +95,13 @@ def run_evaluation(
         judge_scores = {}
         if response.error is None:
             gen_scores = score_generation(case.expected_answer, response.answer, embed_fn)
+            # Judge also gets citation markers stripped — belt-and-suspenders
+            # alongside the prompt instruction (JUDGE_PROMPT_TEMPLATE) to
+            # ignore them, since not every judge model will reliably follow
+            # that instruction on its own.
             judge_scores = score_with_judge(
                 judge_fn, case.question, case.expected_answer,
-                response.answer, response.retrieved_context,
+                strip_citation_markers(response.answer), response.retrieved_context,
             )
 
         ret_scores = score_retrieval(case.relevant_ids, response.citations, k=retrieval_k)

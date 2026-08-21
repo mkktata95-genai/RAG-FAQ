@@ -7,6 +7,28 @@ Two outputs:
     no external assets (safe to email / open offline on VDI).
 
 CHANGE LOG
+v1.2.0 — Aug 2026 | Mukesh Kund
+         Added tone_note banner next to the KPI row, explaining that
+         expected_answer is factual-content-only and doesn't include
+         required empathy/disclaimer framing or citation markers —
+         so lexical metrics (not tone-aware) may read lower than judge
+         scores on tone-sensitive cases, which is expected, not a
+         quality problem. Companion to metrics_judge.py v1.2.0's prompt
+         fix and metrics_generation.py v1.1.0's marker stripping.
+         ROLLBACK: remove tone_note and its {tone_note} placement.
+
+v1.1.0 — Aug 2026 | Mukesh Kund
+         Added click-to-expand for expected_answer/actual_answer in the
+         per-case table. Previously hard-truncated at 120 chars with no
+         way to see the rest in the HTML view (full text was only in
+         eval_report.json) — problem for FCA-regulated content where
+         exact wording matters. Pure inline JS toggle, no external
+         libs/fetch — full text is already in the DOM, just hidden,
+         so it works fully offline.
+         ROLLBACK: revert case_rows to c['expected_answer'][:120] /
+         c['actual_answer'][:120] with _esc() directly, remove
+         _expandable() and the .toggle-link CSS block.
+
 v1.0.0 — Aug 2026 | Mukesh Kund — initial version.
 """
 
@@ -93,6 +115,42 @@ def write_html_report(run: EvalRun, path: str) -> None:
         'flag to manually spot-check, not as a pass/fail gate.</p>'
     ) if ret.get("num_cases_with_citations") else ""
 
+    tone_note = (
+        '<p style="font-size:12px;color:#a05a00;background:#fff8e6;'
+        'border:1px solid #f0d080;border-radius:6px;padding:8px 12px;">'
+        '<b>Note on scoring vs required tone/formatting:</b> expected_answer '
+        'is factual content only — it does not include required empathy '
+        'openers, disclaimers, or citation marker syntax ([1], [2], ...) that '
+        'the chatbot is required to add. Citation markers are stripped before '
+        'scoring; judge_fn is explicitly instructed to score factual content '
+        'only and ignore tone/framing. Lexical metrics (token F1, sequence '
+        'similarity) are NOT tone-aware and may still read lower than the '
+        'judge scores on answers with required empathy framing — this is '
+        'expected, not a quality issue; treat judge scores as the more '
+        'reliable signal when the two disagree on a tone-sensitive case.</p>'
+    )
+
+    def _expandable(text: str, max_len: int = 120) -> str:
+        """Truncated by default with a 'show more' toggle — full text
+        is always in the DOM (just hidden), no re-fetch needed, works
+        fully offline."""
+        escaped_full = _esc(text)
+        if len(text) <= max_len:
+            return escaped_full
+        escaped_short = _esc(text[:max_len])
+        return (
+            f'<span class="truncated">{escaped_short}&hellip; '
+            f'<a href="#" class="toggle-link" onclick="'
+            f'this.parentElement.style.display=\'none\';'
+            f'this.parentElement.nextElementSibling.style.display=\'inline\';'
+            f'return false;">show more</a></span>'
+            f'<span class="full" style="display:none;">{escaped_full} '
+            f'<a href="#" class="toggle-link" onclick="'
+            f'this.parentElement.style.display=\'none\';'
+            f'this.parentElement.previousElementSibling.style.display=\'inline\';'
+            f'return false;">show less</a></span>'
+        )
+
     cat_rows = "".join(
         f"<tr><td>{_esc(cat)}</td><td>{stats['num_cases']}</td><td>{stats.get('avg_token_f1', '-')}</td></tr>"
         for cat, stats in agg.get("by_category", {}).items()
@@ -103,8 +161,8 @@ def write_html_report(run: EvalRun, path: str) -> None:
             <td>{_esc(c['id'])}</td>
             <td>{_esc(c['product_category'])}</td>
             <td>{_esc(c['question'])}</td>
-            <td>{_esc(c['expected_answer'][:120])}</td>
-            <td>{_esc(c['actual_answer'][:120])}</td>
+            <td>{_expandable(c['expected_answer'])}</td>
+            <td>{_expandable(c['actual_answer'])}</td>
             <td>{c['generation_scores'].get('token_f1', '-')}</td>
             <td>{c['judge_scores'].get('faithfulness', '-')}</td>
             <td>{c['judge_scores'].get('correctness', '-')}</td>
@@ -131,12 +189,15 @@ table {{ border-collapse: collapse; width: 100%; background: #fff; font-size: 12
 th, td {{ border: 1px solid #e0e0e0; padding: 6px 8px; text-align: left; vertical-align: top; }}
 th {{ background: #f0f0f0; position: sticky; top: 0; }}
 .err-row {{ background: #fff0f0; }}
+.toggle-link {{ font-size: 11px; color: #0066cc; text-decoration: none; white-space: nowrap; }}
+.toggle-link:hover {{ text-decoration: underline; }}
 </style></head>
 <body>
 <h1>Model Evaluation Report</h1>
 <div class="meta">Run ID: {_esc(run.run_id)} &nbsp;|&nbsp; Model: {_esc(run.model_label)}</div>
 <div class="kpis">{kpis}</div>
 {precision_note}
+{tone_note}
 <h2>By category</h2>
 <table><tr><th>Category</th><th>Cases</th><th>Avg token F1</th></tr>{cat_rows}</table>
 <h2>Per-case detail</h2>
