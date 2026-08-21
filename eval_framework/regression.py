@@ -16,7 +16,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from core import EvalRun
+from eval_core import EvalRun
 
 # Metrics where LOWER is better (everything else assumed higher-is-better)
 LOWER_IS_BETTER = {"error_rate", "mean_seconds", "p95_seconds", "max_seconds"}

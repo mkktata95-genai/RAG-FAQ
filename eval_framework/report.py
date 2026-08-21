@@ -16,7 +16,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from core import EvalRun
+from eval_core import EvalRun
 
 
 def _run_to_dict(run: EvalRun) -> dict:
@@ -36,6 +36,7 @@ def _run_to_dict(run: EvalRun) -> dict:
                 "generation_scores": r.generation_scores,
                 "retrieval_scores": r.retrieval_scores,
                 "judge_scores": r.judge_scores,
+                "citations": r.response.citations,
                 "refused": r.response.refused,
                 "cost_usd": r.response.cost_usd,
             }

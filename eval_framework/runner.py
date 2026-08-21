@@ -20,7 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from core import EvalCase, CaseResult, EvalRun, ResponseFn, invoke_response_fn
+from eval_core import EvalCase, CaseResult, EvalRun, ResponseFn, invoke_response_fn
 from metrics_generation import score_generation, EmbedFn
 from metrics_retrieval import score_retrieval
 from metrics_judge import score_with_judge, JudgeFn
