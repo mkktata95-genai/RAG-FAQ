@@ -7,6 +7,42 @@ Two outputs:
     no external assets (safe to email / open offline on VDI).
 
 CHANGE LOG
+v1.5.0 — Aug 2026 | Mukesh Kund
+         Cosmetic redesign — premium/professional visual pass, plus one
+         functional addition:
+         - Threshold-based KPI card color-coding (green/amber/red left
+           border + value color) via new _kpi_class() helper — score
+           metrics: green >=0.8, amber 0.5-0.79, red <0.5 (inverted for
+           error/refusal rate; latency uses its own thresholds). This
+           is functional, not just decorative — bad numbers are now
+           visible at a glance without reading every value.
+         - Full CSS rebuild: navy/teal palette, CSS custom properties,
+           card hover-lift + shadow, table row hover highlight, custom
+           rotating arrow on <details> open/close (pure CSS, no JS),
+           refined typography and spacing. Still fully self-contained
+           (no external fonts/CDN) — stays offline-safe.
+         - precision_note/tone_note/sample_note now use shared
+           .note-amber/.note-green classes instead of duplicated inline
+           styles, for consistency with the new palette.
+         ROLLBACK: revert kpi()/_kpi_class() to the plain version
+         (v1.4.0), revert the <style> block, revert note classes back
+         to inline style="..." strings.
+
+v1.4.0 — Aug 2026 | Mukesh Kund
+         Added _reading_guide_html() — dynamic "How to read this report"
+         section, open by default (unlike the glossary, which stays
+         collapsed), placed above the glossary. Gives priority order for
+         interpreting the dashboard: error rate gate check, judge scores
+         as primary signal, retrieval metrics for root-cause diagnosis
+         (retrieval vs generation problem), precision/lexical metrics as
+         secondary, operational metrics as a separate deployability
+         question. Sample-size caveat is dynamic — reflects the actual
+         num_cases of the run (amber warning below 30 cases, green note
+         above), not a hardcoded number, so it stays accurate whether
+         run against a 3-question smoke test or the full dataset.
+         ROLLBACK: remove _reading_guide_html() and its {reading_guide}
+         placement in write_html_report().
+
 v1.3.0 — Aug 2026 | Mukesh Kund
          Added METRICS_GLOSSARY_HTML — static, plain-language glossary
          covering every metric on the dashboard (including an
@@ -199,6 +235,77 @@ def _esc(s: str) -> str:
     return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
+def _reading_guide_html(num_cases: int) -> str:
+    """Dynamic — the sample-size caveat reflects the actual case count
+    of this specific run, not a hardcoded number."""
+    SMALL_SAMPLE_THRESHOLD = 30
+    if num_cases < SMALL_SAMPLE_THRESHOLD:
+        sample_note = (
+            f'<p class="note-amber">'
+            f'<b>Small sample — {num_cases} case(s):</b> this run is useful to '
+            f'confirm the framework and pipeline are wired correctly end-to-end, '
+            f'but {num_cases} question(s) is not enough to draw a real conclusion '
+            f'about overall chatbot quality. Treat this as a plumbing check, not '
+            f'a verdict. A meaningful quality conclusion needs the full reviewed '
+            f'golden dataset (target: full SME-reviewed set, not a handful of '
+            f'demo questions).</p>'
+        )
+    else:
+        sample_note = (
+            f'<p class="note-green">'
+            f'<b>{num_cases} cases</b> — large enough to draw a meaningful overall '
+            f'conclusion, though still worth checking the by-category breakdown '
+            f'below for any single category that is thin or skewing the average.</p>'
+        )
+
+    return f"""
+<details class="glossary" open>
+<summary>How to read this report — start here</summary>
+<div class="glossary-body">
+<ol style="margin:8px 0 0 18px; padding:0;">
+<li style="margin-bottom:8px;"><b>Check error rate first.</b> If it isn't
+near 0, stop here — that's a technical/plumbing failure (crashes,
+timeouts), not a quality question. Fix that before judging anything
+else below.</li>
+
+<li style="margin-bottom:8px;"><b>Judge scores are the primary quality
+signal</b> — check these before the automated text-matching scores.
+<ul style="margin:6px 0 0 18px;">
+<li><b>Low faithfulness</b> &rarr; hallucination risk. Usually the most
+serious finding for a regulated chatbot — the model stated something not
+backed by its source content.</li>
+<li><b>Low correctness</b> &rarr; wrong or incomplete answers, even if
+not fabricated.</li>
+<li><b>Low answer relevance</b> &rarr; answering a different question
+than what was asked.</li>
+<li><b>Low context relevance</b> &rarr; points at <i>retrieval</i>, not
+generation — the model was handed bad content to work with.</li>
+</ul></li>
+
+<li style="margin-bottom:8px;"><b>Use retrieval metrics to locate WHERE a
+problem comes from, not just whether one exists.</b> Low judge scores +
+low hit rate/recall &rarr; retrieval is the root cause, fix the search/
+index. Low judge scores + high hit rate/recall &rarr; the right content
+was found but poorly used — that's a generation/prompt problem instead.
+This is the most useful diagnostic split this report gives you.</li>
+
+<li style="margin-bottom:8px;"><b>Treat precision, token F1, and semantic
+similarity as secondary checks</b>, not headline numbers — see the two
+amber notes below for why they can read artificially low even on a
+genuinely good answer. Use them to flag something worth a closer look,
+not to conclude something on their own.</li>
+
+<li style="margin-bottom:0;"><b>Operational metrics (refusal rate, cost,
+latency) answer a different question: "is this deployable," not "is this
+correct."</b> A technically perfect answer that's too slow or too
+expensive is still a real problem — just a different category of one.</li>
+</ol>
+</div>
+</details>
+{sample_note}
+"""
+
+
 def write_html_report(run: EvalRun, path: str) -> None:
     d = _run_to_dict(run)
     agg = d["aggregate"]
@@ -207,9 +314,47 @@ def write_html_report(run: EvalRun, path: str) -> None:
     lat = agg.get("latency", {})
     judge = agg.get("judge", {})
     op = agg.get("operational", {})
+    reading_guide = _reading_guide_html(agg.get("num_cases", 0))
+
+    def _kpi_class(label: str, value) -> str:
+        """Threshold-based color coding. Score metrics (0-1 range,
+        higher=better): green >=0.8, amber 0.5-0.79, red <0.5.
+        Rate metrics where lower=better (error/refusal rate): inverted.
+        Latency: green <10s, amber 10-30s, red >30s. Everything else
+        (cases count, cost) stays neutral — no semantic "good/bad"
+        threshold to apply."""
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return "neutral"
+        lower_is_better = {"Error rate", "Refusal rate"}
+        if label in lower_is_better:
+            if v <= 0.05:
+                return "good"
+            if v <= 0.2:
+                return "warn"
+            return "bad"
+        if "latency" in label.lower():
+            if v < 10:
+                return "good"
+            if v <= 30:
+                return "warn"
+            return "bad"
+        if label in {"Cases", "Avg cost/query ($)"}:
+            return "neutral"
+        # remaining are 0-1 score metrics, higher = better
+        if 0.0 <= v <= 1.0:
+            if v >= 0.8:
+                return "good"
+            if v >= 0.5:
+                return "warn"
+            return "bad"
+        return "neutral"
 
     def kpi(label, value):
-        return f'<div class="kpi"><div class="kpi-val">{_esc(value)}</div><div class="kpi-label">{_esc(label)}</div></div>'
+        cls = _kpi_class(label, value)
+        return (f'<div class="kpi kpi-{cls}"><div class="kpi-val">{_esc(value)}</div>'
+                f'<div class="kpi-label">{_esc(label)}</div></div>')
 
     kpis = "".join([
         kpi("Cases", agg.get("num_cases", 0)),
@@ -229,8 +374,7 @@ def write_html_report(run: EvalRun, path: str) -> None:
         kpi("P95 latency (s)", lat.get("p95_seconds", "-")),
     ])
     precision_note = (
-        '<p style="font-size:12px;color:#a05a00;background:#fff8e6;'
-        'border:1px solid #f0d080;border-radius:6px;padding:8px 12px;">'
+        '<p class="note-amber">'
         '<b>Note on precision:</b> the golden dataset records one known-relevant '
         'chunk per question. Answers that cite more than one source will show '
         'lower precision even when the extra citations are legitimate — those '
@@ -240,8 +384,7 @@ def write_html_report(run: EvalRun, path: str) -> None:
     ) if ret.get("num_cases_with_citations") else ""
 
     tone_note = (
-        '<p style="font-size:12px;color:#a05a00;background:#fff8e6;'
-        'border:1px solid #f0d080;border-radius:6px;padding:8px 12px;">'
+        '<p class="note-amber">'
         '<b>Note on scoring vs required tone/formatting:</b> expected_answer '
         'is factual content only — it does not include required empathy '
         'openers, disclaimers, or citation marker syntax ([1], [2], ...) that '
@@ -301,32 +444,98 @@ def write_html_report(run: EvalRun, path: str) -> None:
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Eval Report — {_esc(run.model_label)}</title>
 <style>
-body {{ font-family: -apple-system, Segoe UI, Arial, sans-serif; margin: 24px; color: #1a1a1a; background: #fafafa; }}
-h1 {{ font-size: 20px; }}
-h2 {{ font-size: 15px; margin-top: 32px; }}
-.meta {{ color: #666; font-size: 13px; margin-bottom: 20px; }}
+:root {{
+  --navy: #0b1f3a;
+  --navy-light: #16305a;
+  --accent: #0d6e6e;
+  --accent-light: #e6f4f4;
+  --good: #1a7f37;
+  --good-bg: #eafaf0;
+  --good-border: #b8e6c8;
+  --warn: #9a6700;
+  --warn-bg: #fff8e6;
+  --warn-border: #f0d080;
+  --bad: #c02626;
+  --bad-bg: #fdecec;
+  --bad-border: #f3bcbc;
+  --neutral-bg: #ffffff;
+  --border: #e2e5eb;
+  --text: #1c2430;
+  --text-muted: #66707e;
+  --bg: #f4f6f9;
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  font-family: -apple-system, "Segoe UI", "Helvetica Neue", Roboto, Arial, sans-serif;
+  margin: 0; padding: 32px 40px 60px;
+  color: var(--text); background: var(--bg);
+  line-height: 1.45;
+}}
+h1 {{ font-size: 22px; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 4px; color: var(--navy); }}
+h2 {{ font-size: 15px; font-weight: 700; margin: 36px 0 12px; color: var(--navy); letter-spacing: -0.005em; }}
+.meta {{ color: var(--text-muted); font-size: 13px; margin-bottom: 24px; }}
+.meta b {{ color: var(--text); font-weight: 600; }}
+
 .kpis {{ display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 24px; }}
-.kpi {{ background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px 18px; min-width: 120px; }}
-.kpi-val {{ font-size: 22px; font-weight: 600; }}
-.kpi-label {{ font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: .03em; }}
-table {{ border-collapse: collapse; width: 100%; background: #fff; font-size: 12px; }}
-th, td {{ border: 1px solid #e0e0e0; padding: 6px 8px; text-align: left; vertical-align: top; }}
-th {{ background: #f0f0f0; position: sticky; top: 0; }}
-.err-row {{ background: #fff0f0; }}
-.toggle-link {{ font-size: 11px; color: #0066cc; text-decoration: none; white-space: nowrap; }}
+.kpi {{
+  background: var(--neutral-bg); border: 1px solid var(--border); border-radius: 10px;
+  padding: 14px 20px; min-width: 128px;
+  box-shadow: 0 1px 2px rgba(16,24,40,0.04);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  border-left: 4px solid var(--border);
+}}
+.kpi:hover {{ transform: translateY(-2px); box-shadow: 0 6px 16px rgba(16,24,40,0.08); }}
+.kpi-good {{ border-left-color: var(--good); }}
+.kpi-good .kpi-val {{ color: var(--good); }}
+.kpi-warn {{ border-left-color: var(--warn); }}
+.kpi-warn .kpi-val {{ color: var(--warn); }}
+.kpi-bad {{ border-left-color: var(--bad); }}
+.kpi-bad .kpi-val {{ color: var(--bad); }}
+.kpi-neutral {{ border-left-color: var(--navy-light); }}
+.kpi-val {{ font-size: 23px; font-weight: 700; letter-spacing: -0.01em; color: var(--navy); }}
+.kpi-label {{ font-size: 10.5px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .04em; margin-top: 3px; font-weight: 600; }}
+
+table {{ border-collapse: collapse; width: 100%; background: var(--neutral-bg); font-size: 12.5px; border-radius: 10px; overflow: hidden; box-shadow: 0 1px 2px rgba(16,24,40,0.04); }}
+th, td {{ border-bottom: 1px solid var(--border); padding: 9px 12px; text-align: left; vertical-align: top; }}
+th {{ background: var(--navy); color: #fff; font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: .03em; position: sticky; top: 0; }}
+tbody tr {{ transition: background-color 0.1s ease; }}
+tbody tr:hover {{ background-color: var(--accent-light); }}
+.err-row {{ background: var(--bad-bg); }}
+.err-row:hover {{ background-color: var(--bad-bg); }}
+
+.toggle-link {{ font-size: 11px; color: var(--accent); text-decoration: none; white-space: nowrap; font-weight: 600; }}
 .toggle-link:hover {{ text-decoration: underline; }}
-.glossary {{ margin-bottom: 24px; background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px 16px; }}
-.glossary summary {{ cursor: pointer; font-weight: 600; font-size: 14px; }}
-.glossary-body {{ margin-top: 14px; font-size: 13px; line-height: 1.5; }}
-.glossary-table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
-.glossary-table th, .glossary-table td {{ border: 1px solid #e0e0e0; padding: 8px 10px; text-align: left; vertical-align: top; font-size: 12px; }}
-.glossary-table th {{ background: #f0f0f0; }}
-.glossary-table td:first-child {{ white-space: nowrap; width: 160px; }}
+
+.glossary {{
+  margin-bottom: 18px; background: var(--neutral-bg); border: 1px solid var(--border);
+  border-radius: 10px; padding: 16px 20px; box-shadow: 0 1px 2px rgba(16,24,40,0.04);
+}}
+.glossary summary {{
+  cursor: pointer; font-weight: 700; font-size: 14px; color: var(--navy);
+  list-style: none; display: flex; align-items: center; gap: 8px;
+}}
+.glossary summary::-webkit-details-marker {{ display: none; }}
+.glossary summary::before {{
+  content: "▸"; display: inline-block; color: var(--accent); font-size: 12px;
+  transition: transform 0.15s ease;
+}}
+.glossary[open] summary::before {{ transform: rotate(90deg); }}
+.glossary summary:hover {{ color: var(--accent); }}
+.glossary-body {{ margin-top: 16px; font-size: 13px; line-height: 1.6; }}
+.glossary-table {{ width: 100%; border-collapse: collapse; margin-top: 12px; }}
+.glossary-table th, .glossary-table td {{ border: 1px solid var(--border); padding: 9px 11px; text-align: left; vertical-align: top; font-size: 12px; }}
+.glossary-table th {{ background: var(--navy); color: #fff; }}
+.glossary-table tr:nth-child(even) td {{ background: #fafbfc; }}
+.glossary-table td:first-child {{ white-space: nowrap; width: 170px; font-weight: 600; color: var(--navy); }}
+
+.note-amber {{ font-size: 12.5px; color: var(--warn); background: var(--warn-bg); border: 1px solid var(--warn-border); border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; }}
+.note-green {{ font-size: 12.5px; color: var(--good); background: var(--good-bg); border: 1px solid var(--good-border); border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; }}
 </style></head>
 <body>
 <h1>Model Evaluation Report</h1>
-<div class="meta">Run ID: {_esc(run.run_id)} &nbsp;|&nbsp; Model: {_esc(run.model_label)}</div>
+<div class="meta">Run ID: <b>{_esc(run.run_id)}</b> &nbsp;|&nbsp; Model: <b>{_esc(run.model_label)}</b></div>
 <div class="kpis">{kpis}</div>
+{reading_guide}
 {METRICS_GLOSSARY_HTML}
 {precision_note}
 {tone_note}
