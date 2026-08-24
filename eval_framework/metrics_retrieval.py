@@ -13,6 +13,17 @@ their own internal doc id — as long as the golden dataset's
 relevant_ids uses the same identifier space as the citations returned.
 
 CHANGE LOG
+v1.1.0 — Aug 2026 | Mukesh Kund
+         Fix: score_retrieval() now also returns {} (N/A) when
+         relevant_ids is empty, not just when citations is empty. Found
+         while discussing handover to a team whose golden dataset might
+         have neither source_url nor chunk_id set — without this guard,
+         a response_fn returning real citations against a dataset with
+         no ground truth would score as 0.0/False across all retrieval
+         metrics, misleadingly looking like total retrieval failure
+         rather than "not applicable, no ground truth to check against."
+         ROLLBACK: revert condition to `if not citations:` only.
+
 v1.0.0 — Aug 2026 | Mukesh Kund — initial version.
 """
 
@@ -59,8 +70,14 @@ def reciprocal_rank(relevant_ids: list[str], citations: list[str]) -> float:
 
 def score_retrieval(relevant_ids: list[str], citations: list[str], k: int = 5) -> dict:
     """Returns all applicable retrieval metrics for one case.
-    Returns empty dict if no citations were provided (metric N/A, not 0 —
-    avoids silently penalising response_fns that don't expose citations).
+    Returns empty dict (metric N/A, not 0) if EITHER side is missing:
+      - no citations were provided by response_fn, OR
+      - no relevant_ids exist for this case (golden dataset has neither
+        source_url nor chunk_id set — there's no ground truth to check
+        against, so scoring would be meaningless 0s/False that look like
+        retrieval failure rather than "not applicable here").
+    This avoids silently penalising response_fns or datasets that don't
+    expose one side or the other.
 
     IMPORTANT: the golden dataset records exactly ONE known-relevant chunk
     per question (by construction — each seed question was generated from
@@ -75,7 +92,7 @@ def score_retrieval(relevant_ids: list[str], citations: list[str], k: int = 5) -
     Treat `precision_at_k` as informational only — do not gate release
     decisions on it without a manual look at the flagged cases.
     """
-    if not citations:
+    if not citations or not relevant_ids:
         return {}
     return {
         "hit": hit(relevant_ids, citations),
