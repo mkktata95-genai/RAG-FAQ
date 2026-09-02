@@ -1,0 +1,51 @@
+Analyze this Microsoft Agent Framework (MAF) chatbot codebase and produce a structured technical summary covering:
+
+0. FRAMEWORK IDENTIFICATION (answer first, before anything else)
+Inspect the dependency manifest (requirements.txt/pyproject.toml) and imports across the codebase.
+State explicitly: which orchestration framework is actually used (Microsoft Agent Framework, LangGraph, LangChain, raw SDK calls, custom orchestration, or other)? 
+Quote the actual import lines / package names as evidence. Do not assume — verify from code.
+
+1. ARCHITECTURE
+List all agents/nodes, their responsibilities, and how they're orchestrated (MAF equivalent of a graph/state machine). Map this against a pipeline with these logical stages: intent classification → retrieval → generation → output safety. Show the orchestration/setup code that wires agents together.
+
+2. FILE INVENTORY
+For every source file: filename, purpose (1 line), key functions/classes, inputs/outputs.
+
+3. STATE MANAGEMENT
+How is conversation/agent state defined and passed between agents (equivalent of an AgentState/schemas.py)? Show the full schema/type definitions as code.
+
+4. MODEL ROUTING
+Which model deployment is used at each stage (intent classification, main generation, fast-path/HQA), and how are per-model client configs (temperature, max_completion_tokens, etc.) set? Show model client init code.
+
+5. RETRIEVAL INTEGRATION
+How is Azure AI Search called — index name(s), query construction, filters, and how retrieved chunks map back to citations in the final response? Show the actual retrieval call code.
+
+6. FULL AZURE SERVICE INVENTORY
+Every Azure resource touched (AI Search, OpenAI/Foundry, Redis, Cosmos DB, Content Safety, Key Vault, etc.) — connection setup, SDK client init code, and env vars/config keys used per service.
+
+7. AUTH PATTERN
+Confirm whether DefaultAzureCredential (or equivalent) is used uniformly across all services. Flag any deviations (API keys, connection strings, etc.) and where they live (env vars, Key Vault, hardcoded).
+
+8. CACHING LAYER
+If a semantic/Redis cache exists: show cache-check and cache-write logic, and where it sits relative to the agent calls (before retrieval? before generation?).
+
+9. PII / SAFETY LAYER
+Where does PII detection (e.g. Presidio) and content safety run in the flow? Which entity types/thresholds are configured? Show the relevant call sites.
+
+10. ENTRY POINT / DEPLOYMENT
+How is this served (FastAPI / Azure Function / Container App)? Show the top-level server/main file and the exact route/function that receives a user question and returns a response.
+
+11. EXTENSIBILITY HOOK FOR EVAL
+Is there (or could there cleanly be) a single function that takes a question string and returns {answer, citations, retrieved_chunks, token_usage} for external evaluation harnesses to call? Show the closest existing entry point, or state clearly if none exists.
+
+12. DEPENDENCY MANIFEST
+Full requirements.txt / pyproject.toml contents — MAF package(s) and versions, Azure SDK packages and versions, any other key libraries.
+
+13. DIFFERENCES FROM A LANGGRAPH-STYLE PIPELINE
+Call out anywhere MAF's execution model (e.g. function-calling agents vs. explicit graph edges/nodes) changes assumptions around determinism, streaming, error handling, or retries.
+
+OUTPUT FORMAT
+- Markdown, organized under the numbered headings above.
+- Show actual code for anything structural (state schema, orchestration/agent setup, model client init, retrieval call, cache logic, safety call sites, server route). Do not paraphrase this code in prose.
+- Business logic (prompt wording, minor helper functions) can be summarized in 1 line each — don't dump full prose explanations.
+- If something isn't present in the codebase (e.g. no caching layer), say "Not present" rather than omitting the section.
