@@ -49,3 +49,13 @@ OUTPUT FORMAT
 - Show actual code for anything structural (state schema, orchestration/agent setup, model client init, retrieval call, cache logic, safety call sites, server route). Do not paraphrase this code in prose.
 - Business logic (prompt wording, minor helper functions) can be summarized in 1 line each — don't dump full prose explanations.
 - If something isn't present in the codebase (e.g. no caching layer), say "Not present" rather than omitting the section.
+
+
+---------------------------
+
+Search for how Agent.run() itself is invoked, and check whether it uses 
+contextvars.Context.run() or contextvars.copy_context().run() anywhere 
+in agent.py or _tools.py — specifically anything that would create a 
+fresh isolated context per agent.run() call, separate from the 
+tool-dispatch code already reviewed. Also check what agent.reset() does 
+and whether it touches context state at all.
