@@ -7,6 +7,22 @@ direction beyond a threshold, so this can gate a release without a
 human reading the full report every time.
 
 CHANGE LOG
+v1.1.0 — Sep 2026 | Mukesh Kund
+         Fix: cost metrics were never in LOWER_IS_BETTER, so a cost
+         INCREASE (avg_cost_usd, total_cost_usd, and the new
+         judge_cost_usd from run_eval.py v2.2.2) was being flagged as
+         "improved" — anything not explicitly in the set defaults to
+         higher-is-better. Added "cost_usd" as a suffix match, covering
+         all three keys in one entry (LOWER_IS_BETTER already does
+         suffix matching via key.endswith(suffix) in
+         compare_to_baseline(), no other logic changed). Found while
+         checking whether judge_cost_usd needed regression.py changes —
+         pre-existing bug, not introduced by the judge-cost work, but
+         would have affected the new metric identically if left alone.
+         ROLLBACK: remove "cost_usd" from LOWER_IS_BETTER — restores
+         the pre-existing (buggy) behavior for all three cost metrics,
+         not just judge_cost_usd.
+
 v1.0.0 — Aug 2026 | Mukesh Kund — initial version.
 """
 
@@ -18,8 +34,14 @@ from pathlib import Path
 
 from eval_core import EvalRun
 
-# Metrics where LOWER is better (everything else assumed higher-is-better)
-LOWER_IS_BETTER = {"error_rate", "mean_seconds", "p95_seconds", "max_seconds"}
+# Metrics where LOWER is better (everything else assumed higher-is-better).
+# "cost_usd" is a suffix match — covers operational.avg_cost_usd,
+# total_cost_usd, and judge_cost_usd in one entry. Pre-existing gap found
+# Sep 2026 while wiring in judge_cost_usd: cost metrics were never in this
+# set, so a cost INCREASE was being flagged as "improved" (anything not
+# in LOWER_IS_BETTER is treated as higher-is-better). Applied retroactively
+# to avg_cost_usd/total_cost_usd too, not just the new judge_cost_usd.
+LOWER_IS_BETTER = {"error_rate", "mean_seconds", "p95_seconds", "max_seconds", "cost_usd"}
 
 
 def save_baseline(run: EvalRun, path: str) -> None:

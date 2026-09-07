@@ -7,6 +7,28 @@ Two outputs:
     no external assets (safe to email / open offline on VDI).
 
 CHANGE LOG
+v1.6.0 — Sep 2026 | Mukesh Kund
+         Added Judge cost ($) KPI card, reading from the new
+         agg["operational"]["judge_cost_usd"] key that run_eval.py
+         v2.2.2 now injects into run.aggregate before write_html_report/
+         write_json_report are called (previously judge cost was only
+         printed to console after both reports were already written —
+         never reached either file). Kept as a separate KPI from "Avg
+         cost/query ($)" since it's a run-level evaluation cost, not a
+         per-query production cost — judge is called multiple times per
+         case (one per metric). Added to the neutral (non color-coded)
+         KPI set alongside Cases/Avg cost per query, since there's no
+         green/amber/red threshold that applies to a cost number.
+         Added a glossary row and a reading-guide clarification so a
+         non-technical reader doesn't read it as part of production
+         cost. JSON report needs no separate change — write_json_report
+         dumps run.aggregate as-is, so it appears automatically once
+         run_eval.py populates the key.
+         ROLLBACK: remove "Judge cost ($)" from the kpis list and from
+         _kpi_class's neutral set, remove the glossary row, and revert
+         the reading-guide bullet's last sentence. No other logic
+         changed.
+
 v1.5.0 — Aug 2026 | Mukesh Kund
          Cosmetic redesign — premium/professional visual pass, plus one
          functional addition:
@@ -182,6 +204,16 @@ current model pricing.</td>
 <td>A longer, more detailed answer costs more in output tokens than a
 short one — this tracks that real spend.</td></tr>
 
+<tr><td><b>Judge cost</b></td>
+<td>Total cost of running the LLM-as-judge scoring itself for this whole
+run — a separate cost from the chatbot being tested. The judge model
+reads and scores every answer (often multiple calls per question, one
+per metric), so this is a one-off cost of running the evaluation, not a
+per-query production cost.</td>
+<td>100 questions scored on faithfulness, correctness, and relevance
+&rarr; up to 300 judge calls, billed at the judge model's own rate,
+separate from what the chatbot itself cost to run.</td></tr>
+
 <tr><td><b>Latency (mean / P95)</b></td>
 <td>How long, in seconds, the chatbot took to respond. P95 shows the
 slower end of typical responses — 95% of queries were faster than this.</td>
@@ -298,7 +330,9 @@ not to conclude something on their own.</li>
 <li style="margin-bottom:0;"><b>Operational metrics (refusal rate, cost,
 latency) answer a different question: "is this deployable," not "is this
 correct."</b> A technically perfect answer that's too slow or too
-expensive is still a real problem — just a different category of one.</li>
+expensive is still a real problem — just a different category of one.
+Note judge cost is separate from avg cost/query: it's the one-off cost
+of running this evaluation, not a per-query production cost.</li>
 </ol>
 </div>
 </details>
@@ -340,7 +374,7 @@ def write_html_report(run: EvalRun, path: str) -> None:
             if v <= 30:
                 return "warn"
             return "bad"
-        if label in {"Cases", "Avg cost/query ($)"}:
+        if label in {"Cases", "Avg cost/query ($)", "Judge cost ($)"}:
             return "neutral"
         # remaining are 0-1 score metrics, higher = better
         if 0.0 <= v <= 1.0:
@@ -370,6 +404,7 @@ def write_html_report(run: EvalRun, path: str) -> None:
         kpi("MRR", ret.get("mrr", "n/a")),
         kpi("Refusal rate", op.get("refusal_rate", "n/a")),
         kpi("Avg cost/query ($)", op.get("avg_cost_usd", "n/a")),
+        kpi("Judge cost ($)", op.get("judge_cost_usd", "n/a")),
         kpi("Mean latency (s)", lat.get("mean_seconds", "-")),
         kpi("P95 latency (s)", lat.get("p95_seconds", "-")),
     ])
