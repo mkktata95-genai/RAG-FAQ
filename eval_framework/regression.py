@@ -7,6 +7,18 @@ direction beyond a threshold, so this can gate a release without a
 human reading the full report every time.
 
 CHANGE LOG
+v1.1.1 — Sep 2026 | Mukesh Kund
+         Added the missing "Unchanged metrics:" print block in
+         print_regression_summary() — RegressionResult.unchanged was
+         always correctly populated by compare_to_baseline() but never
+         printed; only degraded/improved were. Same pattern as those
+         two blocks, same entry dict keys (metric/baseline/current/
+         delta_pct). Pre-existing gap from v1.0.0, not something the
+         v1.1.0 cost-metric fix touched.
+         ROLLBACK: remove the `if result.unchanged:` block —
+         result.unchanged remains populated and usable programmatically
+         either way, this only affects console output.
+
 v1.1.0 — Sep 2026 | Mukesh Kund
          Fix: cost metrics were never in LOWER_IS_BETTER, so a cost
          INCREASE (avg_cost_usd, total_cost_usd, and the new
@@ -116,4 +128,8 @@ def print_regression_summary(result: RegressionResult) -> None:
     if result.improved:
         print("\nImproved metrics:")
         for e in result.improved:
+            print(f"  - {e['metric']}: {e['baseline']} -> {e['current']} ({e['delta_pct']})")
+    if result.unchanged:
+        print("\nUnchanged metrics:")
+        for e in result.unchanged:
             print(f"  - {e['metric']}: {e['baseline']} -> {e['current']} ({e['delta_pct']})")
