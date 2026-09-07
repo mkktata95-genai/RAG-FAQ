@@ -59,3 +59,35 @@ in agent.py or _tools.py — specifically anything that would create a
 fresh isolated context per agent.run() call, separate from the 
 tool-dispatch code already reviewed. Also check what agent.reset() does 
 and whether it touches context state at all.
+
+------------------------------------
+
+Trace SMOKE-003's source_url ("https://www.royallondon.com/isa/stocksandsharesisa")
+back through the pipeline to find where it was set incorrectly:
+
+1. Open sample_golden_dataset.json and find the SMOKE-003 row. Show its
+   exact source_url and chunk_id fields.
+
+2. Search build_golden_dataset_seed.py, build_golden_dataset_from_urls.py,
+   and curate_golden_dataset_subset.py for how source_url gets populated
+   for ISA rows — was it scraped, copy-pasted from a list, or hand-typed?
+
+3. Check validate_urlsV2.py or wherever the 297-URL approved list lives —
+   is "https://www.royallondon.com/isa/stocksandsharesisa" actually IN
+   the approved list at all? If it isn't, that's the root cause: the
+   golden dataset references a URL that was never a valid scrape target.
+
+4. Search the actual scraped/indexed content (whatever local cache or
+   index dump is available) for a chunk whose source_url is
+   "stocksandsharesisa" — does it exist anywhere in what was actually
+   indexed into rlg-faq-index-v5, or only in the golden dataset?
+
+5. Don't touch metrics_retrieval.py's matching logic — confirm first
+   whether this is an isolated bad row or a systemic pattern: grep
+   sample_golden_dataset.json for any other source_url values that
+   don't appear in the approved URL list, so we know if this is a
+   one-off typo or a batch-generation problem affecting more rows.
+
+Report back: is stocksandsharesisa in the approved list, does it exist
+in the index, and how many other golden dataset rows show the same
+not-in-approved-list pattern.
