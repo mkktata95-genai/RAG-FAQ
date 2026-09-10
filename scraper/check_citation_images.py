@@ -28,7 +28,11 @@ from collections import defaultdict
 SAMPLE_URLS = [
     "https://www.royallondon.com/about-us/how-we-are-run/governance-and-leadership-teams/group-executive-committee/",
     "https://www.royallondon.com/about-us/our-purpose/social-impact/changemakers/meet-the-changemakers/",
-    # add more page templates here: a pension product page, an FAQ page, an insurance page, etc.
+    "https://www.royallondon.com/existing-customers/help-and-support/find-a-lost-pension/",
+    "https://www.royallondon.com/existing-customers/help-and-support/update-your-details/pension-plan/",
+    "https://www.royallondon.com/pensions/",
+    "https://www.royallondon.com/retirement-planning/retirement-guidance/in-retirement/",
+    "https://www.royallondon.com/pensions/investment-options/fund-prices/rlmis-climate-reporting/",
 ]
 
 HEADERS = {
@@ -39,10 +43,54 @@ OG_IMAGE_RE = re.compile(
     r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
     re.IGNORECASE,
 )
-BANNER_CSS_RE = re.compile(
+
+# OLD (buggy) regex — kept only so this script can report which pages it
+# was silently missing. [^)]* stops at the FIRST ")" it sees, which is the
+# closing paren of a nested rgba(...) inside a linear-gradient(...) overlay
+# — a very common real-world pattern for hero banners. Confirmed this
+# actually failed on the GEC page's real gradient-overlay CSS.
+BANNER_CSS_RE_OLD = re.compile(
     r'background-image:\s*(?:linear-gradient\([^)]*\)\s*,\s*)?url\(([^)]+\.(?:jpg|jpeg|png))\)',
     re.IGNORECASE,
 )
+
+# NEW (fixed) approach: isolate the whole "background-image: ...;"
+# declaration first, then take the LAST url(...) inside it — the actual
+# photo is always the final layer after any gradient overlays, regardless
+# of how many gradients or how deeply nested their parens are.
+_DECLARATION_RE = re.compile(r'background-image:\s*([^;]+);', re.IGNORECASE)
+_URL_RE = re.compile(
+    r'url\(\s*[\'"]?([^\'")]+\.(?:jpg|jpeg|png|webp))[\'"]?\s*\)',
+    re.IGNORECASE,
+)
+
+
+def extract_banner_images_fixed(html: str) -> list:
+    """Returns deduped list of banner image relative paths using the fixed logic."""
+    matches = []
+    seen = set()
+    for decl_match in _DECLARATION_RE.finditer(html):
+        declaration = decl_match.group(1)
+        urls_in_declaration = _URL_RE.findall(declaration)
+        if not urls_in_declaration:
+            continue
+        rel_path = urls_in_declaration[-1]
+        if rel_path not in seen:
+            seen.add(rel_path)
+            matches.append(rel_path)
+    return matches
+
+
+def extract_banner_images_old(html: str) -> list:
+    """Returns deduped list using the OLD buggy regex, for comparison only."""
+    matches = []
+    seen = set()
+    for m in BANNER_CSS_RE_OLD.finditer(html):
+        img = m.group(1)
+        if img not in seen:
+            seen.add(img)
+            matches.append(img)
+    return matches
 
 
 GENERIC_IMAGE_PATTERNS = [
@@ -59,7 +107,13 @@ def is_generic(image_url: str) -> bool:
 
 
 def check_url(url: str) -> dict:
-    result = {"url": url, "og_images": [], "banner_images": [], "error": None}
+    result = {
+        "url": url,
+        "og_images": [],
+        "banner_images": [],
+        "banner_images_old_regex": [],
+        "error": None,
+    }
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
@@ -78,13 +132,8 @@ def check_url(url: str) -> dict:
             seen_og.add(img)
             result["og_images"].append({"url": img, "generic": is_generic(img)})
 
-    # dedupe banner matches, keep order
-    seen = set()
-    for m in BANNER_CSS_RE.finditer(html):
-        img = m.group(1)
-        if img not in seen:
-            seen.add(img)
-            result["banner_images"].append(img)
+    result["banner_images"] = extract_banner_images_fixed(html)
+    result["banner_images_old_regex"] = extract_banner_images_old(html)
 
     return result
 
@@ -127,11 +176,20 @@ def main():
         else:
             print(f"  og:image tags : (none found)")
         if r["banner_images"]:
-            print(f"  banner images : {len(r['banner_images'])} found")
+            print(f"  banner images (FIXED regex) : {len(r['banner_images'])} found")
             for img in r["banner_images"]:
                 print(f"    - {img}")
         else:
-            print(f"  banner images : (none found)")
+            print(f"  banner images (FIXED regex) : (none found)")
+
+        old_count = len(r["banner_images_old_regex"])
+        new_count = len(r["banner_images"])
+        if old_count < new_count:
+            missed = set(r["banner_images"]) - set(r["banner_images_old_regex"])
+            print(f"  ^^ OLD regex would have found only {old_count}/{new_count} "
+                  f"— MISSED (gradient-overlay case):")
+            for img in missed:
+                print(f"       - {img}")
 
     print("\n" + "=" * 90)
     print("REUSE CHECK (image URL -> pages using it)")
@@ -160,12 +218,17 @@ def main():
     )
     og_has_duplicates = sum(1 for r in results if len(r["og_images"]) > 1)
     banner_found = sum(1 for r in results if r["banner_images"])
+    pages_old_regex_missed = sum(
+        1 for r in results if len(r["banner_images_old_regex"]) < len(r["banner_images"])
+    )
 
     print(f"URLs checked                 : {total}")
     print(f"og:image tag present         : {og_found}/{total}")
     print(f"og:image ALL generic         : {og_all_generic}/{og_found} (logo/teaser, not page-specific)")
     print(f"pages with duplicate og:image: {og_has_duplicates}/{total}")
     print(f"CSS banner image present     : {banner_found}/{total}")
+    print(f"pages OLD regex undercounted : {pages_old_regex_missed}/{total} "
+          f"(gradient-overlay banners silently missed before the fix)")
     print()
     print("Read this as: if og:image is present but flagged GENERIC on most pages,")
     print("og:image is not usable as a page-specific citation thumbnail on this site")
