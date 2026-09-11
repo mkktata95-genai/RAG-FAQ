@@ -50,18 +50,52 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0 Safari/537.36"
 }
 
+_BANNER_ANCHOR_RE = re.compile(
+    r'id=["\'](?:feature|hero)banner(?:block)?\d+["\']', re.IGNORECASE
+)
 _DECLARATION_RE = re.compile(r'background-image:\s*([^;]+);', re.IGNORECASE)
 _URL_RE = re.compile(
     r'url\(\s*[\'"]?([^\'")]+\.(?:jpg|jpeg|png|webp))[\'"]?\s*\)',
     re.IGNORECASE,
 )
+_SOURCE_TAG_RE = re.compile(r'<source\b[^>]*>', re.IGNORECASE)
+_SRCSET_RE = re.compile(
+    r'srcset=["\']([^"\']+\.(?:jpg|jpeg|png|webp))["\']', re.IGNORECASE
+)
 SIZE_TIER_PREFERENCE = ["medium-1000x570", "small-800x800", "large-1200x700"]
+_WINDOW_FALLBACK_SIZE = 8000
 
 
-def extract_base_image_url(html: str, page_url: str) -> Optional[str]:
+def _get_banner_window(html: str) -> Optional[str]:
+    anchor = _BANNER_ANCHOR_RE.search(html)
+    if not anchor:
+        return None
+    start = anchor.end()
+    next_container = html.find('<div class="container', start + 100)
+    end = next_container if next_container != -1 else start + _WINDOW_FALLBACK_SIZE
+    return html[start:end]
+
+
+def _extract_from_picture(window: str) -> Optional[str]:
+    candidates = []
+    for tag in _SOURCE_TAG_RE.findall(window):
+        srcset_match = _SRCSET_RE.search(tag)
+        if not srcset_match:
+            continue
+        has_media = "media=" in tag.lower()
+        candidates.append((srcset_match.group(1), has_media))
+    if not candidates:
+        return None
+    for path, has_media in candidates:
+        if not has_media:
+            return path
+    return candidates[0][0]
+
+
+def _extract_from_css_banner(window: str) -> Optional[str]:
     matches = []
     seen = set()
-    for decl_match in _DECLARATION_RE.finditer(html):
+    for decl_match in _DECLARATION_RE.finditer(window):
         declaration = decl_match.group(1)
         urls_in_declaration = _URL_RE.findall(declaration)
         if not urls_in_declaration:
@@ -70,22 +104,32 @@ def extract_base_image_url(html: str, page_url: str) -> Optional[str]:
         if rel_path not in seen:
             seen.add(rel_path)
             matches.append(rel_path)
-
     if not matches:
         return None
-
-    chosen = None
     for tier in SIZE_TIER_PREFERENCE:
         for rel_path in matches:
             if tier in rel_path:
-                chosen = rel_path
-                break
-        if chosen:
-            break
-    if not chosen:
-        chosen = matches[0]
+                return rel_path
+    return matches[0]
 
-    return urljoin(page_url, chosen)
+
+def extract_base_image_url(html: str, page_url: str) -> Optional[str]:
+    """
+    Scoped to the actual banner container (id="featurebanner*" or
+    "herobannerblock*"). Supports both the CSS background-image template
+    and the <picture><source srcset> template. Does NOT fall back to
+    scanning the rest of the page if the banner container has no image.
+    """
+    window = _get_banner_window(html)
+    if window is None:
+        return None
+    picture_result = _extract_from_picture(window)
+    if picture_result:
+        return urljoin(page_url, picture_result)
+    css_result = _extract_from_css_banner(window)
+    if css_result:
+        return urljoin(page_url, css_result)
+    return None
 
 
 def fetch_image_for_url(url: str) -> Optional[str]:

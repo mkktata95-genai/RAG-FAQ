@@ -54,22 +54,70 @@ BANNER_CSS_RE_OLD = re.compile(
     re.IGNORECASE,
 )
 
-# NEW (fixed) approach: isolate the whole "background-image: ...;"
-# declaration first, then take the LAST url(...) inside it — the actual
-# photo is always the final layer after any gradient overlays, regardless
-# of how many gradients or how deeply nested their parens are.
+# NEW (v3, fixed) approach: scope extraction to the actual banner
+# CONTAINER (id="featurebanner*" or "herobannerblock*"), not the whole
+# page. v2 scanned the whole page for ANY background-image, which meant
+# on pages using the newer <picture><source srcset> hero template (no
+# CSS background-image at all), it fell through and grabbed an unrelated
+# "More articles" related-content thumbnail further down the page instead
+# of correctly returning "not found". v3 fixes this AND adds support for
+# the <picture><source> template itself.
+_BANNER_ANCHOR_RE = re.compile(
+    r'id=["\'](?:feature|hero)banner(?:block)?\d+["\']', re.IGNORECASE
+)
 _DECLARATION_RE = re.compile(r'background-image:\s*([^;]+);', re.IGNORECASE)
 _URL_RE = re.compile(
     r'url\(\s*[\'"]?([^\'")]+\.(?:jpg|jpeg|png|webp))[\'"]?\s*\)',
     re.IGNORECASE,
 )
+_SOURCE_TAG_RE = re.compile(r'<source\b[^>]*>', re.IGNORECASE)
+_SRCSET_RE = re.compile(
+    r'srcset=["\']([^"\']+\.(?:jpg|jpeg|png|webp))["\']', re.IGNORECASE
+)
+SIZE_TIER_PREFERENCE = ["medium-1000x570", "small-800x800", "large-1200x700"]
+_WINDOW_FALLBACK_SIZE = 8000
+
+
+def _get_banner_window(html: str):
+    anchor = _BANNER_ANCHOR_RE.search(html)
+    if not anchor:
+        return None
+    start = anchor.end()
+    next_container = html.find('<div class="container', start + 100)
+    end = next_container if next_container != -1 else start + _WINDOW_FALLBACK_SIZE
+    return html[start:end]
 
 
 def extract_banner_images_fixed(html: str) -> list:
-    """Returns deduped list of banner image relative paths using the fixed logic."""
+    """
+    v3: scoped to the banner container, tries <picture><source> first,
+    then CSS background-image. Returns a list for reporting purposes
+    (the real page-specific image, if found, plus none of the unrelated
+    page images that v2 could accidentally surface).
+    """
+    window = _get_banner_window(html)
+    if window is None:
+        return []
+
+    results = []
+
+    # picture/source pattern
+    candidates = []
+    for tag in _SOURCE_TAG_RE.findall(window):
+        srcset_match = _SRCSET_RE.search(tag)
+        if not srcset_match:
+            continue
+        has_media = "media=" in tag.lower()
+        candidates.append((srcset_match.group(1), has_media))
+    if candidates:
+        no_media = [p for p, m in candidates if not m]
+        results.append(no_media[0] if no_media else candidates[0][0])
+        return results  # picture pattern found — this is the hero, done
+
+    # CSS background-image pattern, scoped to same window
     matches = []
     seen = set()
-    for decl_match in _DECLARATION_RE.finditer(html):
+    for decl_match in _DECLARATION_RE.finditer(window):
         declaration = decl_match.group(1)
         urls_in_declaration = _URL_RE.findall(declaration)
         if not urls_in_declaration:
