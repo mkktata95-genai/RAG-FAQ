@@ -91,3 +91,48 @@ back through the pipeline to find where it was set incorrectly:
 Report back: is stocksandsharesisa in the approved list, does it exist
 in the index, and how many other golden dataset rows show the same
 not-in-approved-list pattern.
+
+
+
+
+------------- Andy's Mail ---------------------------
+Hi Andy,
+
+Following up on our dropdown discussion - we ran a full structural check across all 294 approved URLs to properly validate this before deciding anything. Sharing the findings and our proposed next steps below.
+
+What we checked
+
+For every approved URL, we fetched the raw HTML (no browser, no JS execution) and checked two things:
+1. Whether the page's real content is present without JS - visible text volume + SPA framework markers
+2. For pages with a dropdown, whether each <option> has a matching hidden content panel already sitting in the raw HTML (the pattern you spotted on the bereavement page), by matching option values against data-content attributes directly - not just comparing counts.
+
+Findings
+
+- JS dependency: 294/294 pages confirmed no-JS-required. Matches what you found - traditional CMS, server-side rendered.
+- Dropdowns found: 32 pages
+- Genuine matches (all options resolve to a hidden content panel): 2 pages - bereavement (contact details by product) and the online-services-by-product page. Confirmed both manually in view-source and via the script.
+- No match: 28 pages. Checked every one - all filter/sort/navigation dropdowns (insurer filters, cohort filters, Newest/Oldest sort, meeting-summary selectors etc.), consistent with what you flagged as not relevant to our use case. No hidden third genuine dropdown.
+- N/A (0 options detected): 2 pages - both are static glossary pages with an alphabet jump-nav sidebar, not a real dropdown. False positive in our detection, content is fully visible on page load regardless.
+
+So across all 294 URLs, every case is now accounted for.
+
+Way forward
+
+Based on this, we don't believe Playwright/crawl4ai is required at all going forward:
+- Standard pages: plain HTTPS GET + parse the <main> element, as you suggested.
+- The 2 genuine dropdown pages: same GET request, then extract each option's content directly from its data-content panel in the raw HTML - no click simulation needed.
+
+We're planning to:
+1. Build the new scraper on this approach (no browser dependency)
+2. Rebuild chunk-and-index without HQA question generation
+3. Update the content freshness job to match both
+4. Test all three end-to-end before touching any design documentation
+
+We're holding off on updating the LLD/architecture decision doc until that end-to-end test is done and verified - didn't want to lock in the new approach on paper before it's actually proven.
+
+Happy to share the detailed spreadsheet (per-URL and per-option breakdown) if useful for your side.
+
+Thanks again for digging into this with us.
+
+Best,
+Mukesh
