@@ -2,18 +2,19 @@
 extract_images_for_url_list.py
 
 Reads URLs from an Excel file, extracts each page's citation thumbnail
-image (base_image_url) using the finalized logic, and writes the result
-into a new column immediately next to the URL column. Leaves the cell
-blank if no image was found or the page failed to fetch.
+image (base_image_url) using the finalized extraction logic, and writes
+the result into a new column immediately next to the URL column. Leaves
+the cell blank if no image was found or the page failed to fetch.
 
-Uses the FINALIZED extraction approach (validated on 7 sample URLs):
-  - og:image is NOT used (confirmed always generic on this site).
-  - CSS feature-banner background-image is the source.
-  - Isolates the full "background-image: ...;" declaration and takes the
-    LAST url(...) in it (handles linear-gradient overlays with nested
-    rgba() parens correctly).
-  - Prefers medium-1000x570 tier, falls back through small/large.
-  - Resolves relative paths with urljoin (not string concatenation).
+Tries four patterns per page, in order (see CHANGELOG for how each was
+found):
+  1. JSON-LD "image" array (Feature Article Page template).
+  2. <picture><source srcset> hero banner (id="herobannerblock*").
+  3. CSS background-image hero banner (id="featurebanner*").
+  4. imageblock content image (id="image*") — pages with no hero banner
+     at all; anchored to the FIRST such block only.
+og:image is deliberately NOT used — confirmed always generic (site logo
+or teaser stock) across every page checked.
 
 CONFIGURE these before running:
     INPUT_FILE     - path to your Excel file
@@ -25,6 +26,19 @@ input file. Does not modify the original file.
 
 Usage:
     python extract_images_for_url_list.py
+
+CHANGELOG
+---------
+v3: Scoped extraction to the banner container (id-anchored) instead of
+    whole-page scan; added <picture><source> support; fixed a
+    nested-paren regex bug on linear-gradient(rgba(...)) overlays.
+v4: Added JSON-LD "image" array as primary source (Feature Article Page
+    template) — fixed the majority of a 158/294 blank-result batch run.
+v5: Added "imageblock" (id="image*") fallback for pages with no hero
+    banner section at all (e.g. find-a-financial-adviser).
+v6: Removed file-extension requirement on CSS url() matches — real
+    extension-less URLs found in production (default banner assets that
+    still render live despite no .jpg/.png suffix).
 """
 
 import re
@@ -86,16 +100,40 @@ _BANNER_ANCHOR_RE = re.compile(
     r'id=["\'](?:feature|hero)banner(?:block)?\d+["\']', re.IGNORECASE
 )
 _DECLARATION_RE = re.compile(r'background-image:\s*([^;]+);', re.IGNORECASE)
-_URL_RE = re.compile(
-    r'url\(\s*[\'"]?([^\'")]+\.(?:jpg|jpeg|png|webp))[\'"]?\s*\)',
-    re.IGNORECASE,
-)
+# no extension required — some pages use a genuinely extension-less URL
+# for a default/placeholder banner asset that still renders live.
+_URL_RE = re.compile(r'url\(\s*[\'"]?([^\'")]+)[\'"]?\s*\)', re.IGNORECASE)
 _SOURCE_TAG_RE = re.compile(r'<source\b[^>]*>', re.IGNORECASE)
 _SRCSET_RE = re.compile(
     r'srcset=["\']([^"\']+\.(?:jpg|jpeg|png|webp))["\']', re.IGNORECASE
 )
+_IMG_SRC_RE = re.compile(
+    r'<img\b[^>]*\bsrc=["\']([^"\']+\.(?:jpg|jpeg|png|webp))["\']', re.IGNORECASE
+)
 SIZE_TIER_PREFERENCE = ["medium-1000x570", "small-800x800", "large-1200x700"]
 _WINDOW_FALLBACK_SIZE = 8000
+_IMAGEBLOCK_ANCHOR_RE = re.compile(r'id=["\']image\d+["\']', re.IGNORECASE)
+_IMAGEBLOCK_WINDOW_FALLBACK = 3000
+
+
+def _get_imageblock_window(html: str) -> Optional[str]:
+    anchor = _IMAGEBLOCK_ANCHOR_RE.search(html)
+    if not anchor:
+        return None
+    start = anchor.end()
+    figure_end = html.find("</figure>", start)
+    end = figure_end if figure_end != -1 else start + _IMAGEBLOCK_WINDOW_FALLBACK
+    return html[start:end]
+
+
+def _extract_from_imageblock(window: str) -> Optional[str]:
+    picture_result = _extract_from_picture(window)
+    if picture_result:
+        return picture_result
+    img_match = _IMG_SRC_RE.search(window)
+    if img_match:
+        return img_match.group(1)
+    return None
 
 
 def _get_banner_window(html: str) -> Optional[str]:
@@ -147,11 +185,8 @@ def _extract_from_css_banner(window: str) -> Optional[str]:
 
 def extract_base_image_url(html: str, page_url: str) -> Optional[str]:
     """
-    Scoped to the actual banner container (id="featurebanner*" or
-    "herobannerblock*"). Supports three templates seen on this site:
-      1. JSON-LD "image" array (Feature Article Page template) - tried first.
-      2. <picture><source srcset> template.
-      3. CSS background-image template.
+    Tries four patterns in order: JSON-LD image array, picture/source hero,
+    CSS background-image hero, imageblock content image (no-hero pages).
     Does NOT fall back to scanning the rest of the page.
     """
     jsonld_result = _extract_from_jsonld(html)
@@ -159,14 +194,20 @@ def extract_base_image_url(html: str, page_url: str) -> Optional[str]:
         return urljoin(page_url, jsonld_result)
 
     window = _get_banner_window(html)
-    if window is None:
-        return None
-    picture_result = _extract_from_picture(window)
-    if picture_result:
-        return urljoin(page_url, picture_result)
-    css_result = _extract_from_css_banner(window)
-    if css_result:
-        return urljoin(page_url, css_result)
+    if window is not None:
+        picture_result = _extract_from_picture(window)
+        if picture_result:
+            return urljoin(page_url, picture_result)
+        css_result = _extract_from_css_banner(window)
+        if css_result:
+            return urljoin(page_url, css_result)
+
+    imageblock_window = _get_imageblock_window(html)
+    if imageblock_window is not None:
+        imageblock_result = _extract_from_imageblock(imageblock_window)
+        if imageblock_result:
+            return urljoin(page_url, imageblock_result)
+
     return None
 
 
