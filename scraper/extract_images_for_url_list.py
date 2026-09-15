@@ -28,6 +28,7 @@ Usage:
 """
 
 import re
+import json
 import time
 from urllib.parse import urljoin
 from typing import Optional
@@ -49,6 +50,37 @@ DELAY_BETWEEN_REQUESTS = 0.5   # seconds, be polite to the site
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0 Safari/537.36"
 }
+
+_LDJSON_RE = re.compile(
+    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _extract_from_jsonld(html: str) -> Optional[str]:
+    for match in _LDJSON_RE.finditer(html):
+        raw = match.group(1).strip()
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        candidates = data if isinstance(data, list) else [data]
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            image = item.get("image")
+            if not image:
+                continue
+            if isinstance(image, list) and image:
+                for img in image:
+                    if isinstance(img, str) and "large" in img.lower():
+                        return img
+                last = image[-1]
+                return last if isinstance(last, str) else None
+            if isinstance(image, str):
+                return image
+    return None
+
 
 _BANNER_ANCHOR_RE = re.compile(
     r'id=["\'](?:feature|hero)banner(?:block)?\d+["\']', re.IGNORECASE
@@ -116,10 +148,16 @@ def _extract_from_css_banner(window: str) -> Optional[str]:
 def extract_base_image_url(html: str, page_url: str) -> Optional[str]:
     """
     Scoped to the actual banner container (id="featurebanner*" or
-    "herobannerblock*"). Supports both the CSS background-image template
-    and the <picture><source srcset> template. Does NOT fall back to
-    scanning the rest of the page if the banner container has no image.
+    "herobannerblock*"). Supports three templates seen on this site:
+      1. JSON-LD "image" array (Feature Article Page template) - tried first.
+      2. <picture><source srcset> template.
+      3. CSS background-image template.
+    Does NOT fall back to scanning the rest of the page.
     """
+    jsonld_result = _extract_from_jsonld(html)
+    if jsonld_result:
+        return urljoin(page_url, jsonld_result)
+
     window = _get_banner_window(html)
     if window is None:
         return None
