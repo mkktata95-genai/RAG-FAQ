@@ -48,6 +48,12 @@ v8: Skip the imageblock fallback entirely on Feature Article Page
     template=FeatureArticlePageType) — their id="image*" blocks are
     mid-body content illustrations, not a hero image, and were being
     wrongly picked up when JSON-LD had no real image.
+v9: Generic-filename filter now applies to every source's candidate, not
+    just JSON-LD. Confirmed real case: "couple-in-discussion-
+    small-550x550.jpg" — a shared "Do you need financial support?" CTA
+    embedded on multiple unrelated articles — was reused via the same
+    id="featurebanner*" naming as a real hero banner, so it was returned
+    as if it were the page's own image.
 """
 
 import re
@@ -79,7 +85,8 @@ _LDJSON_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-_GENERIC_IMAGE_PATTERNS = ["fallback", "rl_logo", "rl-logo"]
+# v9: checked against every source's candidate now, not just JSON-LD.
+_GENERIC_IMAGE_PATTERNS = ["fallback", "rl_logo", "rl-logo", "couple-in-discussion"]
 
 
 def _is_generic_image(path: str) -> bool:
@@ -229,7 +236,9 @@ def extract_base_image_url(html: str, page_url: str) -> Optional[str]:
     """
     Tries four patterns in order: JSON-LD image array, picture/source hero,
     CSS background-image hero, imageblock content image (no-hero pages,
-    skipped entirely on Feature Article Page templates). Does NOT fall
+    skipped entirely on Feature Article Page templates). v9: every
+    candidate is checked against _is_generic_image before being accepted
+    — a generic match falls through to the next source. Does NOT fall
     back to scanning the rest of the page.
     """
     jsonld_result = _extract_from_jsonld(html)
@@ -239,10 +248,10 @@ def extract_base_image_url(html: str, page_url: str) -> Optional[str]:
     window = _get_banner_window(html)
     if window is not None:
         picture_result = _extract_from_picture(window)
-        if picture_result:
+        if picture_result and not _is_generic_image(picture_result):
             return urljoin(page_url, picture_result)
         css_result = _extract_from_css_banner(window)
-        if css_result:
+        if css_result and not _is_generic_image(css_result):
             return urljoin(page_url, css_result)
 
     if _is_article_template(html):
@@ -251,7 +260,7 @@ def extract_base_image_url(html: str, page_url: str) -> Optional[str]:
     imageblock_window = _get_imageblock_window(html)
     if imageblock_window is not None:
         imageblock_result = _extract_from_imageblock(imageblock_window)
-        if imageblock_result:
+        if imageblock_result and not _is_generic_image(imageblock_result):
             return urljoin(page_url, imageblock_result)
 
     return None
