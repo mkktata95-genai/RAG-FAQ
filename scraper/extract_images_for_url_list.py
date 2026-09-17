@@ -43,6 +43,11 @@ v7: Filter generic/fallback filenames out of JSON-LD "image" results
     (e.g. "feature-article-fallback-...jpg" on articles with no custom
     banner set) instead of trusting JSON-LD blindly; falls through to
     other sources or leaves the cell blank.
+v8: Skip the imageblock fallback entirely on Feature Article Page
+    templates (detected via JSON-LD "@type":"Article" or meta
+    template=FeatureArticlePageType) — their id="image*" blocks are
+    mid-body content illustrations, not a hero image, and were being
+    wrongly picked up when JSON-LD had no real image.
 """
 
 import re
@@ -200,11 +205,32 @@ def _extract_from_css_banner(window: str) -> Optional[str]:
     return matches[0]
 
 
+# v8: skip imageblock fallback on Feature Article Page templates — their
+# id="image*" blocks are mid-body content illustrations (e.g. a table
+# screenshot), not a hero/citation image. Confirmed real case:
+# "the-royal-london-guide-to-going-self-employed" has no hero image at
+# all, and the old logic fell through to a random body table.png instead
+# of correctly returning blank.
+_ARTICLE_JSONLD_TYPE_RE = re.compile(r'"@type"\s*:\s*"Article"', re.IGNORECASE)
+_ARTICLE_META_TEMPLATE_RE = re.compile(
+    r'<meta\s+name=["\']template["\'][^>]*content=["\']FeatureArticlePageType["\']',
+    re.IGNORECASE,
+)
+
+
+def _is_article_template(html: str) -> bool:
+    return bool(
+        _ARTICLE_JSONLD_TYPE_RE.search(html)
+        or _ARTICLE_META_TEMPLATE_RE.search(html)
+    )
+
+
 def extract_base_image_url(html: str, page_url: str) -> Optional[str]:
     """
     Tries four patterns in order: JSON-LD image array, picture/source hero,
-    CSS background-image hero, imageblock content image (no-hero pages).
-    Does NOT fall back to scanning the rest of the page.
+    CSS background-image hero, imageblock content image (no-hero pages,
+    skipped entirely on Feature Article Page templates). Does NOT fall
+    back to scanning the rest of the page.
     """
     jsonld_result = _extract_from_jsonld(html)
     if jsonld_result:
@@ -218,6 +244,9 @@ def extract_base_image_url(html: str, page_url: str) -> Optional[str]:
         css_result = _extract_from_css_banner(window)
         if css_result:
             return urljoin(page_url, css_result)
+
+    if _is_article_template(html):
+        return None
 
     imageblock_window = _get_imageblock_window(html)
     if imageblock_window is not None:
