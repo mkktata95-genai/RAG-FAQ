@@ -39,6 +39,10 @@ v5: Added "imageblock" (id="image*") fallback for pages with no hero
 v6: Removed file-extension requirement on CSS url() matches — real
     extension-less URLs found in production (default banner assets that
     still render live despite no .jpg/.png suffix).
+v7: Filter generic/fallback filenames out of JSON-LD "image" results
+    (e.g. "feature-article-fallback-...jpg" on articles with no custom
+    banner set) instead of trusting JSON-LD blindly; falls through to
+    other sources or leaves the cell blank.
 """
 
 import re
@@ -70,6 +74,13 @@ _LDJSON_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+_GENERIC_IMAGE_PATTERNS = ["fallback", "rl_logo", "rl-logo"]
+
+
+def _is_generic_image(path: str) -> bool:
+    lower = path.lower()
+    return any(p in lower for p in _GENERIC_IMAGE_PATTERNS)
+
 
 def _extract_from_jsonld(html: str) -> Optional[str]:
     for match in _LDJSON_RE.finditer(html):
@@ -86,12 +97,18 @@ def _extract_from_jsonld(html: str) -> Optional[str]:
             if not image:
                 continue
             if isinstance(image, list) and image:
+                chosen = None
                 for img in image:
                     if isinstance(img, str) and "large" in img.lower():
-                        return img
-                last = image[-1]
-                return last if isinstance(last, str) else None
-            if isinstance(image, str):
+                        chosen = img
+                        break
+                if chosen is None:
+                    last = image[-1]
+                    chosen = last if isinstance(last, str) else None
+                if chosen and not _is_generic_image(chosen):
+                    return chosen
+                continue
+            if isinstance(image, str) and not _is_generic_image(image):
                 return image
     return None
 
