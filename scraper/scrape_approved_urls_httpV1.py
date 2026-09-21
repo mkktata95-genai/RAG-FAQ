@@ -51,9 +51,15 @@ WHAT'S NEW / REPLACED:
     instead of a live URL — lets Phase 1 local testing simulate
     new/changed/unchanged/broken-content scenarios without depending
     on the B&M team to actually change the live site.
-  - Image extraction: placeholder field only (`banner_image_url`).
-    Final logic pending — being finalized separately, not wired in
-    yet. Do not treat as production-ready.
+  - Image extraction: ONE field, `thumbnail_url` (same field V5
+    already used — not a new/second field), deliberately left as a
+    placeholder (None) here. extract_page_metadata() still computes
+    a teaser_image/og:image value internally (that logic hasn't
+    changed), but scrape_page() discards it and stores None instead
+    — the citation-card image approach is being redesigned from
+    scratch in a separate effort, and a stale/possibly-wrong value
+    is worse than an explicit "not yet populated". Once that logic
+    is finalized, patch scrape_page() to store the real value.
   - No async, no crawl4ai, no Playwright, no CDP/Chrome subprocess
     handling — all removed as dead weight for this architecture.
 
@@ -64,7 +70,8 @@ required for chunk_and_index to keep working without changes):
     product_category, description, thumbnail_url, publish_date,
     collection_name, read_time_mins, dropdown_state, dropdown_value,
     scraper_version, metadata_version, scrape_run_id
-  Plus (new, stub only): banner_image_url
+  thumbnail_url is present but currently always None — see "Image
+  extraction" above.
 
 ═══════════════════════════════════════════════════════════════
 LOCAL USAGE (Phase 1)
@@ -915,8 +922,16 @@ _DROPDOWN_PLACEHOLDERS = {
     "choose", "please choose", "-- select an option --",
     "- select -", "select an option", "select option",
     "none", "n/a", "0", "all",
+    # Unicode ellipsis variant — "Select&hellip;" renders as "Select…"
+    # (a single U+2026 character, not three literal dots) once
+    # BeautifulSoup decodes the HTML entity. Seen on the online-service
+    # dropdown page's default placeholder option.
+    "select…",
 }
 
+# Kept as a BONUS signal (not a requirement) — see
+# _dropdown_group_has_variance() below for why the primary filter
+# moved to a content-variance check instead of relying on this alone.
 _CONTACT_SIGNAL_PATTERNS = [
     re.compile(r'0\d{3,4}[\s\-]?\d{3,4}[\s\-]?\d{3,4}'),
     re.compile(r'1\d{3,4}[\s\-]?\d{3,4}[\s\-]?\d{3,4}'),
@@ -930,30 +945,22 @@ _CONTACT_SIGNAL_KEYWORDS = [
 
 def _has_contact_signals(text: str) -> bool:
     """
-    THE core filter that separates a genuine contact/routing dropdown
-    (e.g. bereavement page: pick your policy type, get a phone
-    number) from every other kind of dropdown a Royal London page
-    might have (sort order, category filter, form Mr/Mrs/Ms picker,
-    language selector) — those must NEVER produce indexed dropdown
-    entries, since their "content" is UI chrome, not information.
+    Detects phone-number/opening-hours style contact information in a
+    panel's text (the bereavement-page pattern specifically).
 
-    Returns True only if the given text contains at least one of:
-      - a known contact-related KEYWORD phrase (_CONTACT_SIGNAL_KEYWORDS
-        — "call us", "write to us", "lines are open", "fill in our
-        online form", "monday to friday", opening-hours phrasing etc.)
-      - a UK/ROI-shaped PHONE NUMBER pattern (_CONTACT_SIGNAL_PATTERNS
-        — e.g. 0345 646 2108, or a 1xxx ROI-style number)
+    NOT used as a gate on its own any more (see
+    _dropdown_group_has_variance() for why — this heuristic correctly
+    identified the bereavement page but wrongly rejected the
+    "online-service, what you can do per policy type" dropdown, whose
+    genuine per-option content is a list of account actions, not
+    contact info). Kept only as a fast-path BONUS signal inside
+    extract_dropdown_states_from_html(): if a panel obviously contains
+    a phone number, that alone is enough to trust it without waiting
+    on the group-level variance computation.
 
-    This is deliberately a pure keyword/pattern filter with no
-    whitelist of "known genuine dropdown pages" — it's meant to work
-    automatically on any future page, not just the 2 dropdowns
-    already confirmed genuine (bereavement, online-services-by-product).
-
-    Used in two places: this script's extract_dropdown_states_from_html()
-    (as the single remaining filter layer, since there's no browser
-    navigation risk to guard against here) and — historically in
-    V5 — as Layer 2 of a 2-layer filter alongside a minimum
-    content-length check.
+    Returns True if the text contains a known contact keyword phrase
+    (_CONTACT_SIGNAL_KEYWORDS) or a UK/ROI-shaped phone number
+    (_CONTACT_SIGNAL_PATTERNS).
     """
     text_lower = text.lower()
     for kw in _CONTACT_SIGNAL_KEYWORDS:
@@ -963,6 +970,96 @@ def _has_contact_signals(text: str) -> bool:
         if pattern.search(text):
             return True
     return False
+
+
+# ── Content-variance filter — REPLACES contact-keywords as the
+# primary genuine-vs-noise gate (see extract_dropdown_states_from_html
+# docstring for the real-world case that forced this change). ──
+#
+# Below this Jaccard-similarity value, two panels are considered
+# "meaningfully different" content. Tuned conservatively toward
+# INCLUSION: a false positive (an odd sort/filter dropdown that
+# slips through) is a minor, reviewable index-quality issue; a false
+# negative (silently dropping a genuine per-option routing dropdown,
+# as happened with the online-service page) directly degrades what
+# Aria can answer. 0.65 was chosen so that a pure reordering of the
+# same item set (Jaccard = 1.0, since word sets are identical) is
+# always rejected, while panels sharing some common boilerplate
+# phrasing but differing in their specific details are kept.
+_DROPDOWN_NOISE_SIMILARITY_THRESHOLD = 0.65
+
+
+def _panel_word_set(text: str, cap: int = 200) -> set[str]:
+    """
+    Reduce a panel's text to a comparable set of lowercased word
+    tokens (alphanumeric runs only — punctuation ignored), capped to
+    the first `cap` words for performance on long panels. Used purely
+    for the Jaccard similarity comparison in
+    _dropdown_group_has_variance(); not used for anything that ends
+    up in the output content itself.
+    """
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    return set(words[:cap])
+
+
+def _jaccard_similarity(set_a: set, set_b: set) -> float:
+    """
+    Standard Jaccard similarity — |intersection| / |union| — between
+    two word sets. Returns 0.0 for two empty sets (treated as having
+    nothing in common, not "identical") so an empty panel can never
+    accidentally count as similar-enough evidence.
+    """
+    if not set_a or not set_b:
+        return 0.0
+    intersection = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return intersection / union if union else 0.0
+
+
+def _dropdown_group_has_variance(panel_texts: list[str]) -> bool:
+    """
+    THE core filter that replaces contact-keyword matching. Decides
+    whether an entire dropdown (all its resolved option panels taken
+    together) carries genuinely distinguishing information, or is
+    just UI chrome (a sort/filter control whose options reorder or
+    relabel the same underlying item set).
+
+    Logic: compute pairwise Jaccard word-set similarity between every
+    pair of panels in the group, and take the MINIMUM. If even one
+    pair of options shows clearly different content (similarity below
+    _DROPDOWN_NOISE_SIMILARITY_THRESHOLD), the dropdown as a whole is
+    treated as genuine and ALL its panels are kept — including any
+    individual pair that happens to be identical (e.g. two policy
+    types that legitimately share the same available actions; that's
+    correct data, not noise, once the group itself is confirmed
+    genuine).
+
+    Conversely, if EVERY pair is near-identical (minimum similarity
+    stays at/above the threshold), the whole group is treated as
+    noise and none of its panels are extracted — this is exactly the
+    "Newest/Oldest" sort-order case, where every option's word set is
+    identical (same 3 items, just reordered) and nothing has changed
+    hands to be worth indexing.
+
+    Deliberately evaluated at the GROUP level, not per-option — a
+    per-option check can't tell a coincidentally-shared-content pair
+    apart from a systematically-reordered group; only comparing
+    across the whole set can.
+
+    Requires at least 2 panels to make a comparison; with fewer than
+    that there's nothing to compare, so the caller should not invoke
+    this for a group of size < 2.
+    """
+    word_sets = [_panel_word_set(t) for t in panel_texts]
+    similarities = []
+    for i in range(len(word_sets)):
+        for j in range(i + 1, len(word_sets)):
+            similarities.append(_jaccard_similarity(word_sets[i], word_sets[j]))
+
+    if not similarities:
+        return False
+
+    return min(similarities) < _DROPDOWN_NOISE_SIMILARITY_THRESHOLD
 
 
 def _has_routing_dropdowns_in_html(html: str) -> bool:
@@ -979,12 +1076,14 @@ def _has_routing_dropdowns_in_html(html: str) -> bool:
     category-filter <select> also passes this check (2+ real
     options). That's fine: this function's only job is "is there
     something here worth looking at closer", not "is this a genuine
-    contact dropdown" — that distinction is made downstream, per
-    option, by _has_contact_signals() inside
+    routing dropdown" — that distinction is made downstream, at the
+    whole-group level, by _dropdown_group_has_variance() inside
     extract_dropdown_states_from_html(). Out of the ~32 pages on the
     approved list that DO have a <select> and pass this check, only 2
-    (bereavement, online-services-by-product) end up producing any
-    output, because everything else fails the contact-signal filter.
+    (bereavement, online-services-by-product) are currently known to
+    produce output — but unlike an allowlist, this pipeline doesn't
+    need to know that in advance; any future dropdown page is
+    evaluated by the same content-variance logic automatically.
 
     Returns False on any parse exception rather than raising — this
     is a pre-check, so failing safe (skip dropdown handling, keep the
@@ -1054,14 +1153,35 @@ def extract_dropdown_states_from_html(
     it's one static document).
 
     Mirrors V5's _scrape_dropdown_states_playwright() output schema
-    exactly, and reuses the same two filtering layers:
-      - minimum content length >= 20 chars
-      - _has_contact_signals() — eliminates filter/sort/navigation
-        dropdowns automatically, same as V5.
+    exactly. Filtering is TWO layers, evaluated per <select> group:
 
-    Returns list of page_data dicts (one per option with genuine
-    contact content). Empty list if no genuine dropdown is found or
-    no option passes filtering — base page is still used either way.
+      Layer 1 (per-panel): minimum content length >= 20 chars —
+        drops individually broken/empty panels regardless of the
+        group's genuineness.
+
+      Layer 2 (whole-group): _dropdown_group_has_variance() — decides
+        whether this <select>'s panels carry genuinely distinguishing
+        information, or are just UI chrome (sort/filter/reorder
+        controls) that happen to have >1 option. See that function's
+        docstring for the full rationale.
+
+        NOTE ON WHY THIS ISN'T A PER-OPTION CONTACT-KEYWORD CHECK
+        ANYMORE: an earlier version gated each panel individually on
+        _has_contact_signals() (phone numbers / "call us" phrasing).
+        That correctly identified the bereavement page, but silently
+        DROPPED the equally genuine "online-service, what you can do
+        per policy type" dropdown — its content is a list of account
+        actions, not contact info, so it contains no such keywords.
+        A keyword list can only ever describe patterns already known
+        in advance; a content-variance check works on any future
+        dropdown without needing to know its subject matter first.
+        _has_contact_signals() is kept only as a fast-path BONUS
+        signal below — an obvious phone number is trusted immediately
+        without waiting on the group computation.
+
+    Returns list of page_data dicts (one per option, for every
+    <select> group whose variance check passes). Empty list if no
+    genuine dropdown is found — base page is still used either way.
     """
     results: list[dict] = []
 
@@ -1088,6 +1208,11 @@ def extract_dropdown_states_from_html(
 
         log.info("dropdown_detected", url=url, option_count=len(valid_opts))
 
+        # ── Resolve panels for every option first, applying only the
+        # per-panel min-length gate (Layer 1). The group-level
+        # variance decision (Layer 2) needs ALL resolved panels
+        # together, so nothing is emitted yet at this stage.
+        resolved = []  # list of (option, panel_text)
         for option in valid_opts:
             opt_value = option["value"]
             opt_text = option["text"]
@@ -1102,23 +1227,48 @@ def extract_dropdown_states_from_html(
 
             panel_text = panel.get_text(separator=" ", strip=True)
 
-            # Layer 1: minimum content length — same 20-char gate as V5
             if not panel_text or len(panel_text.strip()) < 20:
                 log.warning("dropdown_option_no_content", url=url, option=opt_text)
                 continue
 
-            # Layer 2: contact-signal validation — same filter as V5,
-            # eliminates filter/sort/navigation dropdowns automatically.
-            if not _has_contact_signals(panel_text):
-                log.info(
-                    "dropdown_option_no_contact_signal",
-                    url=url, option=opt_text, chars=len(panel_text),
-                )
-                continue
+            resolved.append((option, panel_text.strip()))
+
+        if len(resolved) < 2:
+            log.info(
+                "dropdown_group_insufficient_panels",
+                url=url, resolved_count=len(resolved),
+            )
+            continue
+
+        panel_texts = [text for _opt, text in resolved]
+        has_variance = _dropdown_group_has_variance(panel_texts)
+        # Fast-path bonus: an unambiguous contact signal anywhere in
+        # the group is enough evidence on its own, even if variance
+        # happens to sit right at the threshold.
+        has_contact_evidence = any(_has_contact_signals(t) for t in panel_texts)
+
+        if not (has_variance or has_contact_evidence):
+            log.info(
+                "dropdown_group_rejected_low_variance",
+                url=url, option_count=len(resolved),
+                note="Panels look like a reordered/relabeled version "
+                     "of the same content (e.g. a sort or filter "
+                     "control) rather than genuinely distinct "
+                     "per-option information.",
+            )
+            continue
+
+        log.info(
+            "dropdown_group_accepted", url=url, option_count=len(resolved),
+            has_variance=has_variance, has_contact_evidence=has_contact_evidence,
+        )
+
+        for option, content in resolved:
+            opt_value = option["value"]
+            opt_text = option["text"]
 
             safe_value = opt_value if opt_value else opt_text
             state_url = f"{url}#state={urllib.parse.quote(safe_value)}"
-            content = panel_text.strip()
 
             results.append({
                 "url":              state_url,
@@ -1143,7 +1293,6 @@ def extract_dropdown_states_from_html(
                 "read_time_mins":   str(max(1, len(content.split()) // 200)),
                 "dropdown_state":   opt_text,
                 "dropdown_value":   opt_value or "",
-                "banner_image_url": None,  # placeholder — see module docstring
             })
 
             log.info("dropdown_option_scraped", url=state_url, option=opt_text, chars=len(content))
@@ -1303,14 +1452,18 @@ def scrape_page(
             "content_type":     map_excel_category_to_content_type(excel_category, url),
             "product_category": metadata["product_category"],
             "description":      metadata["description"],
-            "thumbnail_url":    metadata["thumbnail_url"],
+            # Placeholder only — deliberately NOT populated from
+            # metadata["teaser_image"]/og:image (computed above, but
+            # discarded here). The citation-card image field is being
+            # redesigned from scratch (single field, not two competing
+            # sources) and its extraction logic is still being
+            # finalized separately. None is safer than a value that
+            # might not match whatever the final logic decides is
+            # correct — wire the real value in once that logic lands.
+            "thumbnail_url":    None,
             "publish_date":     metadata["publish_date"],
             "collection_name":  metadata["collection_name"],
             "read_time_mins":   metadata["read_time_mins"],
-
-            # Placeholder only — final banner-image extraction logic
-            # is being finalized separately and is not wired in yet.
-            "banner_image_url": None,
         }
 
         log.info(
