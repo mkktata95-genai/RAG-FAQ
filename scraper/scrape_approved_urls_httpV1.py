@@ -1565,11 +1565,15 @@ def run_scraper(
                      live URLs (Phase 1 controlled testing).
 
     Returns dict: success, pages_scraped, pages_failed, output_path,
-    dry_run, error — identical shape to V5.
+    dry_run, error, elapsed_seconds — same shape as V5 plus
+    elapsed_seconds (new — V5 never reported run duration).
     """
+    run_started_at = time.monotonic()
+
     result = {
         "success": False, "pages_scraped": 0, "pages_failed": 0,
         "output_path": "", "dry_run": dry_run, "error": "",
+        "elapsed_seconds": 0.0,
     }
 
     try:
@@ -1577,9 +1581,11 @@ def run_scraper(
 
         if dry_run:
             pages = load_url_source(excel)
+            result["elapsed_seconds"] = round(time.monotonic() - run_started_at, 2)
             print("\n✅ DRY RUN COMPLETE — no scraping performed.")
             print(f"   Excel file:    {excel}")
             print(f"   URLs detected: {len(pages)}")
+            print(f"   Elapsed:       {result['elapsed_seconds']}s")
             result["success"] = True
             return result
 
@@ -1620,6 +1626,7 @@ def run_scraper(
         output_path = save_scraped_pages(scraped, output_file)
 
         if not output_path:
+            result["elapsed_seconds"] = round(time.monotonic() - run_started_at, 2)
             result["error"] = (
                 "All URLs failed to scrape — output file not written. "
                 "Check scrape errors in the log."
@@ -1627,9 +1634,15 @@ def run_scraper(
             result["pages_failed"] = len(failed_urls)
             return result
 
+        result["elapsed_seconds"] = round(time.monotonic() - run_started_at, 2)
+
         log.info(
             "scraper_pipeline_complete", pages_scraped=len(scraped),
             pages_failed=len(failed_urls), output_path=output_path,
+            elapsed_seconds=result["elapsed_seconds"],
+            avg_seconds_per_url=(
+                round(result["elapsed_seconds"] / total, 2) if total else 0.0
+            ),
         )
 
         result["success"] = True
@@ -1639,8 +1652,9 @@ def run_scraper(
         return result
 
     except Exception as e:
+        result["elapsed_seconds"] = round(time.monotonic() - run_started_at, 2)
         result["error"] = str(e)
-        log.error("scraper_pipeline_error", error=str(e))
+        log.error("scraper_pipeline_error", error=str(e), elapsed_seconds=result["elapsed_seconds"])
         return result
 
 
@@ -1666,12 +1680,14 @@ def main():
     )
 
     if not result["success"]:
-        print(f"\n❌ FAILED: {result['error']}")
+        print(f"\n❌ FAILED after {result['elapsed_seconds']}s: {result['error']}")
         sys.exit(1)
 
     if not result["dry_run"]:
+        mins = result["elapsed_seconds"] / 60
         print(f"\n✅ Scraped {result['pages_scraped']} pages "
               f"({result['pages_failed']} failed) → {result['output_path']}")
+        print(f"   Time taken: {result['elapsed_seconds']}s ({mins:.1f} min)")
 
 
 if __name__ == "__main__":
