@@ -57,6 +57,7 @@ URL_COLUMN = "URL"         # exact header text of the column with page URLs
 NEW_COLUMN_HEADER = "teaser_image_url"
 REQUEST_TIMEOUT = 15
 DELAY_BETWEEN_REQUESTS = 0.5   # seconds, be polite to the site
+RUN_REGRESSION_TESTS = True    # set False to skip straight to the batch run
 # ---------------------------------------------------------------------------
 
 HEADERS = {
@@ -142,7 +143,9 @@ def main():
     print("=" * 70)
 
 
-if __name__ == "__main__":
+def run_regression_tests() -> bool:
+    """Returns True if all tests pass. Does NOT run the batch job itself —
+    call main() separately (see bottom of file)."""
     # Regression tests against real tag formats confirmed live on
     # royallondon.com (see module docstring).
     tests = []
@@ -204,9 +207,15 @@ if __name__ == "__main__":
             passed += 1
         print(f"[{status}] {name}\n    expected: {expected}\n    got:      {result}\n")
 
-    print(f"{passed}/{len(tests)} tests passed")
-    print()
-    print("NOTE: live network fetch not runnable from this sandbox (egress")
-    print("blocked to royallondon.com). Regex validated against synthetic")
-    print("HTML built from real tag content confirmed live via manual fetch.")
-    print("Run main() on your VDI against the real URL list for live coverage.")
+    print(f"{passed}/{len(tests)} tests passed\n")
+    return passed == len(tests)
+
+
+if __name__ == "__main__":
+    if RUN_REGRESSION_TESTS:
+        if not run_regression_tests():
+            print("Regression tests FAILED — fix before running the batch job. Aborting.")
+            raise SystemExit(1)
+        print("All regression tests passed. Starting batch run against the URL list...\n")
+
+    main()
