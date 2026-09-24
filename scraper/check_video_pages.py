@@ -125,28 +125,40 @@ def detect_video_from_html(html: str, url: str) -> tuple[bool, str]:
 
 def extract_video_url(html: str) -> str:
     """
-    Pull the direct video iframe src, if one of the known
-    VIDEO_IFRAME_HOSTS is present. Static HTML only — no JS needed
-    (confirmed for Vimeo via the same investigation that confirmed
-    the rest of the site needs no browser rendering).
+    Pull the direct video iframe URL, if one of the known
+    VIDEO_IFRAME_HOSTS is present. Static HTML only — no JS needed.
 
-    Returns "" if no matching iframe is found (has_video can still
-    be True from a signal that isn't an iframe-based player, e.g. a
-    URL-pattern or metadata match with no visible player markup —
-    that's expected and fine, just means no video_url to extract for
-    that page).
+    CONFIRMED live on royallondon.com (view-source, not rendered DOM):
+    Royal London's Vimeo iframes are lazy-loaded — the real URL sits
+    in `data-src`, and `src` is absent entirely until a JS swap fires
+    on scroll-into-view. E.g.:
+        <iframe class="vimeoapi" data-src="https://player.vimeo.com/video/1201748881?h=..." ...>
+    (no src attribute at all in the raw HTML).
+
+    So this checks `data-src` FIRST (the confirmed real-world case for
+    this site), then falls back to `src` in case some page/template
+    doesn't lazy-load. A couple of other common lazy-load attribute
+    names (data-lazy-src, data-vimeo-src) are included defensively —
+    UNCONFIRMED for this site, kept in case a different template uses
+    them; harmless no-ops if not present.
+
+    Returns "" if no matching iframe/attribute is found (has_video can
+    still be True from a signal that isn't an iframe-based player —
+    that's expected, just means no video_url to extract for that page).
     """
     if not html:
         return ""
     try:
         soup = BeautifulSoup(html, "html.parser")
+        candidate_attrs = ["data-src", "src", "data-lazy-src", "data-vimeo-src"]
         for iframe in soup.find_all("iframe"):
-            src = (iframe.get("src") or "").strip()
-            if not src:
-                continue
-            for host in VIDEO_IFRAME_HOSTS:
-                if host in src.lower():
-                    return src.split("?")[0]  # strip tracking params, keep the id
+            for attr in candidate_attrs:
+                val = (iframe.get(attr) or "").strip()
+                if not val:
+                    continue
+                for host in VIDEO_IFRAME_HOSTS:
+                    if host in val.lower():
+                        return val.split("?")[0]  # strip tracking params, keep the id
     except Exception:
         pass
     return ""
