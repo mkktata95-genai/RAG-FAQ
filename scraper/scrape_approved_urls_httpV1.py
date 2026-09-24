@@ -63,15 +63,21 @@ WHAT'S NEW / REPLACED:
   - No async, no crawl4ai, no Playwright, no CDP/Chrome subprocess
     handling — all removed as dead weight for this architecture.
 
-OUTPUT FIELDS PER PAGE (unchanged from V5 — schema compatibility is
-required for chunk_and_index to keep working without changes):
+OUTPUT FIELDS PER PAGE (adds has_video fix + video_url to V5's schema —
+chunk_and_index must add a video_url field to its own indexing schema
+to store this new column; everything else is unchanged):
     url, title, section, audience, content, scraped_at,
-    content_length, content_hash, has_video, content_type,
+    content_length, content_hash, has_video, video_url, content_type,
     product_category, description, thumbnail_url, publish_date,
     collection_name, read_time_mins, dropdown_state, dropdown_value,
     scraper_version, metadata_version, scrape_run_id
   thumbnail_url is present but currently always None — see "Image
-  extraction" above.
+  extraction" above. video_url is populated when has_video is True and
+  a matching iframe (Vimeo confirmed; YouTube/Brightcove included
+  defensively) is found — see extract_video_url() docstring for the
+  data-src lazy-load and ?h= access-token details. Empty string ("")
+  when has_video is True but no matching iframe markup is present
+  (e.g. a URL-pattern or metadata-only video signal).
 
 ═══════════════════════════════════════════════════════════════
 LOCAL USAGE (Phase 1)
@@ -114,6 +120,26 @@ PROGRAMMATIC
 CHANGE LOG
 ═══════════════════════════════════════════════════════════════
 
+v1.1.0 — has_video fix + new video_url field
+    VIDEO_CSS_SIGNALS was missing Vimeo entirely (vimeoapi,
+    vimeovideoblock, player.vimeo.com class/src patterns) — confirmed
+    live on royallondon.com pages using Vimeo (e.g. understanding-
+    compound-growth, about-us/how-we-are-run/mutuality), which were
+    silently scraped with has_video=False. Added those 3 signals to
+    VIDEO_CSS_SIGNALS; no other detection logic changed.
+    New extract_video_url() function + video_url field on page_data
+    (and on dropdown-state entries, which previously had no video_url
+    key at all). Confirmed live that Royal London's Vimeo iframes are
+    lazy-loaded — the real URL is in data-src, not src, until a JS
+    swap fires on scroll-into-view — so data-src is checked first,
+    src as fallback. Confirmed manually that the ?h=<hash> query
+    param is a required Vimeo access token, not a trackable/strippable
+    param (the video errors without it) — so the full URL including
+    query string is stored, not truncated at "?".
+    NOTE: chunk_and_index_hqaV5.py's indexing schema does not yet
+    have a video_url field — this scraper now outputs it, but it
+    won't be indexed until that's added separately.
+
 v1.0.0 — Initial version
     Fresh, separate rebuild of the offline scraper. Removes the
     Playwright/crawl4ai browser-automation dependency entirely
@@ -154,7 +180,7 @@ log = structlog.get_logger()
 # ═══════════════════════════════════════════════════════════════
 # Versioning
 # ═══════════════════════════════════════════════════════════════
-SCRAPER_VERSION  = "1.0.0"
+SCRAPER_VERSION  = "1.1.0"
 METADATA_VERSION = "1.0.0"
 SCRAPE_RUN_ID    = str(_uuid.uuid4())
 
@@ -230,6 +256,10 @@ VIDEO_CSS_SIGNALS = [
     "video-player", "webinar-player", "brightcove-player", "bc-player",
     "vjs-tech", "kaltura-player", "jwplayer", "data-video-id",
     "data-webinar-id", "data-brightcove",
+    # Vimeo embeds (e.g. <iframe class="vimeoapi" src="https://player.vimeo.com/...">)
+    # — confirmed missed on live RLG article pages using Vimeo, not covered by
+    # any pattern above.
+    "vimeoapi", "vimeovideoblock", "player.vimeo.com",
 ]
 VIDEO_URL_SIGNALS = ["/webinars/", "/videos/", "/video/", "/webinar/"]
 VIDEO_COLLECTION_SIGNALS = ["webinar", "video", "podcast"]
@@ -406,6 +436,63 @@ def detect_video_from_html(html: str, url: str) -> bool:
         log.warning("video_detection_parse_error", url=url, error=str(e))
 
     return False
+
+
+# Iframe src hosts extract_video_url() knows how to pull a direct link
+# from. Vimeo is the confirmed, primary case on royallondon.com.
+VIDEO_IFRAME_HOSTS = [
+    "player.vimeo.com",
+    "youtube.com/embed",
+    "players.brightcove.net",
+]
+
+
+def extract_video_url(html: str, url: str) -> str:
+    """
+    Extract the direct video iframe URL, when one of VIDEO_IFRAME_HOSTS
+    is present. Static HTML only — no JS needed for this specifically
+    (see below).
+
+    CONFIRMED live on royallondon.com (view-source, not rendered DOM —
+    e.g. /about-us/how-we-are-run/mutuality/): Royal London's Vimeo
+    iframes are lazy-loaded — the real URL sits in `data-src`, and
+    `src` is absent entirely until a JS swap fires on scroll-into-view.
+    E.g.:
+        <iframe class="vimeoapi" data-src="https://player.vimeo.com/video/1201748881?h=..." ...>
+    So `data-src` is checked FIRST (the confirmed case), then `src` as
+    a fallback for any template that doesn't lazy-load. A couple of
+    other common lazy-load attribute names (data-lazy-src,
+    data-vimeo-src) are included defensively — UNCONFIRMED for this
+    site, harmless no-ops if absent.
+
+    IMPORTANT: the query string is NOT stripped. For Vimeo, `?h=<hash>`
+    is a required access token for unlisted/private videos, not a
+    tracking param — confirmed manually (plays with it, Vimeo returns
+    an error page without it). The full attribute value is returned
+    as-is.
+
+    Returns "" on no match, no html, or any parse exception — a
+    failure to extract a video URL should never crash the scrape of
+    an otherwise-good page, mirroring detect_video_from_html()'s own
+    fail-safe behaviour.
+    """
+    if not html:
+        return ""
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        candidate_attrs = ["data-src", "src", "data-lazy-src", "data-vimeo-src"]
+        for iframe in soup.find_all("iframe"):
+            for attr in candidate_attrs:
+                val = (iframe.get(attr) or "").strip()
+                if not val:
+                    continue
+                for host in VIDEO_IFRAME_HOSTS:
+                    if host in val.lower():
+                        return val
+    except Exception as e:
+        log.warning("video_url_extraction_error", url=url, error=str(e))
+
+    return ""
 
 
 def extract_page_metadata(html: str, url: str) -> dict:
@@ -1284,6 +1371,7 @@ def extract_dropdown_states_from_html(
                 "scrape_run_id":    SCRAPE_RUN_ID,
                 "audience":         base_page_data["audience"],
                 "has_video":        base_page_data["has_video"],
+                "video_url":        base_page_data["video_url"],
                 "content_type":     base_page_data["content_type"],
                 "product_category": base_page_data["product_category"],
                 "description":      base_page_data["description"],
@@ -1449,6 +1537,7 @@ def scrape_page(
 
             "audience":         metadata["audience"],
             "has_video":        metadata["has_video"],
+            "video_url":        extract_video_url(html, url) if metadata["has_video"] else "",
             "content_type":     map_excel_category_to_content_type(excel_category, url),
             "product_category": metadata["product_category"],
             "description":      metadata["description"],
