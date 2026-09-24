@@ -145,6 +145,13 @@ def extract_video_url(html: str) -> str:
     Returns "" if no matching iframe/attribute is found (has_video can
     still be True from a signal that isn't an iframe-based player —
     that's expected, just means no video_url to extract for that page).
+
+    IMPORTANT — the query string is NOT stripped. For Vimeo, `?h=<hash>`
+    is a required access token for unlisted/private videos, not a
+    tracking param: confirmed live (royallondon.com/about-us/how-we-are-run/mutuality/)
+    that the URL 404s/"Sorry, we're having a little trouble"s without
+    it, and plays correctly with it. So the full attribute value —
+    query string included — is returned as-is.
     """
     if not html:
         return ""
@@ -158,7 +165,7 @@ def extract_video_url(html: str) -> str:
                     continue
                 for host in VIDEO_IFRAME_HOSTS:
                     if host in val.lower():
-                        return val.split("?")[0]  # strip tracking params, keep the id
+                        return val  # full URL incl. query string — required for Vimeo's ?h= access token
     except Exception:
         pass
     return ""
