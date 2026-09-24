@@ -63,21 +63,21 @@ WHAT'S NEW / REPLACED:
   - No async, no crawl4ai, no Playwright, no CDP/Chrome subprocess
     handling — all removed as dead weight for this architecture.
 
-OUTPUT FIELDS PER PAGE (adds has_video fix + video_url to V5's schema —
-chunk_and_index must add a video_url field to its own indexing schema
-to store this new column; everything else is unchanged):
+OUTPUT FIELDS PER PAGE (unchanged from V5 — schema compatibility is
+required for chunk_and_index to keep working without changes):
     url, title, section, audience, content, scraped_at,
     content_length, content_hash, has_video, video_url, content_type,
     product_category, description, thumbnail_url, publish_date,
     collection_name, read_time_mins, dropdown_state, dropdown_value,
     scraper_version, metadata_version, scrape_run_id
   thumbnail_url is present but currently always None — see "Image
-  extraction" above. video_url is populated when has_video is True and
-  a matching iframe (Vimeo confirmed; YouTube/Brightcove included
-  defensively) is found — see extract_video_url() docstring for the
-  data-src lazy-load and ?h= access-token details. Empty string ("")
-  when has_video is True but no matching iframe markup is present
-  (e.g. a URL-pattern or metadata-only video signal).
+  extraction" above.
+  video_url (new in v1.1.0) is populated only when has_video is True
+  AND a matching <iframe> host is found (VIDEO_IFRAME_HOSTS) — it is
+  "" when has_video is True but no matching iframe is found (e.g.
+  video detected only via a CSS class/meta signal), and "" when
+  has_video is False. NOTE: chunk_and_index_hqaV5.py's indexing
+  schema does not yet have a video_url field — see changelog.
 
 ═══════════════════════════════════════════════════════════════
 LOCAL USAGE (Phase 1)
@@ -165,6 +165,7 @@ import sys
 import time
 import uuid as _uuid
 import urllib.parse
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -256,9 +257,9 @@ VIDEO_CSS_SIGNALS = [
     "video-player", "webinar-player", "brightcove-player", "bc-player",
     "vjs-tech", "kaltura-player", "jwplayer", "data-video-id",
     "data-webinar-id", "data-brightcove",
-    # Vimeo embeds (e.g. <iframe class="vimeoapi" src="https://player.vimeo.com/...">)
-    # — confirmed missed on live RLG article pages using Vimeo, not covered by
-    # any pattern above.
+    # Vimeo — confirmed live on royallondon.com (e.g. understanding-
+    # compound-growth, about-us/how-we-are-run/mutuality) which were
+    # previously silently scraped with has_video=False.
     "vimeoapi", "vimeovideoblock", "player.vimeo.com",
 ]
 VIDEO_URL_SIGNALS = ["/webinars/", "/videos/", "/video/", "/webinar/"]
@@ -438,8 +439,6 @@ def detect_video_from_html(html: str, url: str) -> bool:
     return False
 
 
-# Iframe src hosts extract_video_url() knows how to pull a direct link
-# from. Vimeo is the confirmed, primary case on royallondon.com.
 VIDEO_IFRAME_HOSTS = [
     "player.vimeo.com",
     "youtube.com/embed",
@@ -449,32 +448,27 @@ VIDEO_IFRAME_HOSTS = [
 
 def extract_video_url(html: str, url: str) -> str:
     """
-    Extract the direct video iframe URL, when one of VIDEO_IFRAME_HOSTS
-    is present. Static HTML only — no JS needed for this specifically
-    (see below).
+    Extract the actual embedded video URL (not just presence) from an
+    <iframe> in the page HTML, for the known video-host patterns in
+    VIDEO_IFRAME_HOSTS.
 
-    CONFIRMED live on royallondon.com (view-source, not rendered DOM —
-    e.g. /about-us/how-we-are-run/mutuality/): Royal London's Vimeo
-    iframes are lazy-loaded — the real URL sits in `data-src`, and
-    `src` is absent entirely until a JS swap fires on scroll-into-view.
-    E.g.:
-        <iframe class="vimeoapi" data-src="https://player.vimeo.com/video/1201748881?h=..." ...>
-    So `data-src` is checked FIRST (the confirmed case), then `src` as
-    a fallback for any template that doesn't lazy-load. A couple of
-    other common lazy-load attribute names (data-lazy-src,
-    data-vimeo-src) are included defensively — UNCONFIRMED for this
-    site, harmless no-ops if absent.
+    Checks candidate_attrs in priority order: data-src, src,
+    data-lazy-src, data-vimeo-src. data-src is checked FIRST because
+    Royal London's Vimeo iframes are lazy-loaded — the real URL lives
+    in data-src until a JS swap fires on scroll-into-view, and src is
+    often empty or a placeholder until then (confirmed live).
 
-    IMPORTANT: the query string is NOT stripped. For Vimeo, `?h=<hash>`
-    is a required access token for unlisted/private videos, not a
-    tracking param — confirmed manually (plays with it, Vimeo returns
-    an error page without it). The full attribute value is returned
-    as-is.
+    The full URL including its query string is returned unmodified —
+    Vimeo's `?h=<hash>` parameter is a required access token, not a
+    trackable/strippable tracking param; the video fails to load
+    without it.
 
-    Returns "" on no match, no html, or any parse exception — a
-    failure to extract a video URL should never crash the scrape of
-    an otherwise-good page, mirroring detect_video_from_html()'s own
-    fail-safe behaviour.
+    Returns "" (not None) if no matching iframe is found, or on any
+    parse exception — this mirrors detect_video_from_html()'s
+    fail-safe behaviour (a video-url miss should never crash the
+    scrape of an otherwise-good page), and is why has_video=True with
+    video_url="" is a valid, expected combination (video detected via
+    a CSS/meta signal, but no iframe host we recognise was present).
     """
     if not html:
         return ""
@@ -491,7 +485,6 @@ def extract_video_url(html: str, url: str) -> str:
                         return val
     except Exception as e:
         log.warning("video_url_extraction_error", url=url, error=str(e))
-
     return ""
 
 
@@ -1389,6 +1382,35 @@ def extract_dropdown_states_from_html(
 
 
 # ═══════════════════════════════════════════════════════════════
+# Failure tracking — NEW. V5 only ever counted failed pages; it never
+# recorded WHICH url failed or WHY, so diagnosing a failure meant
+# re-reading the whole run's log output line by line. Since
+# scrape_page() runs concurrently across a ThreadPoolExecutor, this
+# store is a plain dict guarded by a lock (dict assignment is
+# effectively atomic under the GIL for this simple case, but the lock
+# makes that guarantee explicit rather than relying on an
+# implementation detail).
+# ═══════════════════════════════════════════════════════════════
+
+_FAILURE_REASONS: dict[str, str] = {}
+_FAILURE_REASONS_LOCK = threading.Lock()
+
+
+def _record_failure(url: str, reason: str) -> None:
+    """Thread-safe: record why a given URL failed, for run_scraper() to report."""
+    with _FAILURE_REASONS_LOCK:
+        _FAILURE_REASONS[url] = reason
+
+
+def _get_failure_reason(url: str) -> str:
+    """Look up a recorded failure reason; falls back to a generic label
+    if scrape_page() failed via a path that didn't call _record_failure()
+    (shouldn't happen, but never let a missing reason crash reporting)."""
+    with _FAILURE_REASONS_LOCK:
+        return _FAILURE_REASONS.get(url, "unknown_error: no reason recorded")
+
+
+# ═══════════════════════════════════════════════════════════════
 # Fetch — REPLACED. requests.get() instead of crawl4ai. Supports a
 # local-fixture override for Phase 1 controlled testing (new/
 # changed/unchanged/broken-content scenarios) without depending on
@@ -1479,6 +1501,12 @@ def scrape_page(
         list[dict]  — multi-state dropdown page: first entry is the
                       base page, subsequent entries are per-option states
         None        — scrape failed
+
+    On any failure path (returns None), the reason is also recorded
+    via _record_failure() so run_scraper() can report WHICH url failed
+    and WHY, not just a bare count — V5 never surfaced this, leaving
+    "1 page failed" with no way to tell a timeout from a 404 from a
+    too-short/broken page without re-reading the whole log.
     """
     url = page_info["url"]
     title = page_info["title"]
@@ -1489,15 +1517,25 @@ def scrape_page(
     html, status_code, fetch_error = fetch_html(url, fixture_dir=fixture_dir)
 
     if fetch_error is not None:
+        # requests.exceptions.Timeout, ConnectionError etc. surface here
+        # as fetch_error's string — a timeout will literally contain
+        # "Timeout" or "timed out" in that string, which is how to
+        # distinguish it from a DNS/connection failure at a glance.
+        reason = f"fetch_error: {fetch_error}"
         log.error("scrape_fetch_error", url=url, error=fetch_error)
+        _record_failure(url, reason)
         return None
 
     if status_code is not None and status_code >= 400:
+        reason = f"http_error: status {status_code}"
         log.error("scrape_http_error", url=url, status_code=status_code)
+        _record_failure(url, reason)
         return None
 
     if not html:
+        reason = "empty_response: server returned 200 but no HTML body"
         log.warning("content_empty", url=url)
+        _record_failure(url, reason)
         return None
 
     try:
@@ -1505,13 +1543,26 @@ def scrape_page(
         page_content = html_fragment_to_markdown(main_html)
 
         if not page_content or len(page_content.strip()) < 100:
+            reason = (
+                f"content_too_short: {len(page_content or '')} chars in "
+                f"main content region before cleaning (min 100) — page "
+                f"may not use the expected main/article/.content selector, "
+                f"or is genuinely a near-empty page"
+            )
             log.warning("content_too_short", url=url, length=len(page_content or ""))
+            _record_failure(url, reason)
             return None
 
         page_content = clean_content(page_content)
 
         if len(page_content.strip()) < 50:
+            reason = (
+                f"content_too_short_after_cleaning: {len(page_content.strip())} "
+                f"chars remained after clean_content() removed boilerplate "
+                f"(min 50) — page may be almost entirely nav/footer/share links"
+            )
             log.warning("content_too_short_after_cleaning", url=url)
+            _record_failure(url, reason)
             return None
 
         # Metadata extracted from the FULL page HTML (meta tags live in
@@ -1580,7 +1631,9 @@ def scrape_page(
         return page_data
 
     except Exception as e:
+        reason = f"unexpected_error: {type(e).__name__}: {e}"
         log.error("scrape_error", url=url, error=str(e))
+        _record_failure(url, reason)
         return None
 
 
@@ -1654,15 +1707,18 @@ def run_scraper(
                      live URLs (Phase 1 controlled testing).
 
     Returns dict: success, pages_scraped, pages_failed, output_path,
-    dry_run, error, elapsed_seconds — same shape as V5 plus
-    elapsed_seconds (new — V5 never reported run duration).
+    dry_run, error, elapsed_seconds, failed_urls, failures_path — the
+    last three are new (V5 only ever reported a bare failure COUNT,
+    never which URL failed, why, or a run duration). failed_urls is a
+    list of {"url": ..., "reason": ...} dicts; failures_path is the
+    JSON file those are also written to (empty string if nothing failed).
     """
     run_started_at = time.monotonic()
 
     result = {
         "success": False, "pages_scraped": 0, "pages_failed": 0,
         "output_path": "", "dry_run": dry_run, "error": "",
-        "elapsed_seconds": 0.0,
+        "elapsed_seconds": 0.0, "failed_urls": [], "failures_path": "",
     }
 
     try:
@@ -1681,6 +1737,13 @@ def run_scraper(
         pages_to_scrape = load_url_source(excel)
         total = len(pages_to_scrape)
         scraped, failed_urls = [], []
+
+        # Clear any failure reasons left over from a previous run_scraper()
+        # call in this same process (e.g. repeated test runs, or a
+        # long-lived Function App instance across invocations) so a
+        # stale reason can never be misattributed to this run's failures.
+        with _FAILURE_REASONS_LOCK:
+            _FAILURE_REASONS.clear()
 
         log.info(
             "scraper_pipeline_started", total_urls=total, excel=excel,
@@ -1701,7 +1764,10 @@ def run_scraper(
 
             for page_info, r in zip(batch, batch_results):
                 if r is None:
-                    failed_urls.append(page_info["url"])
+                    failed_urls.append({
+                        "url": page_info["url"],
+                        "reason": _get_failure_reason(page_info["url"]),
+                    })
                 elif isinstance(r, list):
                     scraped.extend(entry for entry in r if entry.get("content_length", 0) >= 20)
                 else:
@@ -1713,6 +1779,28 @@ def run_scraper(
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         output_file = Path("scraper/data") / f"royal_london_faq_approved_httpV1_{timestamp}.json"
         output_path = save_scraped_pages(scraped, output_file)
+
+        # Write failures (url + reason) to their own JSON file, right
+        # next to the main output — so a failed run can be diagnosed
+        # by opening one small file instead of scrolling the console
+        # log looking for scrape_fetch_error / scrape_http_error /
+        # content_too_short lines. Written whenever there's at least
+        # one failure, independent of whether the overall run
+        # succeeded — a "313 of 314 scraped" run should still leave a
+        # clear trail for that 1 failure.
+        failures_path = ""
+        if failed_urls:
+            failures_file = Path("scraper/data") / f"royal_london_faq_approved_httpV1_{timestamp}_failures.json"
+            failures_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(failures_file, "w", encoding="utf-8") as f:
+                json.dump(failed_urls, f, ensure_ascii=False, indent=2)
+            failures_path = str(failures_file)
+            log.warning(
+                "scrape_failures_written", file=failures_path, count=len(failed_urls),
+            )
+
+        result["failed_urls"] = failed_urls
+        result["failures_path"] = failures_path
 
         if not output_path:
             result["elapsed_seconds"] = round(time.monotonic() - run_started_at, 2)
@@ -1777,6 +1865,10 @@ def main():
         print(f"\n✅ Scraped {result['pages_scraped']} pages "
               f"({result['pages_failed']} failed) → {result['output_path']}")
         print(f"   Time taken: {result['elapsed_seconds']}s ({mins:.1f} min)")
+        if result["failures_path"]:
+            print(f"   Failures (url + reason): {result['failures_path']}")
+            for f in result["failed_urls"]:
+                print(f"     - {f['url']}\n       reason: {f['reason']}")
 
 
 if __name__ == "__main__":
