@@ -61,6 +61,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+import urllib.parse
 from urllib.parse import urlparse
 
 import aiohttp
@@ -69,7 +70,7 @@ import structlog
 from bs4 import BeautifulSoup
 from dotenv import find_dotenv, load_dotenv
 from markdownify import markdownify as _markdownify
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
