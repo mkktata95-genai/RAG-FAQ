@@ -79,6 +79,17 @@ check("double-space-only diff collapses to the same hash (no false positive)",
 
 print()
 print("=" * 60)
+print("5. Matches the ACTUAL stored content_hash in rlg-faq-index-test")
+print("   (ground truth, confirmed via Azure Search Explorer on VDI for")
+print("   understanding-compound-growth, chunk_index=1 of 9)")
+print("=" * 60)
+STORED_INDEX_HASH = "0333a8e2b560ec9e5935b38c1a61286e20292ea62ced166c0e729ff778db6640"
+check("fresh hash matches the value actually stored in Azure AI Search",
+      hash_a == STORED_INDEX_HASH,
+      f"{hash_a} != {STORED_INDEX_HASH}")
+
+print()
+print("=" * 60)
 print(f"RESULT: {passed} passed, {failed} failed")
 print("=" * 60)
 
