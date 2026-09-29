@@ -1597,10 +1597,11 @@ def scrape_page(
             # discarded here). The citation-card image field is being
             # redesigned from scratch (single field, not two competing
             # sources) and its extraction logic is still being
-            # finalized separately. None is safer than a value that
-            # might not match whatever the final logic decides is
-            # correct — wire the real value in once that logic lands.
-            "thumbnail_url":    None,
+            # finalized separately. Empty string (not None) so the
+            # field is always a valid Edm.String for the indexer with
+            # no defensive None-coercion needed downstream — wire the
+            # real value in once that logic lands.
+            "thumbnail_url":    "",
             "publish_date":     metadata["publish_date"],
             "collection_name":  metadata["collection_name"],
             "read_time_mins":   metadata["read_time_mins"],
