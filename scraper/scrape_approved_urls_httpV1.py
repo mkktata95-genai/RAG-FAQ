@@ -1351,8 +1351,8 @@ def extract_dropdown_states_from_html(
             state_url = f"{url}#state={urllib.parse.quote(safe_value)}"
 
             results.append({
-                "url":              state_url,
-                "parent_url":       url,
+                "source_url":       url,
+                "state_url":        state_url,
                 "title":            f"{base_title} — {opt_text}",
                 "section":          base_page_data["section"],
                 "content":          content,
@@ -1574,7 +1574,8 @@ def scrape_page(
         url = normalize_url(url)
 
         page_data = {
-            "url":            url,
+            "source_url":     url,
+            "state_url":      "",
             "title":          title,
             "section":        derive_section(url),
             "content":        page_content.strip(),

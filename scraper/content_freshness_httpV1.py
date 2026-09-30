@@ -1122,8 +1122,8 @@ def extract_dropdown_states_from_html(
             state_url = f"{url}#state={urllib.parse.quote(safe_value)}"
 
             results.append({
-                "url":              state_url,
-                "parent_url":       url,
+                "source_url":       url,
+                "state_url":        state_url,
                 "title":            f"{base_title} — {opt_text}",
                 "section":          base_page_data["section"],
                 "content":          content,
@@ -1564,9 +1564,12 @@ def chunk_pages(pages: list, refresh_run_id: str = "") -> list:
     _index_run_id = refresh_run_id or str(uuid.uuid4())
     _indexed_at = datetime.now(timezone.utc).isoformat()
 
+    # Dedup key: state_url when present (dropdown chunk identity),
+    # else source_url — two dropdown states under the same base page
+    # legitimately share source_url now.
     seen_urls, dedup_pages = set(), []
     for p in pages:
-        pu = p.get("url", "")
+        pu = p.get("state_url") or p.get("source_url", "")
         if pu and pu not in seen_urls:
             seen_urls.add(pu)
             dedup_pages.append(p)
@@ -1578,7 +1581,8 @@ def chunk_pages(pages: list, refresh_run_id: str = "") -> list:
     for page in pages:
         content = page.get("content", "").strip()
         title = page.get("title", "")
-        url = page.get("url", "")
+        url = page.get("source_url", "")
+        state_url = page.get("state_url", "")
         section = page.get("section", "")
         audience = page.get("audience", "customer")
 
@@ -1595,7 +1599,7 @@ def chunk_pages(pages: list, refresh_run_id: str = "") -> list:
             "audience": audience,
             "scraped_at": page.get("scraped_at", ""),
             "content_hash": page_hash,
-            "parent_url": page.get("parent_url", ""),
+            "state_url": state_url,
             "pipeline_version": PIPELINE_VERSION,
             "index_run_id": _index_run_id,
             "indexed_at": _indexed_at,
@@ -1620,7 +1624,10 @@ def chunk_pages(pages: list, refresh_run_id: str = "") -> list:
             stripped = content_with_title.strip()
             if len(stripped) >= 50:
                 chunks.append({
-                    "chunk_id": compute_chunk_id(url, 0, stripped),
+                    # identity for chunk_id must be state_url — source_url
+                    # is the shared base page url and would otherwise
+                    # collide with the base page's own chunk_index=0.
+                    "chunk_id": compute_chunk_id(state_url or url, 0, stripped),
                     "content": stripped,
                     "source_url": url,
                     "title": title,
@@ -1751,10 +1758,19 @@ def upload_chunks(chunks: list, embeddings: list) -> int:
 
 def fetch_current_state_from_index() -> dict:
     """
-    Read {normalised_base_url: {content_hash, video_url}} for every
-    page currently in the index — one page per base URL (dropdown
-    #state= variants share their parent's content_hash/video_url, so
-    only the first row seen per base URL is kept).
+    Read {normalised_identity_url: {content_hash, video_url, is_dropdown,
+    source_url}} for every DISTINCT chunk identity currently in the index.
+
+    identity_url = state_url when non-empty, else source_url. Since the
+    schema change, source_url is ALWAYS the clean, navigable base page
+    URL — including for dropdown-state chunks — so every dropdown state
+    under one base page now shares the same source_url. Keying this dict
+    by source_url alone would collapse them all into one entry again
+    (the exact bug this function was fixed for previously): a dropdown
+    state's own content_hash (hashed from just that panel's text) would
+    get silently overwritten by/lost to whichever chunk the paginated
+    scan saw first. state_url is the real per-chunk identity and must be
+    the key whenever it's present.
     """
     client = get_search_client()
     state: dict = {}
@@ -1763,18 +1779,23 @@ def fetch_current_state_from_index() -> dict:
         try:
             results = client.search(
                 search_text="*",
-                select=["source_url", "content_hash", "video_url"],
+                select=["source_url", "state_url", "content_hash", "video_url"],
                 top=page_sz, skip=skip,
             )
             batch = list(results)
             if not batch:
                 break
             for r in batch:
-                base = normalise_url(get_base_url(r.get("source_url", "")))
-                if base and base not in state:
-                    state[base] = {
+                src = r.get("source_url", "")
+                st = r.get("state_url", "")
+                identity = st or src
+                norm = normalise_url(identity)
+                if norm and norm not in state:
+                    state[norm] = {
                         "content_hash": r.get("content_hash", ""),
                         "video_url": r.get("video_url", ""),
+                        "is_dropdown": bool(st),
+                        "source_url": src,
                     }
             if len(batch) < page_sz:
                 break
@@ -1787,8 +1808,19 @@ def fetch_current_state_from_index() -> dict:
 
 
 def get_chunk_ids_for_url(url: str) -> list:
+    """
+    Every chunk_id whose source_url matches this base page URL.
+
+    Since the schema change, source_url is ALWAYS the clean base page
+    URL — for a page's own prose/table chunks AND for every one of its
+    dropdown-state chunks (which used to carry the #state=... fragment
+    here; that now lives in state_url instead). So a single source_url
+    match already captures the base page's own chunks and every
+    dropdown variant in one pass — no separate fragment-expansion step
+    needed (see the removed get_all_urls_to_delete()).
+    """
     client = get_search_client()
-    norm = normalise_url(get_base_url(url))
+    norm = normalise_url(url)
     ids, skip, page_sz = [], 0, 1000
     try:
         while True:
@@ -1797,7 +1829,7 @@ def get_chunk_ids_for_url(url: str) -> list:
             if not batch:
                 break
             for r in batch:
-                if normalise_url(get_base_url(r.get("source_url", ""))) == norm:
+                if normalise_url(r.get("source_url", "")) == norm:
                     ids.append(r["chunk_id"])
             if len(batch) < page_sz:
                 break
@@ -1805,31 +1837,6 @@ def get_chunk_ids_for_url(url: str) -> list:
     except Exception as e:
         log.error("get_chunk_ids_error", url=url, error=str(e))
     return ids
-
-
-def get_all_urls_to_delete(base_urls: list) -> list:
-    """Expand base URLs to include every #state= dropdown variant already in the index."""
-    client = get_search_client()
-    all_urls = set(base_urls)
-    skip, page_sz = 0, 1000
-    try:
-        while True:
-            results = client.search(search_text="*", select=["source_url"], top=page_sz, skip=skip)
-            batch = list(results)
-            if not batch:
-                break
-            for r in batch:
-                src = r.get("source_url", "")
-                if src and is_dropdown_url(src):
-                    base_norm = normalise_url(get_base_url(src))
-                    if any(normalise_url(b) == base_norm for b in base_urls):
-                        all_urls.add(src)
-            if len(batch) < page_sz:
-                break
-            skip += page_sz
-    except Exception as e:
-        log.warning("get_all_urls_to_delete_error", error=str(e))
-    return list(all_urls)
 
 
 def delete_chunks_for_urls(urls: list, dry_run: bool = False) -> dict:
@@ -1853,24 +1860,30 @@ def delete_chunks_for_urls(urls: list, dry_run: bool = False) -> dict:
     return summary
 
 
-def get_refresh_count_for_url(url: str) -> int:
+def get_refresh_count_for_url(identity_url: str) -> int:
+    """
+    identity_url should be state_url for a dropdown-state chunk, or
+    source_url for a regular chunk — matches how fetch_current_state_
+    from_index() keys entries, since source_url alone is no longer
+    unique for dropdown-state chunks (all share their base page's URL).
+    """
     client = get_search_client()
-    norm = normalise_url(get_base_url(url))
+    norm = normalise_url(identity_url)
     skip, page_sz = 0, 1000
     try:
         while True:
-            results = client.search(search_text="*", select=["source_url", "refresh_count"], top=page_sz, skip=skip)
+            results = client.search(search_text="*", select=["source_url", "state_url", "refresh_count"], top=page_sz, skip=skip)
             batch = list(results)
             if not batch:
                 break
             for r in batch:
-                if normalise_url(get_base_url(r.get("source_url", ""))) == norm:
+                if normalise_url(r.get("state_url") or r.get("source_url", "")) == norm:
                     return int(r.get("refresh_count") or 0)
             if len(batch) < page_sz:
                 break
             skip += page_sz
     except Exception as e:
-        log.warning("get_refresh_count_error", url=url, error=str(e))
+        log.warning("get_refresh_count_error", url=identity_url, error=str(e))
     return 0
 
 
@@ -1883,7 +1896,7 @@ def archive_deleted_chunks_locally(url: str, ts_str: str) -> str | None:
     causes a response-quality regression.
     """
     client = get_search_client()
-    norm = normalise_url(get_base_url(url))
+    norm = normalise_url(url)
     try:
         chunks, skip, page_sz = [], 0, 500
         while True:
@@ -1892,7 +1905,7 @@ def archive_deleted_chunks_locally(url: str, ts_str: str) -> str | None:
             if not batch:
                 break
             for r in batch:
-                if normalise_url(get_base_url(r.get("source_url", ""))) == norm:
+                if normalise_url(r.get("source_url", "")) == norm:
                     chunks.append(dict(r))
             if len(batch) < page_sz:
                 break
@@ -2005,7 +2018,8 @@ def scrape_url_for_freshness(entry: dict, fixture_dir: str | None = None) -> "li
         url = normalize_url(url)
 
         page_data = {
-            "url": url,
+            "source_url": url,
+            "state_url": "",
             "title": title,
             "section": derive_section(url),
             "content": page_content.strip(),
@@ -2071,7 +2085,7 @@ def validate_chunking_preflight(scraped_pages: list) -> dict:
         return result
 
     for page in scraped_pages:
-        url = page.get("url", "")
+        url = page.get("state_url") or page.get("source_url", "")
         try:
             chunks = chunk_pages([page])
             if not chunks and len(page.get("content", "").strip()) >= 100:
@@ -2307,7 +2321,13 @@ def run_freshness_job(mode: str = "report", excel_path: str | None = None,
         scan_results.append(row)
 
     # De-listed: in the index but no longer in the approved Excel.
-    delisted_bases = [b for b in current_state if b not in approved_norm_urls]
+    # Only check base-page entries (no #state=/#policy=) — a dropdown
+    # variant's exact URL never appears in the Excel by design, so
+    # checking dropdown keys here would false-flag every one of them.
+    delisted_bases = [
+        b for b in current_state
+        if not current_state[b]["is_dropdown"] and b not in approved_norm_urls
+    ]
     for base in delisted_bases:
         scan_results.append({
             "url": base, "title": "", "category": "", "is_dropdown": False,
@@ -2326,18 +2346,43 @@ def run_freshness_job(mode: str = "report", excel_path: str | None = None,
                 row["action"], row["notes"] = "scrape_failed", "Scrape returned no content."
             continue
 
-        base_page = pages[0]
-        base_norm = normalise_url(get_base_url(base_page["url"]))
-        stored = current_state.get(base_norm)
+        # Compare EVERY page scrape_url_for_freshness() returned — the
+        # base page AND each dropdown state — against its own exact
+        # source_url entry in current_state. Each dropdown state has
+        # its own independent content_hash (hashed from just that
+        # panel's text), so comparing only pages[0] (the base page)
+        # against a single collapsed value would miss a state-only
+        # edit entirely, or — the bug this replaced — compare the
+        # base page's fresh hash against a dropdown state's stored
+        # hash and false-flag "changed" on no real edit.
+        any_changed = False
+        any_video_changed = False
+        diff_notes = []
+        for pg in pages:
+            pg_identity = pg.get("state_url") or pg.get("source_url", "")
+            pg_norm = normalise_url(pg_identity)
+            stored = current_state.get(pg_norm)
+            if stored is None:
+                any_changed = True
+                diff_notes.append(f"new dropdown state: {pg_identity}" if pg.get("dropdown_state") else "content_hash differs")
+                continue
+            hash_diff = stored["content_hash"] != pg["content_hash"]
+            video_diff = (stored.get("video_url") or "") != (pg.get("video_url") or "")
+            if hash_diff or video_diff:
+                any_changed = True
+                if video_diff:
+                    any_video_changed = True
+                    diff_notes.append("video_url differs" if not hash_diff else "content_hash + video_url differ")
+                else:
+                    diff_notes.append("content_hash differs")
 
         if row and row["action"] != "new":
-            if stored and stored["content_hash"] == base_page["content_hash"] \
-               and (stored.get("video_url") or "") == (base_page.get("video_url") or ""):
+            if not any_changed:
                 row["action"], row["notes"] = "unchanged", ""
                 continue
             row["action"] = "changed"
-            row["video_changed"] = bool(stored) and (stored.get("video_url") or "") != (base_page.get("video_url") or "")
-            row["notes"] = "content_hash differs" if not row["video_changed"] else "video_url differs"
+            row["video_changed"] = any_video_changed
+            row["notes"] = "; ".join(dict.fromkeys(diff_notes))  # dedupe, preserve order
 
         scraped_pages.extend(pages)
 
@@ -2355,22 +2400,31 @@ def run_freshness_job(mode: str = "report", excel_path: str | None = None,
 
     if mode == "apply" and not dry_run:
         print("⚡ Step 7: Applying changes to the index...")
+        # No fragment-expansion step needed here: source_url is now the
+        # clean base URL for every chunk under a page, dropdown-state
+        # chunks included, so get_chunk_ids_for_url(base_url) — called
+        # inside delete_chunks_for_urls() — already matches the base
+        # page's own chunks AND every dropdown variant in one pass.
         urls_needing_delete = [
-            get_base_url(r["url"]) for r in scan_results
+            r["url"] for r in scan_results
             if r["action"] in ("changed", "removed_404", "removed_5xx", "removed_delisted",
                                 "removed_int_redir", "removed_ext_redir")
         ]
         if urls_needing_delete:
-            expanded = get_all_urls_to_delete(urls_needing_delete)
-            for url in expanded:
+            for url in urls_needing_delete:
                 archive_deleted_chunks_locally(url, ts_str)
-            deleted_summary = delete_chunks_for_urls(expanded)
+            deleted_summary = delete_chunks_for_urls(urls_needing_delete)
             chunks_deleted = sum(deleted_summary.values())
 
         pages_to_index = [p for p in scraped_pages]
         for p in pages_to_index:
-            base_norm = normalise_url(get_base_url(p["url"]))
-            p["refresh_count"] = get_refresh_count_for_url(p["url"]) + 1 if base_norm in current_state else 0
+            # refresh_count tracks THIS chunk's own prior count — for a
+            # dropdown-state page that's keyed by state_url (its real
+            # identity), not source_url (now shared with the base page
+            # and every other dropdown state under it).
+            p_identity = p.get("state_url") or p.get("source_url", "")
+            base_norm = normalise_url(p.get("source_url", ""))
+            p["refresh_count"] = get_refresh_count_for_url(p_identity) + 1 if base_norm in current_state or normalise_url(p_identity) in current_state else 0
 
         if pages_to_index:
             new_chunks = chunk_pages(pages_to_index, refresh_run_id=freshness_run_id)

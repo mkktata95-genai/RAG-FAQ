@@ -47,7 +47,8 @@ WHAT CARRIES OVER FROM V5 (unchanged logic):
     chunking for standard pages, URL dedup guard, all versioning
     fields (pipeline_version, scrape_run_id, index_run_id, indexed_at,
     refresh_count, scraper_version, metadata_version), all v3.0.0
-    enrichment fields, parent_url.
+    enrichment fields, state_url (dropdown-chunk identity field;
+    source_url is always the clean, navigable base page URL).
   Index schema — all non-HQA fields unchanged, including the
   chunk-duplication root-cause fix (deterministic chunk_id) and the
   content_hash retrievable=True / SHA-256 fix content_freshness.py
@@ -413,15 +414,20 @@ def compute_content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def compute_chunk_id(source_url: str, chunk_index: int, content: str) -> str:
+def compute_chunk_id(identity_url: str, chunk_index: int, content: str) -> str:
     """
-    Deterministic chunk_id — SHA-256 of (source_url, chunk_index, content).
+    Deterministic chunk_id — SHA-256 of (identity_url, chunk_index, content).
     Same URL + same position + same text always produces the same ID,
     so re-processing (retry, re-run) overwrites instead of duplicating.
     chunk_index is included so two genuinely different chunks that
     happen to share identical text don't collide into one ID.
+
+    identity_url must be the DISTINGUISHING url for this chunk — for a
+    dropdown-state chunk that is state_url (the #state=... one), not
+    source_url (which is now always the clean base page url and would
+    otherwise collide with chunk 0 of the base page's own chunks).
     """
-    return hashlib.sha256(f"{source_url}|{chunk_index}|{content}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{identity_url}|{chunk_index}|{content}".encode("utf-8")).hexdigest()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -444,9 +450,13 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
     _index_run_id = str(uuid.uuid4())
     _indexed_at = datetime.now(timezone.utc).isoformat()
 
+    # Dedup key: state_url when present (dropdown chunk identity),
+    # else source_url — two dropdown states under the same base page
+    # legitimately share source_url now, so deduping on source_url
+    # alone would drop all but one of them.
     seen_urls, dedup_pages = set(), []
     for p in pages:
-        pu = p.get("url", "")
+        pu = p.get("state_url") or p.get("source_url", "")
         if pu and pu not in seen_urls:
             seen_urls.add(pu)
             dedup_pages.append(p)
@@ -458,7 +468,8 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
     for page in pages:
         content = page.get("content", "").strip()
         title = page.get("title", "")
-        url = page.get("url", "")
+        url = page.get("source_url", "")
+        state_url = page.get("state_url", "")
         section = page.get("section", "")
         audience = page.get("audience", "customer")
 
@@ -475,7 +486,7 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
             "audience": audience,
             "scraped_at": page.get("scraped_at", ""),
             "content_hash": page_hash,
-            "parent_url": page.get("parent_url", ""),
+            "state_url": state_url,
             "pipeline_version": PIPELINE_VERSION,
             "index_run_id": _index_run_id,
             "indexed_at": _indexed_at,
@@ -500,7 +511,10 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
             stripped = content_with_title.strip()
             if len(stripped) >= 50:
                 chunks.append({
-                    "chunk_id": compute_chunk_id(url, 0, stripped),
+                    # identity for chunk_id must be state_url — source_url
+                    # is now the shared base page url, and would otherwise
+                    # collide with the base page's own chunk_index=0.
+                    "chunk_id": compute_chunk_id(state_url or url, 0, stripped),
                     "content": stripped,
                     "source_url": url,
                     "title": title,
@@ -509,7 +523,7 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
                     "element_type": "dropdown_state",
                     **common_fields,
                 })
-                log.info("dropdown_atomic_chunk", url=url,
+                log.info("dropdown_atomic_chunk", url=url, state_url=state_url,
                          dropdown_state=page.get("dropdown_state"), chars=len(stripped))
             continue
 
@@ -727,7 +741,13 @@ def create_or_update_index(fresh: bool = False):
                          searchable=True, filterable=True, sortable=False, facetable=True, retrievable=True),
         SimpleField(name="read_time_mins", type=SearchFieldDataType.String,
                     searchable=False, filterable=True, sortable=False, facetable=False, retrievable=True),
-        SimpleField(name="parent_url", type=SearchFieldDataType.String,
+        # source_url is ALWAYS the clean, navigable base page URL — for a
+        # dropdown-state chunk too, not just standard chunks. state_url
+        # carries the #state=... fragment ONLY for dropdown-state chunks
+        # ("" otherwise) — it exists purely as an internal distinguishing
+        # identity (chunk_id, freshness comparison), never for display.
+        # Any consumer can just read source_url with no OR-fallback.
+        SimpleField(name="state_url", type=SearchFieldDataType.String,
                     searchable=False, filterable=True, sortable=False, facetable=False, retrievable=True),
         SimpleField(name="element_type", type=SearchFieldDataType.String,
                     searchable=False, filterable=True, sortable=False, facetable=True, retrievable=True),
@@ -920,7 +940,7 @@ def run_pipeline(mode: str = "new-only", scraped_file: str | None = None, dry_ru
             indexed_urls = get_indexed_urls()
             pages_to_index = [
                 p for p in pages
-                if p.get("url", "").rstrip("/") not in {u.rstrip("/") for u in indexed_urls}
+                if p.get("source_url", "").rstrip("/") not in {u.rstrip("/") for u in indexed_urls}
             ]
             if not pages_to_index:
                 log.info("no_new_pages_to_index")
