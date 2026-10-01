@@ -9,7 +9,7 @@ in with the user before build:
   - HQA: dropped entirely (matches chunk_embed_index_v1.py, no-HQA index).
   - Index: single index only (no dual main/baseline split).
   - Redis: cache-invalidation step dropped entirely.
-  - thumbnail_url: always "" — matches scraper (image logic not finalized).
+  - page_image_url: always "" — matches scraper (image logic not finalized).
   - video_url: added as a comparison signal (content_hash alone won't catch
     a video swap, since markdownify strips <img>/video embeds are metadata).
   - chunk_id / pagination-safe index reads / redirect-aware health check /
@@ -464,7 +464,7 @@ def extract_page_metadata(html: str, url: str) -> dict:
                             <meta property="og:description">,
                             <meta name="st-description"> — truncated
                             to 300 chars for UI preview use
-      thumbnail_url      -> <meta name="teaser_image"> preferred (a
+      page_image_url      -> <meta name="teaser_image"> preferred (a
                             page-specific 350x200 image Royal London
                             sets deliberately); falls back to
                             og:image ONLY if it isn't the generic
@@ -492,7 +492,7 @@ def extract_page_metadata(html: str, url: str) -> dict:
         "product_category": derive_product_category(url),
         "audience":         derive_audience_from_url(url),
         "description":      "",
-        "thumbnail_url":    "",
+        "page_image_url":    "",
         "publish_date":     "",
         "collection_name":  "",
         "read_time_mins":   "5",
@@ -520,13 +520,13 @@ def extract_page_metadata(html: str, url: str) -> dict:
         # Thumbnail URL — meta-teaser_image > og:image (RL-logo filtered)
         teaser = soup.find("meta", attrs={"name": "teaser_image"})
         if teaser and teaser.get("content", "").strip():
-            metadata["thumbnail_url"] = teaser["content"].strip()
+            metadata["page_image_url"] = teaser["content"].strip()
         else:
             og_image = soup.find("meta", property="og:image")
             if og_image and og_image.get("content", "").strip():
                 img_url = og_image["content"].strip()
                 if "rl-logo-meta-image" not in img_url:
-                    metadata["thumbnail_url"] = img_url
+                    metadata["page_image_url"] = img_url
 
         # Publish date — "13 March 2024" -> "2024-03-13"
         pub_date_tag = soup.find("meta", attrs={"name": "st-publish-date"})
@@ -1119,12 +1119,12 @@ def extract_dropdown_states_from_html(
             opt_text = option["text"]
 
             safe_value = opt_value if opt_value else opt_text
-            state_url = f"{url}#state={urllib.parse.quote(safe_value)}"
+            dropdown_url = f"{url}#state={urllib.parse.quote(safe_value)}"
 
             results.append({
                 "source_url":       url,
-                "state_url":        state_url,
-                "title":            f"{base_title} — {opt_text}",
+                "dropdown_url":        dropdown_url,
+                "title":            base_title,
                 "section":          base_page_data["section"],
                 "content":          content,
                 "scraped_at":       datetime.now(timezone.utc).isoformat(),
@@ -1139,15 +1139,15 @@ def extract_dropdown_states_from_html(
                 "content_type":     base_page_data["content_type"],
                 "product_category": base_page_data["product_category"],
                 "description":      base_page_data["description"],
-                "thumbnail_url":    base_page_data["thumbnail_url"],
+                "page_image_url":    base_page_data["page_image_url"],
                 "publish_date":     base_page_data["publish_date"],
                 "collection_name":  base_page_data["collection_name"],
                 "read_time_mins":   str(max(1, len(content.split()) // 200)),
-                "dropdown_state":   opt_text,
+                "dropdown_title":   opt_text,
                 "dropdown_value":   opt_value or "",
             })
 
-            log.info("dropdown_option_scraped", url=state_url, option=opt_text, chars=len(content))
+            log.info("dropdown_option_scraped", url=dropdown_url, option=opt_text, chars=len(content))
 
     return results
 
@@ -1564,12 +1564,12 @@ def chunk_pages(pages: list, refresh_run_id: str = "") -> list:
     _index_run_id = refresh_run_id or str(uuid.uuid4())
     _indexed_at = datetime.now(timezone.utc).isoformat()
 
-    # Dedup key: state_url when present (dropdown chunk identity),
+    # Dedup key: dropdown_url when present (dropdown chunk identity),
     # else source_url — two dropdown states under the same base page
     # legitimately share source_url now.
     seen_urls, dedup_pages = set(), []
     for p in pages:
-        pu = p.get("state_url") or p.get("source_url", "")
+        pu = p.get("dropdown_url") or p.get("source_url", "")
         if pu and pu not in seen_urls:
             seen_urls.add(pu)
             dedup_pages.append(p)
@@ -1582,7 +1582,7 @@ def chunk_pages(pages: list, refresh_run_id: str = "") -> list:
         content = page.get("content", "").strip()
         title = page.get("title", "")
         url = page.get("source_url", "")
-        state_url = page.get("state_url", "")
+        dropdown_url = page.get("dropdown_url", "")
         section = page.get("section", "")
         audience = page.get("audience", "customer")
 
@@ -1599,7 +1599,8 @@ def chunk_pages(pages: list, refresh_run_id: str = "") -> list:
             "audience": audience,
             "scraped_at": page.get("scraped_at", ""),
             "content_hash": page_hash,
-            "state_url": state_url,
+            "dropdown_url": dropdown_url,
+            "dropdown_title": page.get("dropdown_title", ""),
             "pipeline_version": PIPELINE_VERSION,
             "index_run_id": _index_run_id,
             "indexed_at": _indexed_at,
@@ -1612,22 +1613,22 @@ def chunk_pages(pages: list, refresh_run_id: str = "") -> list:
             "content_type": page.get("content_type", "article"),
             "product_category": page.get("product_category", "general"),
             "description": page.get("description", ""),
-            "thumbnail_url": page.get("thumbnail_url") or "",
+            "page_image_url": page.get("page_image_url") or "",
             "publish_date": page.get("publish_date", ""),
             "collection_name": page.get("collection_name", ""),
             "read_time_mins": str(page.get("read_time_mins", "5")),
         }
 
-        is_dropdown_state = bool(page.get("dropdown_state", ""))
+        is_dropdown_state = bool(page.get("dropdown_title", ""))
 
         if is_dropdown_state:
             stripped = content_with_title.strip()
             if len(stripped) >= 50:
                 chunks.append({
-                    # identity for chunk_id must be state_url — source_url
+                    # identity for chunk_id must be dropdown_url — source_url
                     # is the shared base page url and would otherwise
                     # collide with the base page's own chunk_index=0.
-                    "chunk_id": compute_chunk_id(state_url or url, 0, stripped),
+                    "chunk_id": compute_chunk_id(dropdown_url or url, 0, stripped),
                     "content": stripped,
                     "source_url": url,
                     "title": title,
@@ -1761,7 +1762,7 @@ def fetch_current_state_from_index() -> dict:
     Read {normalised_identity_url: {content_hash, video_url, is_dropdown,
     source_url}} for every DISTINCT chunk identity currently in the index.
 
-    identity_url = state_url when non-empty, else source_url. Since the
+    identity_url = dropdown_url when non-empty, else source_url. Since the
     schema change, source_url is ALWAYS the clean, navigable base page
     URL — including for dropdown-state chunks — so every dropdown state
     under one base page now shares the same source_url. Keying this dict
@@ -1769,7 +1770,7 @@ def fetch_current_state_from_index() -> dict:
     (the exact bug this function was fixed for previously): a dropdown
     state's own content_hash (hashed from just that panel's text) would
     get silently overwritten by/lost to whichever chunk the paginated
-    scan saw first. state_url is the real per-chunk identity and must be
+    scan saw first. dropdown_url is the real per-chunk identity and must be
     the key whenever it's present.
     """
     client = get_search_client()
@@ -1779,7 +1780,7 @@ def fetch_current_state_from_index() -> dict:
         try:
             results = client.search(
                 search_text="*",
-                select=["source_url", "state_url", "content_hash", "video_url"],
+                select=["source_url", "dropdown_url", "content_hash", "video_url"],
                 top=page_sz, skip=skip,
             )
             batch = list(results)
@@ -1787,7 +1788,7 @@ def fetch_current_state_from_index() -> dict:
                 break
             for r in batch:
                 src = r.get("source_url", "")
-                st = r.get("state_url", "")
+                st = r.get("dropdown_url", "")
                 identity = st or src
                 norm = normalise_url(identity)
                 if norm and norm not in state:
@@ -1814,7 +1815,7 @@ def get_chunk_ids_for_url(url: str) -> list:
     Since the schema change, source_url is ALWAYS the clean base page
     URL — for a page's own prose/table chunks AND for every one of its
     dropdown-state chunks (which used to carry the #state=... fragment
-    here; that now lives in state_url instead). So a single source_url
+    here; that now lives in dropdown_url instead). So a single source_url
     match already captures the base page's own chunks and every
     dropdown variant in one pass — no separate fragment-expansion step
     needed (see the removed get_all_urls_to_delete()).
@@ -1862,7 +1863,7 @@ def delete_chunks_for_urls(urls: list, dry_run: bool = False) -> dict:
 
 def get_refresh_count_for_url(identity_url: str) -> int:
     """
-    identity_url should be state_url for a dropdown-state chunk, or
+    identity_url should be dropdown_url for a dropdown-state chunk, or
     source_url for a regular chunk — matches how fetch_current_state_
     from_index() keys entries, since source_url alone is no longer
     unique for dropdown-state chunks (all share their base page's URL).
@@ -1872,12 +1873,12 @@ def get_refresh_count_for_url(identity_url: str) -> int:
     skip, page_sz = 0, 1000
     try:
         while True:
-            results = client.search(search_text="*", select=["source_url", "state_url", "refresh_count"], top=page_sz, skip=skip)
+            results = client.search(search_text="*", select=["source_url", "dropdown_url", "refresh_count"], top=page_sz, skip=skip)
             batch = list(results)
             if not batch:
                 break
             for r in batch:
-                if normalise_url(r.get("state_url") or r.get("source_url", "")) == norm:
+                if normalise_url(r.get("dropdown_url") or r.get("source_url", "")) == norm:
                     return int(r.get("refresh_count") or 0)
             if len(batch) < page_sz:
                 break
@@ -2019,7 +2020,7 @@ def scrape_url_for_freshness(entry: dict, fixture_dir: str | None = None) -> "li
 
         page_data = {
             "source_url": url,
-            "state_url": "",
+            "dropdown_url": "",
             "title": title,
             "section": derive_section(url),
             "content": page_content.strip(),
@@ -2038,11 +2039,11 @@ def scrape_url_for_freshness(entry: dict, fixture_dir: str | None = None) -> "li
             # Always "" — matches scrape_approved_urls_httpV1.py. Image
             # logic not finalized; wire the real value in once it lands
             # (both here and in the scraper, together).
-            "thumbnail_url": "",
+            "page_image_url": "",
             "publish_date": metadata["publish_date"],
             "collection_name": metadata["collection_name"],
             "read_time_mins": metadata["read_time_mins"],
-            "dropdown_state": "",
+            "dropdown_title": "",
             "dropdown_value": "",
         }
 
@@ -2085,7 +2086,7 @@ def validate_chunking_preflight(scraped_pages: list) -> dict:
         return result
 
     for page in scraped_pages:
-        url = page.get("state_url") or page.get("source_url", "")
+        url = page.get("dropdown_url") or page.get("source_url", "")
         try:
             chunks = chunk_pages([page])
             if not chunks and len(page.get("content", "").strip()) >= 100:
@@ -2219,7 +2220,7 @@ def build_report(scan_results: list, run_summary: dict, output_path: Path) -> Pa
         ["De-listed URLs", "Removed from index — not in approved Excel."],
         ["Dropdown variants", "All #state= URLs deleted when base URL changes/removed."],
         ["Video/thumbnail", "content_hash does not cover video swaps or image changes — "
-                             "video_url compared separately; thumbnail_url always empty "
+                             "video_url compared separately; page_image_url always empty "
                              "for now (image logic not finalized)."],
     ]:
         ws3.append(row_data)
@@ -2359,12 +2360,12 @@ def run_freshness_job(mode: str = "report", excel_path: str | None = None,
         any_video_changed = False
         diff_notes = []
         for pg in pages:
-            pg_identity = pg.get("state_url") or pg.get("source_url", "")
+            pg_identity = pg.get("dropdown_url") or pg.get("source_url", "")
             pg_norm = normalise_url(pg_identity)
             stored = current_state.get(pg_norm)
             if stored is None:
                 any_changed = True
-                diff_notes.append(f"new dropdown state: {pg_identity}" if pg.get("dropdown_state") else "content_hash differs")
+                diff_notes.append(f"new dropdown state: {pg_identity}" if pg.get("dropdown_title") else "content_hash differs")
                 continue
             hash_diff = stored["content_hash"] != pg["content_hash"]
             video_diff = (stored.get("video_url") or "") != (pg.get("video_url") or "")
@@ -2419,10 +2420,10 @@ def run_freshness_job(mode: str = "report", excel_path: str | None = None,
         pages_to_index = [p for p in scraped_pages]
         for p in pages_to_index:
             # refresh_count tracks THIS chunk's own prior count — for a
-            # dropdown-state page that's keyed by state_url (its real
+            # dropdown-state page that's keyed by dropdown_url (its real
             # identity), not source_url (now shared with the base page
             # and every other dropdown state under it).
-            p_identity = p.get("state_url") or p.get("source_url", "")
+            p_identity = p.get("dropdown_url") or p.get("source_url", "")
             base_norm = normalise_url(p.get("source_url", ""))
             p["refresh_count"] = get_refresh_count_for_url(p_identity) + 1 if base_norm in current_state or normalise_url(p_identity) in current_state else 0
 

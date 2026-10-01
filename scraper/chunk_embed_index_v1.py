@@ -47,7 +47,7 @@ WHAT CARRIES OVER FROM V5 (unchanged logic):
     chunking for standard pages, URL dedup guard, all versioning
     fields (pipeline_version, scrape_run_id, index_run_id, indexed_at,
     refresh_count, scraper_version, metadata_version), all v3.0.0
-    enrichment fields, state_url (dropdown-chunk identity field;
+    enrichment fields, dropdown_url (dropdown-chunk identity field;
     source_url is always the clean, navigable base page URL).
   Index schema — all non-HQA fields unchanged, including the
   chunk-duplication root-cause fix (deterministic chunk_id) and the
@@ -56,7 +56,7 @@ WHAT CARRIES OVER FROM V5 (unchanged logic):
 
 WHAT'S NEW:
   video_url — SimpleField, passthrough from scraper v1.1.0's
-    video_url field (same pattern as thumbnail_url). "" when
+    video_url field (same pattern as page_image_url). "" when
     has_video is False or no matching iframe was found.
 
 WHAT'S FIXED:
@@ -68,9 +68,9 @@ WHAT'S FIXED:
   dicts) — chunk_pages() would crash if that file got picked as
   "latest". Now explicitly excludes any filename ending
   "_failures.json".
-  (thumbnail_url None-safety is NOT needed here — the scraper itself
+  (page_image_url None-safety is NOT needed here — the scraper itself
   now sets the placeholder to "" instead of None at the source, so
-  chunk_pages()'s existing page.get("thumbnail_url", "") default
+  chunk_pages()'s existing page.get("page_image_url", "") default
   already works correctly. See scrape_approved_urls_httpV1.py.)
 
 THREE REUSABLE ENTRY POINTS (segregated so other code — e.g. a future
@@ -423,7 +423,7 @@ def compute_chunk_id(identity_url: str, chunk_index: int, content: str) -> str:
     happen to share identical text don't collide into one ID.
 
     identity_url must be the DISTINGUISHING url for this chunk — for a
-    dropdown-state chunk that is state_url (the #state=... one), not
+    dropdown-state chunk that is dropdown_url (the #state=... one), not
     source_url (which is now always the clean base page url and would
     otherwise collide with chunk 0 of the base page's own chunks).
     """
@@ -438,7 +438,7 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
     """
     Split scraped pages into chunk dicts ready for embedding + upload.
 
-    Dropdown-state pages (page.get("dropdown_state") non-empty) are
+    Dropdown-state pages (page.get("dropdown_title") non-empty) are
     NEVER split — exactly 1 atomic chunk each, so policy context
     (title) and per-option content (e.g. contact details) always stay
     together regardless of content length. Signal is dropdown_state,
@@ -450,13 +450,13 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
     _index_run_id = str(uuid.uuid4())
     _indexed_at = datetime.now(timezone.utc).isoformat()
 
-    # Dedup key: state_url when present (dropdown chunk identity),
+    # Dedup key: dropdown_url when present (dropdown chunk identity),
     # else source_url — two dropdown states under the same base page
     # legitimately share source_url now, so deduping on source_url
     # alone would drop all but one of them.
     seen_urls, dedup_pages = set(), []
     for p in pages:
-        pu = p.get("state_url") or p.get("source_url", "")
+        pu = p.get("dropdown_url") or p.get("source_url", "")
         if pu and pu not in seen_urls:
             seen_urls.add(pu)
             dedup_pages.append(p)
@@ -469,7 +469,7 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
         content = page.get("content", "").strip()
         title = page.get("title", "")
         url = page.get("source_url", "")
-        state_url = page.get("state_url", "")
+        dropdown_url = page.get("dropdown_url", "")
         section = page.get("section", "")
         audience = page.get("audience", "customer")
 
@@ -486,7 +486,8 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
             "audience": audience,
             "scraped_at": page.get("scraped_at", ""),
             "content_hash": page_hash,
-            "state_url": state_url,
+            "dropdown_url": dropdown_url,
+            "dropdown_title": page.get("dropdown_title", ""),
             "pipeline_version": PIPELINE_VERSION,
             "index_run_id": _index_run_id,
             "indexed_at": _indexed_at,
@@ -499,22 +500,22 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
             "content_type": page.get("content_type", "article"),
             "product_category": page.get("product_category", "general"),
             "description": page.get("description", ""),
-            "thumbnail_url": page.get("thumbnail_url") or "",
+            "page_image_url": page.get("page_image_url") or "",
             "publish_date": page.get("publish_date", ""),
             "collection_name": page.get("collection_name", ""),
             "read_time_mins": str(page.get("read_time_mins", "5")),
         }
 
-        is_dropdown_state = bool(page.get("dropdown_state", ""))
+        is_dropdown_state = bool(page.get("dropdown_title", ""))
 
         if is_dropdown_state:
             stripped = content_with_title.strip()
             if len(stripped) >= 50:
                 chunks.append({
-                    # identity for chunk_id must be state_url — source_url
+                    # identity for chunk_id must be dropdown_url — source_url
                     # is now the shared base page url, and would otherwise
                     # collide with the base page's own chunk_index=0.
-                    "chunk_id": compute_chunk_id(state_url or url, 0, stripped),
+                    "chunk_id": compute_chunk_id(dropdown_url or url, 0, stripped),
                     "content": stripped,
                     "source_url": url,
                     "title": title,
@@ -523,8 +524,8 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
                     "element_type": "dropdown_state",
                     **common_fields,
                 })
-                log.info("dropdown_atomic_chunk", url=url, state_url=state_url,
-                         dropdown_state=page.get("dropdown_state"), chars=len(stripped))
+                log.info("dropdown_atomic_chunk", url=url, dropdown_url=dropdown_url,
+                         dropdown_title=page.get("dropdown_title"), chars=len(stripped))
             continue
 
         pieces = chunk_content_element_aware(content_with_title, CHUNK_SIZE, CHUNK_OVERLAP)
@@ -733,7 +734,7 @@ def create_or_update_index(fresh: bool = False):
                          searchable=True, filterable=True, sortable=False, facetable=True, retrievable=True),
         SearchableField(name="description", type=SearchFieldDataType.String,
                          searchable=True, filterable=False, sortable=False, facetable=False, retrievable=True),
-        SimpleField(name="thumbnail_url", type=SearchFieldDataType.String,
+        SimpleField(name="page_image_url", type=SearchFieldDataType.String,
                     searchable=False, filterable=False, sortable=False, facetable=False, retrievable=True),
         SimpleField(name="publish_date", type=SearchFieldDataType.String,
                     searchable=False, filterable=True, sortable=True, facetable=False, retrievable=True),
@@ -742,13 +743,21 @@ def create_or_update_index(fresh: bool = False):
         SimpleField(name="read_time_mins", type=SearchFieldDataType.String,
                     searchable=False, filterable=True, sortable=False, facetable=False, retrievable=True),
         # source_url is ALWAYS the clean, navigable base page URL — for a
-        # dropdown-state chunk too, not just standard chunks. state_url
+        # dropdown-state chunk too, not just standard chunks. dropdown_url
         # carries the #state=... fragment ONLY for dropdown-state chunks
         # ("" otherwise) — it exists purely as an internal distinguishing
         # identity (chunk_id, freshness comparison), never for display.
         # Any consumer can just read source_url with no OR-fallback.
-        SimpleField(name="state_url", type=SearchFieldDataType.String,
+        SimpleField(name="dropdown_url", type=SearchFieldDataType.String,
                     searchable=False, filterable=True, sortable=False, facetable=False, retrievable=True),
+        # dropdown_title — the per-option label (e.g. "Scottish Life"), "" for
+        # non-dropdown chunks. title stays the plain B&M page title for ALL
+        # chunks, never compounded with this, since title is what consumers
+        # render as the citation hyperlink text and it must match an entry
+        # in the approved-URL list. Consumers wanting the option label for
+        # display (e.g. "Related" cards) read this field explicitly instead.
+        SearchableField(name="dropdown_title", type=SearchFieldDataType.String,
+                         searchable=True, filterable=True, sortable=False, facetable=False, retrievable=True),
         SimpleField(name="element_type", type=SearchFieldDataType.String,
                     searchable=False, filterable=True, sortable=False, facetable=True, retrievable=True),
         SearchField(name="embedding", type=SearchFieldDataType.Collection(SearchFieldDataType.Single),

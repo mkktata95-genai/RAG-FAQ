@@ -51,7 +51,7 @@ WHAT'S NEW / REPLACED:
     instead of a live URL — lets Phase 1 local testing simulate
     new/changed/unchanged/broken-content scenarios without depending
     on the B&M team to actually change the live site.
-  - Image extraction: ONE field, `thumbnail_url` (same field V5
+  - Image extraction: ONE field, `page_image_url` (same field V5
     already used — not a new/second field), deliberately left as a
     placeholder (None) here. extract_page_metadata() still computes
     a teaser_image/og:image value internally (that logic hasn't
@@ -67,10 +67,10 @@ OUTPUT FIELDS PER PAGE (unchanged from V5 — schema compatibility is
 required for chunk_and_index to keep working without changes):
     url, title, section, audience, content, scraped_at,
     content_length, content_hash, has_video, video_url, content_type,
-    product_category, description, thumbnail_url, publish_date,
+    product_category, description, page_image_url, publish_date,
     collection_name, read_time_mins, dropdown_state, dropdown_value,
     scraper_version, metadata_version, scrape_run_id
-  thumbnail_url is present but currently always None — see "Image
+  page_image_url is present but currently always None — see "Image
   extraction" above.
   video_url (new in v1.1.0) is populated only when has_video is True
   AND a matching <iframe> host is found (VIDEO_IFRAME_HOSTS) — it is
@@ -517,7 +517,7 @@ def extract_page_metadata(html: str, url: str) -> dict:
                             <meta property="og:description">,
                             <meta name="st-description"> — truncated
                             to 300 chars for UI preview use
-      thumbnail_url      -> <meta name="teaser_image"> preferred (a
+      page_image_url      -> <meta name="teaser_image"> preferred (a
                             page-specific 350x200 image Royal London
                             sets deliberately); falls back to
                             og:image ONLY if it isn't the generic
@@ -545,7 +545,7 @@ def extract_page_metadata(html: str, url: str) -> dict:
         "product_category": derive_product_category(url),
         "audience":         derive_audience_from_url(url),
         "description":      "",
-        "thumbnail_url":    "",
+        "page_image_url":    "",
         "publish_date":     "",
         "collection_name":  "",
         "read_time_mins":   "5",
@@ -573,13 +573,13 @@ def extract_page_metadata(html: str, url: str) -> dict:
         # Thumbnail URL — meta-teaser_image > og:image (RL-logo filtered)
         teaser = soup.find("meta", attrs={"name": "teaser_image"})
         if teaser and teaser.get("content", "").strip():
-            metadata["thumbnail_url"] = teaser["content"].strip()
+            metadata["page_image_url"] = teaser["content"].strip()
         else:
             og_image = soup.find("meta", property="og:image")
             if og_image and og_image.get("content", "").strip():
                 img_url = og_image["content"].strip()
                 if "rl-logo-meta-image" not in img_url:
-                    metadata["thumbnail_url"] = img_url
+                    metadata["page_image_url"] = img_url
 
         # Publish date — "13 March 2024" -> "2024-03-13"
         pub_date_tag = soup.find("meta", attrs={"name": "st-publish-date"})
@@ -1348,12 +1348,12 @@ def extract_dropdown_states_from_html(
             opt_text = option["text"]
 
             safe_value = opt_value if opt_value else opt_text
-            state_url = f"{url}#state={urllib.parse.quote(safe_value)}"
+            dropdown_url = f"{url}#state={urllib.parse.quote(safe_value)}"
 
             results.append({
                 "source_url":       url,
-                "state_url":        state_url,
-                "title":            f"{base_title} — {opt_text}",
+                "dropdown_url":        dropdown_url,
+                "title":            base_title,
                 "section":          base_page_data["section"],
                 "content":          content,
                 "scraped_at":       datetime.now(timezone.utc).isoformat(),
@@ -1368,15 +1368,15 @@ def extract_dropdown_states_from_html(
                 "content_type":     base_page_data["content_type"],
                 "product_category": base_page_data["product_category"],
                 "description":      base_page_data["description"],
-                "thumbnail_url":    base_page_data["thumbnail_url"],
+                "page_image_url":    base_page_data["page_image_url"],
                 "publish_date":     base_page_data["publish_date"],
                 "collection_name":  base_page_data["collection_name"],
                 "read_time_mins":   str(max(1, len(content.split()) // 200)),
-                "dropdown_state":   opt_text,
+                "dropdown_title":   opt_text,
                 "dropdown_value":   opt_value or "",
             })
 
-            log.info("dropdown_option_scraped", url=state_url, option=opt_text, chars=len(content))
+            log.info("dropdown_option_scraped", url=dropdown_url, option=opt_text, chars=len(content))
 
     return results
 
@@ -1575,7 +1575,7 @@ def scrape_page(
 
         page_data = {
             "source_url":     url,
-            "state_url":      "",
+            "dropdown_url":      "",
             "title":          title,
             "section":        derive_section(url),
             "content":        page_content.strip(),
@@ -1602,7 +1602,7 @@ def scrape_page(
             # field is always a valid Edm.String for the indexer with
             # no defensive None-coercion needed downstream — wire the
             # real value in once that logic lands.
-            "thumbnail_url":    "",
+            "page_image_url":    "",
             "publish_date":     metadata["publish_date"],
             "collection_name":  metadata["collection_name"],
             "read_time_mins":   metadata["read_time_mins"],
