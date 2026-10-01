@@ -1216,6 +1216,13 @@ def extract_main_html(html: str) -> str:
     for tag_name in EXCLUDED_TAGS:
         for tag in soup.find_all(tag_name):
             tag.decompose()
+    # Dropdown option panels (data-content) are rendered hidden-but-present
+    # in the DOM for every option simultaneously. Strip them from the base
+    # page extraction here — they're parsed separately, per-option, by
+    # extract_dropdown_states_from_html(). Without this the base page's
+    # content includes every dropdown option's text concatenated.
+    for panel in soup.find_all(attrs={"data-content": True}):
+        panel.decompose()
     container = soup.select_one(CONTENT_SELECTOR)
     if container is None:
         container = soup.body or soup
