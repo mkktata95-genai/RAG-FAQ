@@ -136,3 +136,18 @@ Thanks again for digging into this with us.
 
 Best,
 Mukesh
+
+-----------------
+
+step2-> python -c "import sys; sys.path.insert(0,'scraper'); import content_freshness_httpV1 as m; import re; url='https://www.royallondon.com/guides-tools/money-guides/everyday-money/understanding-compound-growth'; print(re.sub(r'[^a-zA-Z0-9]+','_', m.normalize_url(url)).strip('_') + '.html')"
+
+step3:
+mkdir scraper\tests\fixtures\mini
+copy scraper\tests\fixtures\real_page.html scraper\tests\fixtures\mini\<filename_from_step2>.html
+
+step4:
+python scraper\content_freshness_httpV1.py --mode report --file scraper\data\mini_test.xlsx --fixture-dir scraper\tests\fixtures\mini
+
+step5:
+copy /Y scraper\tests\fixtures\real_page_edited.html scraper\tests\fixtures\mini\<filename_from_step2>.html
+python scraper\content_freshness_httpV1.py --mode report --file scraper\data\mini_test.xlsx --fixture-dir scraper\tests\fixtures\mini
