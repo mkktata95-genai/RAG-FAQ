@@ -151,3 +151,17 @@ python scraper\content_freshness_httpV1.py --mode report --file scraper\data\min
 step5:
 copy /Y scraper\tests\fixtures\real_page_edited.html scraper\tests\fixtures\mini\<filename_from_step2>.html
 python scraper\content_freshness_httpV1.py --mode report --file scraper\data\mini_test.xlsx --fixture-dir scraper\tests\fixtures\mini
+
+
+-------Retesting----------
+python -c "
+import sys; sys.path.insert(0,'scraper')
+import content_freshness_httpV1 as m
+import requests, re
+url = 'https://www.royallondon.com/existing-customers/help-and-support/make-a-claim/tell-us-about-a-bereavement'
+norm = m.normalize_url(url)
+fname = re.sub(r'[^a-zA-Z0-9]+','_',norm).strip('_')+'.html'
+r = requests.get(url, timeout=20, headers={'User-Agent':'Mozilla/5.0'})
+open(f'scraper/tests/fixtures/mini/{fname}','w',encoding='utf-8').write(r.text)
+print(r.status_code, fname)
+"
