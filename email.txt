@@ -1,0 +1,106 @@
+Subject: RE: Multi-language Q&A – AI team update, estimate and open questions
+
+Hi all,
+
+Thanks for the context. Below is the AI team's combined view: approach, estimate, dependencies, cost and open questions. No commitment is implied for MVP; this is to understand what is possible.
+
+SCOPE NOTE: Lee's ask is multi-language text Q&A. The UX and QE estimates also include voice input and voice response. We have therefore estimated text and voice separately so the scope decision is clear (sections 6 and 7).
+
+1. CONTEXT AND CORE CHALLENGE
+The content we consume (the webpages on the RLG website) is available only in English. It is therefore uncertain how reliable it would be to use a non-English query directly to search for relevant content. This needs to be validated rather than assumed.
+
+2. PROPOSED APPROACH (to be validated)
+One possible approach is:
+Query (Non-English) -> Translate -> Query (English) -> Search -> Response (English) -> Translate -> Response (Non-English)
+
+This keeps the FCA-approved English content as the single source of truth. Azure offers a service for this: Azure Translator in Foundry Tools (formerly Azure AI Translator / Azure AI Services).
+
+We will also benchmark two variants against it:
+- Generating the final answer directly in the user's language from the English sources, to avoid a second translation hop.
+- Cross-lingual retrieval using the non-English query directly, compared against translate-first.
+
+3. TRANSLATION OPTIONS
+Option A: Azure Translator with neural machine translation (NMT). Supports 100+ languages (Microsoft's model catalogue lists up to 135 for text translation). Domain terms (e.g. ISA, annuity, bereavement) need Custom Translator or a glossary.
+Option B: Azure Translator in LLM mode. The latest preview lets us select an LLM (GPT-4o or GPT-4o mini) per request and needs a Foundry resource. This is a preview feature, and availability of those models must be checked against Azure's model retirement schedule.
+Option C: A dedicated LLM for the language conversion, provided the model has strong support and training for the languages stakeholders want. Better fluency, but less predictable and may paraphrase regulated wording. A specialised third-party model would additionally need security and data-residency review.
+
+Related questions we are working through:
+- How many languages does the Azure translation service support, and which do the stakeholders want the agent to support?
+- How does the Azure service perform the translation: traditional NLP/NMT models or an LLM-based approach? (Initial finding: both are offered, see Options A and B.)
+- How reliable is the translation, especially for FCA-compliant responses where semantic accuracy is critical? We would need to validate this thoroughly.
+
+Recommendation: benchmark A, B and C on the same sample set before committing.
+
+4. EVALUATION AND SMEs
+- SMEs are required to validate the translated responses and confirm that the semantic meaning remains unchanged across languages. This applies in lower environments and also for sign-off before release and ongoing monitoring.
+- Per language: translated golden question set, language-detection accuracy, fidelity of regulated terms, faithfulness to the English source, refusal/safety parity with English, back-translation checks, and a native-speaker review sample.
+- A language expert is needed per launch language; we cannot reliably self-validate.
+
+5. FCA CONSIDERATIONS
+- Translated answers are not pre-approved content. Compliance to rule on disclaimers, an English/human fallback, and the Consumer Duty consumer-understanding position.
+- Translated fixed wording (disclaimers, refusals, fallbacks) needs formal approval, along with a glossary of regulated terms.
+- Audit trail: log the original query, the English version and the translated answer.
+- Safety and guardrails to be validated in non-English languages.
+- For voice, spoken answers raise further questions: how disclaimers and citations are delivered, and whether voice transcripts are retained.
+
+6. EFFORT ESTIMATE A: MULTI-LANGUAGE TEXT (2 AI engineers)
+
+Phase | Effort (person-days) | Each extra language | Depends on
+Scope and language list | 2-3 | - | Client
+Benchmark options (Translator NMT, Translator LLM, dedicated LLM, cross-lingual retrieval) | 4-6 | 0.5-1 | Sample data, SMEs
+Build (language detection, translate in/out, glossary) | 6-9 | - | Azure resource
+Fixed wording, disclaimers, guardrails | 3-4 | 1 | Compliance
+Evaluation dataset and SME validation | 4-6 | 2-3 | SMEs
+Infra, security, network | 2-3 | - | DevOps, InfoSec
+Integration testing, fixes, release | 3-4 | 1 | QE
+Subtotal | 24-35 | |
+With 20% contingency | 29-42 | 6-8 |
+
+7. EFFORT ESTIMATE B: VOICE INPUT + VOICE RESPONSE (additional, indicative)
+Assumes Azure Speech in Foundry Tools for speech-to-text and text-to-speech, added alongside text rather than replacing it. Voice has more unknowns, so this is less certain than estimate A.
+
+Phase | Effort (person-days) | Each extra language | Depends on
+Speech-to-text integration and language handling | 4-6 | 1 | Speech resource, app team
+Text-to-speech, voice selection, pronunciation of product terms | 3-5 | 1 | SMEs
+Streaming, latency and mobile app integration | 3-5 | - | App/mobile team
+Voice guardrails, spoken disclaimers and citations | 2-3 | 0.5 | Compliance, UX
+Voice evaluation (accents, background noise, recognition accuracy) | 4-6 | 1-2 | SMEs, QE
+Testing, fixes, release | 2-3 | 0.5 | QE
+Subtotal | 18-28 | |
+With 20% contingency | 22-34 | 3-5 |
+
+COMBINED VIEW
+Text only (A): 29-42 person-days; about 4-6 weeks engineering, 6-9 weeks overall with dependency lead times.
+Text plus voice (A+B): 51-76 person-days; about 7-10 weeks engineering, 10-14 weeks overall.
+Each extra language: 6-8 days (text) or 9-13 days (text plus voice).
+These run on two engineers with some sequencing and shared commitments. They exclude UX, QE and brand effort. For reference, UX estimates 35-50 days (7-10 weeks, one designer) and QE estimates 13-23 testing days plus 5-10 per additional language, both for voice input, voice response and multi-language.
+
+8. DEPENDENCIES
+- DevOps: Translator (and Speech, if voice) provisioning, identity and network
+- InfoSec/DPIA approval to send customer text (and audio, if voice) to the services. Data residency follows the region of the resource.
+- Compliance: translated wording, glossary, FCA position, voice disclosures
+- SMEs/language experts per language, in every environment where we validate
+- QE for native-speaker testing; app/mobile team for voice integration
+- Client decisions listed below
+
+9. COST
+- Azure Translator has a free tier (F0) of 2M characters per month, shared across standard translation and custom-translation training. At about 1,000 characters per turn that covers roughly 2,000 turns a month, so it suits dev/test only.
+- Production is pay-as-you-go per character; the rate will be confirmed with the Azure pricing calculator for our region before we quote. Speech services (voice) are priced separately and will be confirmed the same way.
+- LLM mode or a dedicated LLM adds token cost, expected to be small.
+- SME/language-expert cost is likely the larger item.
+
+10. OPEN QUESTIONS FOR THE CLIENT
+1. Which languages and dialects at launch, and what customer data or research supports the choice?
+2. Is voice in scope? Lee's ask is text Q&A, while the UX and QE estimates include voice input and response. This changes effort from about 29-42 to 51-76 person-days on the AI side.
+3. Source content is English only. Is it acceptable that citations and "Read more" links point to English pages, or is a translated content layer needed?
+4. May answers be given in a language where the source is English-only, and with what disclaimer?
+5. Who approves translated fixed wording and the regulated-terms glossary?
+6. Can we get SME/language-expert access per language, and who funds it?
+7. Does compliance treat translated answers as approved customer communications?
+8. Is InfoSec/DPIA approval available for the translation (and speech) services?
+9. What is the MVP date, so languages and voice can be phased if needed?
+
+We are still evaluating several of these aspects to determine what is feasible and the best overall solution. Happy to discuss.
+
+Regards,
+Mukesh
