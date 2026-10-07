@@ -2220,17 +2220,28 @@ def scrape_url_for_freshness(entry: dict, fixture_dir: str | None = None) -> "li
     try:
         main_html = extract_main_html(html)
         markdown = html_fragment_to_markdown(main_html)
+        thin = None
+        page_content = ""
         if not markdown or len(markdown.strip()) < 100:
-            log.warning("content_too_short", url=url)
-            return None
+            thin = ("content_too_short", len((markdown or "").strip()))
+        else:
+            page_content = clean_scraped_content(markdown)
+            if len(page_content.strip()) < 50:
+                thin = ("content_too_short_after_cleaning", len(page_content.strip()))
 
-        page_content = clean_scraped_content(markdown)
-        if len(page_content.strip()) < 50:
-            log.warning("content_too_short_after_cleaning", url=url)
-            return None
-
-        content_hash = compute_content_hash(clean_content(page_content))
         metadata = extract_page_metadata(html, url)
+        if thin:
+            # Same rule as scrape_approved_urls_httpV1.py: non-Information
+            # thin pages fall back to the meta description.
+            desc = (metadata.get("description") or "").strip()
+            if page_purpose.strip().lower() != "information" and desc:
+                log.warning("short_content_fallback_used", url=url,
+                            page_purpose=page_purpose, chars=thin[1], reason=thin[0])
+                page_content = desc
+            else:
+                log.warning(thin[0], url=url)
+                return None
+        content_hash = compute_content_hash(clean_content(page_content))
         url = normalize_url(url)
 
         page_data = {

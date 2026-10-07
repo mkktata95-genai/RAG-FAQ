@@ -1634,34 +1634,42 @@ def scrape_page(
         main_html = extract_main_html(html)
         page_content = html_fragment_to_markdown(main_html)
 
+        thin = None
         if not page_content or len(page_content.strip()) < 100:
-            reason = (
-                f"content_too_short: {len(page_content or '')} chars in "
-                f"main content region before cleaning (min 100) — page "
-                f"may not use the expected main/article/.content selector, "
-                f"or is genuinely a near-empty page"
-            )
-            log.warning("content_too_short", url=url, length=len(page_content or ""))
-            _record_failure(url, reason)
-            return None
-
-        page_content = clean_content(page_content)
-
-        if len(page_content.strip()) < 50:
-            reason = (
-                f"content_too_short_after_cleaning: {len(page_content.strip())} "
-                f"chars remained after clean_content() removed boilerplate "
-                f"(min 50) — page may be almost entirely nav/footer/share links"
-            )
-            log.warning("content_too_short_after_cleaning", url=url)
-            _record_failure(url, reason)
-            return None
+            thin = ("content_too_short", len(page_content or ""),
+                    f"content_too_short: {len(page_content or '')} chars in "
+                    f"main content region before cleaning (min 100) — page "
+                    f"may not use the expected main/article/.content selector, "
+                    f"or is genuinely a near-empty page")
+        else:
+            page_content = clean_content(page_content)
+            if len(page_content.strip()) < 50:
+                thin = ("content_too_short_after_cleaning", len(page_content.strip()),
+                        f"content_too_short_after_cleaning: {len(page_content.strip())} "
+                        f"chars remained after clean_content() removed boilerplate "
+                        f"(min 50) — page may be almost entirely nav/footer/share links")
 
         # Metadata extracted from the FULL page HTML (meta tags live in
         # <head>, outside the content container) — same as V5, which
         # ran extract_page_metadata() on result.html, not the trimmed
         # content region.
         metadata = extract_page_metadata(html, url)
+
+        if thin:
+            # Thin page (e.g. JS-rendered tool/calculator). Information pages
+            # are answer sources, so a thin one stays a failure. Any other
+            # label falls back to its meta description (the chunker prepends
+            # the title). Same rule in content_freshness_httpV1.py.
+            kind, n, reason = thin
+            desc = (metadata.get("description") or "").strip()
+            if page_purpose.strip().lower() != "information" and desc:
+                log.warning("short_content_fallback_used", url=url,
+                            page_purpose=page_purpose, chars=n, reason=kind)
+                page_content = desc
+            else:
+                log.warning(kind, url=url, length=n)
+                _record_failure(url, reason)
+                return None
 
         url = normalize_url(url)
 
