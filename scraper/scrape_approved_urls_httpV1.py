@@ -160,6 +160,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -199,6 +200,68 @@ REQUEST_HEADERS = {
         "Chrome/124.0 Safari/537.36 RLG-Aria-Scraper/1.0"
     ),
 }
+
+# ═══════════════════════════════════════════════════════════════
+# Resilience helpers — retry with exponential backoff + jitter, and a
+# transient-vs-permanent error classifier. Duplicated inline in every
+# pipeline script on purpose (zero cross-file imports); a fix here must
+# be mirrored by hand into content_freshness_httpV1.py and
+# chunk_embed_index_v1.py. (This scraper has no Azure/OpenAI calls, so
+# its classifier covers HTTP/network errors only.)
+#
+# Policy: transient failures are retried and every attempt is logged.
+# Permanent failures, or transient ones that exhaust their retries, are
+# logged at ERROR and RAISED/RECORDED — never swallowed.
+# ═══════════════════════════════════════════════════════════════
+RETRY_ATTEMPTS = int(os.environ.get("PIPELINE_RETRY_ATTEMPTS", "5"))
+RETRY_BASE_SECONDS = float(os.environ.get("PIPELINE_RETRY_BASE_SECONDS", "2"))
+RETRY_MAX_SECONDS = 60.0
+TRANSIENT_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+# Safety gate: if more than this share of URLs fail to scrape, the run is
+# marked FAILED (non-zero exit) so a downstream full re-index is not built
+# from an incomplete page set. Any failure at all still exits non-zero (2).
+MAX_SCRAPE_FAILURE_RATIO = float(os.environ.get("SCRAPER_MAX_FAILURE_RATIO", "0.05"))
+
+
+class TransientHTTPError(Exception):
+    """Raised for a retryable HTTP status (429/5xx) from a plain HTTP fetch."""
+
+    def __init__(self, status_code: int):
+        super().__init__(f"transient HTTP status {status_code}")
+        self.status_code = status_code
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """True for errors worth retrying: network errors, timeouts, throttling, 5xx."""
+    return isinstance(exc, (
+        TransientHTTPError, TimeoutError, ConnectionError,
+        requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+    ))
+
+
+def with_retry(fn, *, op: str, attempts: int | None = None, base_seconds: float | None = None, **ctx):
+    """
+    Call fn() with retry on transient errors (exponential backoff + jitter).
+    Every retry is logged at WARNING; a permanent error, or exhausted
+    retries, is logged at ERROR and re-raised. ctx is attached to every log line.
+    """
+    attempts = attempts or RETRY_ATTEMPTS
+    base = RETRY_BASE_SECONDS if base_seconds is None else base_seconds
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            transient = is_transient_error(e)
+            if not transient or attempt >= attempts:
+                log.error("operation_failed", op=op, attempt=attempt, attempts=attempts,
+                          transient=transient, error_type=type(e).__name__, error=str(e), **ctx)
+                raise
+            wait = min(RETRY_MAX_SECONDS, base * (2 ** (attempt - 1))) * random.uniform(0.75, 1.25)
+            log.warning("operation_retry", op=op, attempt=attempt, attempts=attempts,
+                        wait_seconds=round(wait, 1), error_type=type(e).__name__, error=str(e), **ctx)
+            time.sleep(wait)
+
 
 # CSS selector for the content container — identical priority order
 # to V5's crawl4ai css_selector config, so the same page regions are
@@ -1441,11 +1504,17 @@ def fetch_html(url: str, fixture_dir: str | None = None) -> tuple[str | None, in
         except Exception as e:
             return None, None, f"fixture_read_error:{e}"
 
+    def _get():
+        resp = requests.get(url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code in TRANSIENT_HTTP_STATUS:
+            raise TransientHTTPError(resp.status_code)
+        return resp
+
     try:
-        resp = requests.get(
-            url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT_SECONDS,
-        )
+        resp = with_retry(_get, op="http_get", attempts=3, url=url)
         return resp.text, resp.status_code, None
+    except TransientHTTPError as e:
+        return None, e.status_code, str(e)
     except requests.exceptions.RequestException as e:
         return None, None, str(e)
 
@@ -1695,8 +1764,17 @@ def save_scraped_pages(results: list[dict], output_file: Path) -> str:
         return ""
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+    # Atomic write: a crash mid-write must never leave a truncated JSON
+    # that the indexer would then try to consume.
+    tmp_file = output_file.with_name(output_file.name + ".tmp")
+    try:
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, output_file)
+    except Exception as e:
+        log.error("save_scraped_pages_failed", file=str(output_file), error_type=type(e).__name__, error=str(e))
+        tmp_file.unlink(missing_ok=True)
+        raise
     log.info("scraped_pages_saved_locally", file=str(output_file), pages=len(results))
     return str(output_file)
 
@@ -1786,6 +1864,16 @@ def run_scraper(
             if batch_start + BATCH_SIZE < total and not fixture_dir:
                 time.sleep(BATCH_DELAY_SECONDS)
 
+        _seen, _dedup = set(), []
+        for e in scraped:
+            k = e.get("dropdown_url") or e.get("url")
+            if k in _seen:
+                log.warning("duplicate_page_dropped", key=k)
+                continue
+            _seen.add(k)
+            _dedup.append(e)
+        scraped = _dedup
+
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         output_file = Path("scraper/data") / f"royal_london_faq_approved_httpV1_{timestamp}.json"
         output_path = save_scraped_pages(scraped, output_file)
@@ -1832,16 +1920,33 @@ def run_scraper(
             ),
         )
 
-        result["success"] = True
         result["pages_scraped"] = len(scraped)
         result["pages_failed"] = len(failed_urls)
         result["output_path"] = output_path
+
+        # Failure-ratio gate: the output file is kept for diagnosis, but
+        # the run is marked FAILED when too many URLs are missing, so a
+        # downstream --full rebuild is not silently built from a
+        # truncated page set.
+        failure_ratio = len(failed_urls) / total if total else 0.0
+        if failure_ratio > MAX_SCRAPE_FAILURE_RATIO:
+            result["error"] = (
+                f"{len(failed_urls)} of {total} URLs failed to scrape ({failure_ratio:.0%} > "
+                f"{MAX_SCRAPE_FAILURE_RATIO:.0%} limit) — do NOT index this output; see "
+                f"{failures_path or 'the log'}"
+            )
+            log.critical("scrape_failure_ratio_exceeded", failed=len(failed_urls), total=total,
+                         ratio=round(failure_ratio, 3), limit=MAX_SCRAPE_FAILURE_RATIO)
+            return result
+
+        result["success"] = True
         return result
 
     except Exception as e:
         result["elapsed_seconds"] = round(time.monotonic() - run_started_at, 2)
-        result["error"] = str(e)
-        log.error("scraper_pipeline_error", error=str(e), elapsed_seconds=result["elapsed_seconds"])
+        result["error"] = f"{type(e).__name__}: {e}"
+        log.error("scraper_pipeline_error", error_type=type(e).__name__, error=str(e),
+                  elapsed_seconds=result["elapsed_seconds"], exc_info=True)
         return result
 
 
@@ -1879,6 +1984,11 @@ def main():
             print(f"   Failures (url + reason): {result['failures_path']}")
             for f in result["failed_urls"]:
                 print(f"     - {f['url']}\n       reason: {f['reason']}")
+            # Partial run: output written, but pages are missing from it.
+            # Non-zero exit so a pipeline stage does not treat it as clean.
+            print(f"\n⚠️  PARTIAL: {result['pages_failed']} URL(s) missing from the output — "
+                  f"review before indexing.")
+            sys.exit(2)
 
 
 if __name__ == "__main__":

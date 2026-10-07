@@ -120,6 +120,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -127,9 +128,14 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
 import structlog
+from azure.core.exceptions import (
+    ClientAuthenticationError, HttpResponseError, ResourceNotFoundError,
+    ServiceRequestError, ServiceResponseError,
+)
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-from openai import AzureOpenAI, RateLimitError
+from openai import APIConnectionError, APITimeoutError, AzureOpenAI, InternalServerError, RateLimitError
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
 from azure.search.documents.indexes.models import (
@@ -182,6 +188,68 @@ EMBEDDING_DEPLOYMENT  = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-emb
 SEMANTIC_CONFIG_NAME  = os.getenv("AZURE_SEARCH_SEMANTIC_CONFIG", "rlg-semantic-config")
 EMBEDDING_BATCH_SIZE  = int(os.getenv("EMBEDDING_BATCH_SIZE", "50"))
 UPLOAD_BATCH_SIZE     = 100
+
+# Safety gate for --full: refuse to delete + rebuild an index that already
+# holds >= MIN_DOCS_FOR_SHRINK_GATE documents when the rebuild would hold
+# fewer than INDEX_MIN_REBUILD_RATIO of them (a truncated/old scraped JSON,
+# a partial scrape). Override with --allow-shrink.
+INDEX_MIN_REBUILD_RATIO = float(os.getenv("INDEX_MIN_REBUILD_RATIO", "0.5"))
+MIN_DOCS_FOR_SHRINK_GATE = 20
+
+# ═══════════════════════════════════════════════════════════════
+# Resilience helpers — retry with exponential backoff + jitter, and a
+# transient-vs-permanent error classifier. Duplicated inline in every
+# pipeline script on purpose (zero cross-file imports); a fix here must
+# be mirrored by hand into scrape_approved_urls_httpV1.py and
+# content_freshness_httpV1.py.
+#
+# Policy: transient failures (network, timeouts, throttling, 5xx, token
+# acquisition blips) are retried and every attempt is logged. Permanent
+# failures, or transient ones that exhaust their retries, are logged at
+# ERROR and RAISED — never swallowed — so a run fails loudly instead of
+# leaving the index half-built with no trace.
+# ═══════════════════════════════════════════════════════════════
+RETRY_ATTEMPTS = int(os.environ.get("PIPELINE_RETRY_ATTEMPTS", "5"))
+RETRY_BASE_SECONDS = float(os.environ.get("PIPELINE_RETRY_BASE_SECONDS", "2"))
+RETRY_MAX_SECONDS = 60.0
+TRANSIENT_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """True for errors worth retrying: network/timeout, throttling, 5xx, token-acquisition blips."""
+    if isinstance(exc, (
+        ServiceRequestError, ServiceResponseError, ClientAuthenticationError,
+        RateLimitError, APIConnectionError, APITimeoutError, InternalServerError,
+        TimeoutError, ConnectionError,
+        requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+    )):
+        return True
+    if isinstance(exc, HttpResponseError):
+        return getattr(exc, "status_code", None) in TRANSIENT_HTTP_STATUS
+    return False
+
+
+def with_retry(fn, *, op: str, attempts: int | None = None, base_seconds: float | None = None, **ctx):
+    """
+    Call fn() with retry on transient errors (exponential backoff + jitter).
+    Every retry is logged at WARNING; a permanent error, or exhausted
+    retries, is logged at ERROR and re-raised. ctx is attached to every log line.
+    """
+    attempts = attempts or RETRY_ATTEMPTS
+    base = RETRY_BASE_SECONDS if base_seconds is None else base_seconds
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            transient = is_transient_error(e)
+            if not transient or attempt >= attempts:
+                log.error("operation_failed", op=op, attempt=attempt, attempts=attempts,
+                          transient=transient, error_type=type(e).__name__, error=str(e), **ctx)
+                raise
+            wait = min(RETRY_MAX_SECONDS, base * (2 ** (attempt - 1))) * random.uniform(0.75, 1.25)
+            log.warning("operation_retry", op=op, attempt=attempt, attempts=attempts,
+                        wait_seconds=round(wait, 1), error_type=type(e).__name__, error=str(e), **ctx)
+            time.sleep(wait)
 
 if os.getenv("CHUNK_SIZE") or os.getenv("CHUNK_OVERLAP"):
     log.warning(
@@ -592,17 +660,17 @@ def embed_chunks(chunks: list[dict]) -> list[list[float]]:
     Generate one embedding per chunk (content only — no HQA question
     text to combine with now that HQA is dropped).
 
-    Batches of EMBEDDING_BATCH_SIZE with a 2s inter-batch sleep and
-    exponential-backoff retry on 429 (S0 tier TPM limit protection).
-    Kept even though volume is much lower without HQA — cheap
-    insurance, and a full 350-page reindex still sends everything in
-    one run.
+    Batches of EMBEDDING_BATCH_SIZE with a 2s inter-batch sleep. Every
+    batch is retried on transient errors (rate limit, timeout, connection,
+    5xx, token blips) with a longer backoff for throttling, and each
+    response is validated (vector count + dimensions) — a short or
+    wrong-sized response raises instead of producing misaligned embeddings.
     """
     texts = [c["content"] for c in chunks]
     if not texts:
         return []
 
-    BATCH_SLEEP_SECONDS, MAX_RETRIES, RETRY_BASE_SECONDS = 2, 5, 10
+    BATCH_SLEEP_SECONDS = 2
     client = get_openai_client()
     all_embeddings = []
     total_batches = (len(texts) + EMBEDDING_BATCH_SIZE - 1) // EMBEDDING_BATCH_SIZE
@@ -610,30 +678,31 @@ def embed_chunks(chunks: list[dict]) -> list[list[float]]:
     for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
         batch = texts[i:i + EMBEDDING_BATCH_SIZE]
         batch_number = i // EMBEDDING_BATCH_SIZE + 1
-        retry = 0
-        while True:
-            try:
-                response = client.embeddings.create(
-                    input=batch, model=EMBEDDING_DEPLOYMENT, dimensions=EMBEDDING_DIMS,
+        response = with_retry(
+            lambda b=batch: client.embeddings.create(
+                input=b, model=EMBEDDING_DEPLOYMENT, dimensions=EMBEDDING_DIMS,
+            ),
+            op="embeddings_create", base_seconds=10, batch=batch_number, total_batches=total_batches,
+        )
+        sorted_data = sorted(response.data, key=lambda e: e.index)
+        if len(sorted_data) != len(batch):
+            raise RuntimeError(
+                f"Embedding batch {batch_number}: expected {len(batch)} vectors, got {len(sorted_data)}"
+            )
+        for e in sorted_data:
+            if len(e.embedding) != EMBEDDING_DIMS:
+                raise RuntimeError(
+                    f"Embedding batch {batch_number}: expected {EMBEDDING_DIMS} dims, got {len(e.embedding)}"
                 )
-                sorted_data = sorted(response.data, key=lambda e: e.index)
-                all_embeddings.extend(e.embedding for e in sorted_data)
-                log.info("embeddings_batch_done", batch=batch_number,
-                         total_batches=total_batches, chunk_count=len(all_embeddings))
-                break
-            except RateLimitError as e:
-                retry += 1
-                if retry > MAX_RETRIES:
-                    log.error("embeddings_rate_limit_max_retries", batch=batch_number, error=str(e))
-                    raise
-                wait = RETRY_BASE_SECONDS * (2 ** (retry - 1))
-                log.warning("embeddings_rate_limit_retry", batch=batch_number,
-                            retry=retry, wait_seconds=wait, error=str(e)[:80])
-                time.sleep(wait)
+        all_embeddings.extend(e.embedding for e in sorted_data)
+        log.info("embeddings_batch_done", batch=batch_number,
+                 total_batches=total_batches, chunk_count=len(all_embeddings))
 
         if i + EMBEDDING_BATCH_SIZE < len(texts):
             time.sleep(BATCH_SLEEP_SECONDS)
 
+    if len(all_embeddings) != len(texts):
+        raise RuntimeError(f"Embedded {len(all_embeddings)} of {len(texts)} chunks")
     return all_embeddings
 
 
@@ -649,25 +718,78 @@ def get_search_index_client() -> SearchIndexClient:
     return SearchIndexClient(endpoint=SEARCH_ENDPOINT, credential=get_credential())
 
 
-def get_indexed_urls() -> set:
-    """All source_url values already in the index — used for --new-only mode."""
+def verify_azure_access(check_index: bool) -> "int | None":
+    """
+    Fail-fast preflight, run before any work: acquire AAD tokens for Search
+    and OpenAI, and (when check_index) read the index's document count.
+    Warms the credential chain, so a slow/broken `az` login surfaces here —
+    with retries and a clear error — instead of mid-run. Returns the
+    index's document count, or None if the index does not exist yet.
+    """
+    cred = get_credential()
+    for scope in ("https://search.azure.com/.default", "https://cognitiveservices.azure.com/.default"):
+        with_retry(lambda s=scope: cred.get_token(s), op="credential_preflight", scope=scope)
+    if not check_index:
+        log.info("azure_access_verified", index=INDEX_NAME, documents=None)
+        return None
     try:
-        client = get_search_client()
-        urls, skip, page_size = set(), 0, 1000
-        while True:
-            results = client.search(search_text="*", select=["source_url"], top=page_size, skip=skip)
-            batch = list(results)
-            if not batch:
-                break
-            urls.update(r.get("source_url", "") for r in batch if r.get("source_url"))
-            if len(batch) < page_size:
-                break
-            skip += page_size
-        log.info("indexed_urls_fetched", count=len(urls))
-        return urls
-    except Exception as e:
-        log.warning("get_indexed_urls_failed", error=str(e))
+        count = with_retry(lambda: get_search_client().get_document_count(), op="index_preflight", index=INDEX_NAME)
+    except ResourceNotFoundError:
+        log.info("azure_access_verified", index=INDEX_NAME, documents=None, note="index does not exist yet")
+        return None
+    log.info("azure_access_verified", index=INDEX_NAME, documents=count)
+    return count
+
+
+def _search_page(client, op: str, **kwargs):
+    """One search page with retry; returns (documents, total_count)."""
+    def _call():
+        r = client.search(include_total_count=True, **kwargs)
+        return list(r), r.get_count()
+    return with_retry(_call, op=op, skip=kwargs.get("skip"))
+
+
+def _scan_index(client, op: str, select: list, on_doc) -> int:
+    """Paginate the whole index, call on_doc(doc) for each; raise if the scan is incomplete."""
+    skip, page_sz, scanned, total = 0, 1000, 0, None
+    while True:
+        batch, count = _search_page(client, op, search_text="*", select=select, top=page_sz, skip=skip)
+        if total is None:
+            total = count
+        if not batch:
+            break
+        for r in batch:
+            on_doc(r)
+        scanned += len(batch)
+        if len(batch) < page_sz:
+            break
+        skip += page_sz
+    if total is not None and scanned != total:
+        log.error("index_scan_incomplete", op=op, scanned=scanned, expected=total)
+        raise RuntimeError(f"{op}: index scan incomplete — read {scanned} of {total} documents")
+    return scanned
+
+
+def get_indexed_urls() -> set:
+    """
+    All source_url values already in the index — used for --new-only mode.
+    A missing index is a legitimate "nothing indexed yet" (empty set). Any
+    other failure RAISES: a silently empty/partial set would make every
+    page look new and re-upload changed pages next to their stale copies.
+    """
+    urls: set = set()
+
+    def _on_doc(r):
+        if r.get("source_url"):
+            urls.add(r["source_url"])
+
+    try:
+        scanned = _scan_index(get_search_client(), "get_indexed_urls", ["source_url"], _on_doc)
+    except ResourceNotFoundError:
+        log.info("index_not_found_treating_as_empty", index=INDEX_NAME)
         return set()
+    log.info("indexed_urls_fetched", count=len(urls), documents=scanned)
+    return urls
 
 
 def create_or_update_index(fresh: bool = False):
@@ -679,11 +801,15 @@ def create_or_update_index(fresh: bool = False):
     client = get_search_index_client()
 
     if fresh:
+        # Only "index does not exist" is acceptable here. Any other failure
+        # must stop the run: swallowing it would leave the OLD index in
+        # place, and the upload would then mix new chunks into stale data
+        # while the operator believes a fresh rebuild happened.
         try:
-            client.delete_index(INDEX_NAME)
+            with_retry(lambda: client.delete_index(INDEX_NAME), op="delete_index", index=INDEX_NAME)
             log.info("existing_index_deleted", index=INDEX_NAME)
-        except Exception:
-            pass
+        except ResourceNotFoundError:
+            log.info("no_existing_index_to_delete", index=INDEX_NAME)
 
     fields = [
         SimpleField(name="chunk_id", type=SearchFieldDataType.String, key=True,
@@ -790,30 +916,78 @@ def create_or_update_index(fresh: bool = False):
     )])
 
     try:
-        client.create_index(SearchIndex(
-            name=INDEX_NAME, fields=fields,
-            vector_search=vector_search, semantic_search=semantic_search,
-        ))
+        with_retry(
+            lambda: client.create_index(SearchIndex(
+                name=INDEX_NAME, fields=fields,
+                vector_search=vector_search, semantic_search=semantic_search,
+            )),
+            op="create_index", index=INDEX_NAME,
+        )
         log.info("index_created", index=INDEX_NAME, semantic_config=SEMANTIC_CONFIG_NAME)
     except Exception as e:
-        if "already exists" in str(e).lower():
+        # "already exists" is fine when appending, but after a --full delete it
+        # means the delete did not take effect — never carry on into stale data.
+        if "already exists" in str(e).lower() and not fresh:
             log.info("index_already_exists", index=INDEX_NAME)
         else:
             raise
 
 
 def upload_chunks(chunks: list[dict], embeddings: list[list[float]]) -> int:
-    """Upload chunk+embedding documents to Azure AI Search, batched."""
+    """
+    Upload chunk+embedding documents to Azure AI Search, batched. Every
+    document's result is checked: failed documents are retried (bounded);
+    if any still fail, raises — a partial upload is never reported as success.
+    """
+    if len(chunks) != len(embeddings):
+        raise RuntimeError(f"upload_chunks: {len(chunks)} chunks but {len(embeddings)} embeddings")
     client = get_search_client()
     documents = [{**chunk, "embedding": emb} for chunk, emb in zip(chunks, embeddings)]
     total_uploaded = 0
     for i in range(0, len(documents), UPLOAD_BATCH_SIZE):
-        batch = documents[i:i + UPLOAD_BATCH_SIZE]
-        result = client.upload_documents(documents=batch)
-        total_uploaded += sum(1 for r in result if r.succeeded)
+        pending = documents[i:i + UPLOAD_BATCH_SIZE]
+        batch_total = len(pending)
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
+            results = with_retry(
+                lambda p=pending: client.upload_documents(documents=p),
+                op="upload_documents", batch_start=i, batch_size=len(pending),
+            )
+            failed = {r.key: (r.error_message or r.status_code) for r in results if not r.succeeded}
+            total_uploaded += len(pending) - len(failed)
+            if not failed:
+                break
+            pending = [d for d in pending if d["chunk_id"] in failed]
+            if attempt == RETRY_ATTEMPTS:
+                log.error("upload_documents_failed", failed=len(pending), sample=list(failed.items())[:3])
+                raise RuntimeError(
+                    f"{len(pending)} of {batch_total} document(s) failed to upload after "
+                    f"{RETRY_ATTEMPTS} attempts (batch starting at {i}); first errors: {list(failed.items())[:3]}"
+                )
+            wait = min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * (2 ** (attempt - 1))) * random.uniform(0.75, 1.25)
+            log.warning("upload_partial_failure_retry", attempt=attempt, failed=len(failed), wait_seconds=round(wait, 1))
+            time.sleep(wait)
         log.info("upload_batch_done", uploaded=total_uploaded, total=len(documents))
     log.info("upload_complete", total=total_uploaded)
     return total_uploaded
+
+
+def verify_document_count(expected: int, attempts: int = 8, wait_seconds: float = 5.0) -> int:
+    """
+    After a --full rebuild the index must hold exactly the uploaded chunks.
+    The service's document count is eventually consistent, so poll briefly;
+    raise if it never matches (lost or duplicated documents).
+    """
+    client = get_search_client()
+    actual = -1
+    for attempt in range(1, attempts + 1):
+        actual = with_retry(lambda: client.get_document_count(), op="postload_document_count", index=INDEX_NAME)
+        if actual == expected:
+            log.info("document_count_verified", index=INDEX_NAME, documents=actual)
+            return actual
+        log.warning("document_count_pending", index=INDEX_NAME, expected=expected, actual=actual, attempt=attempt)
+        time.sleep(wait_seconds)
+    log.error("document_count_mismatch", index=INDEX_NAME, expected=expected, actual=actual)
+    raise RuntimeError(f"Index '{INDEX_NAME}' holds {actual} documents after upload, expected {expected}")
 
 
 def verify_index() -> bool:
@@ -904,6 +1078,17 @@ def load_pages(scraped_file: str | None = None) -> list[dict]:
         )
     with open(file_path, encoding="utf-8") as f:
         pages = json.load(f)
+    # Validate before anything downstream can act on it: an empty or malformed
+    # file must never reach a --full rebuild (which deletes the index first).
+    if not isinstance(pages, list) or not pages:
+        raise ValueError(f"{file_path} contains no pages — refusing to index (a --full run would wipe the index)")
+    bad = [i for i, p in enumerate(pages)
+           if not isinstance(p, dict) or not p.get("source_url") or not p.get("content")]
+    if bad:
+        raise ValueError(
+            f"{file_path}: {len(bad)} malformed page record(s) (missing source_url/content); "
+            f"first record indexes: {bad[:5]}. Is this the scraper's *_failures.json?"
+        )
     log.info("pages_loaded_from_local", file=file_path, total=len(pages))
     return pages
 
@@ -912,7 +1097,8 @@ def load_pages(scraped_file: str | None = None) -> list[dict]:
 # Pipeline
 # ═══════════════════════════════════════════════════════════════
 
-def run_pipeline(mode: str = "new-only", scraped_file: str | None = None, dry_run: bool = False) -> dict:
+def run_pipeline(mode: str = "new-only", scraped_file: str | None = None, dry_run: bool = False,
+                 allow_shrink: bool = False) -> dict:
     """
     Programmatic entry point: load -> chunk_pages -> embed_chunks ->
     index_chunks.
@@ -942,6 +1128,9 @@ def run_pipeline(mode: str = "new-only", scraped_file: str | None = None, dry_ru
                 f"AZURE_SEARCH_INDEX_NAME in .env / Key Vault."
             )
 
+        # Fail fast (and warm the credential chain) before any work.
+        existing_docs = None if dry_run else verify_azure_access(check_index=True)
+
         pages = load_pages(scraped_file)
         log.info("pages_loaded", total=len(pages))
 
@@ -963,8 +1152,19 @@ def run_pipeline(mode: str = "new-only", scraped_file: str | None = None, dry_ru
 
         chunks = chunk_pages(pages_to_index)
         result["chunks_created"] = len(chunks)
-        if chunks:
-            result["run_id"] = chunks[0].get("index_run_id", "")
+        if not chunks:
+            raise ValueError("chunk_pages produced 0 chunks from a non-empty page list — refusing to touch the index")
+        result["run_id"] = chunks[0].get("index_run_id", "")
+
+        # Shrink gate (--full only): a rebuild that would hold far fewer
+        # documents than the live index is almost always a wrong/partial input.
+        if (fresh and not dry_run and existing_docs and existing_docs >= MIN_DOCS_FOR_SHRINK_GATE
+                and len(chunks) < INDEX_MIN_REBUILD_RATIO * existing_docs and not allow_shrink):
+            raise ValueError(
+                f"ABORTED before touching the index: the rebuild would hold {len(chunks)} chunks but "
+                f"'{INDEX_NAME}' currently holds {existing_docs} (< {INDEX_MIN_REBUILD_RATIO:.0%}). "
+                f"Check the scraped file is complete; re-run with --allow-shrink only if this is intended."
+            )
 
         if dry_run:
             log.info("dry_run_complete", pages=result["pages_indexed"], chunks=result["chunks_created"])
@@ -979,7 +1179,12 @@ def run_pipeline(mode: str = "new-only", scraped_file: str | None = None, dry_ru
         # broken build (schema/dims/semantic-config mismatch) here
         # instead of via a real customer query later.
         if fresh:
+            verify_document_count(len(chunks))
             result["verified"] = verify_index()
+            if not result["verified"]:
+                raise RuntimeError(
+                    "post-build verification query failed — the rebuilt index is not serving results; see log"
+                )
 
         result["success"] = True
         result["elapsed_seconds"] = round(time.monotonic() - run_started_at, 2)
@@ -987,9 +1192,9 @@ def run_pipeline(mode: str = "new-only", scraped_file: str | None = None, dry_ru
 
     except Exception as e:
         import traceback
-        result["error"] = str(e)
+        result["error"] = f"{type(e).__name__}: {e}"
         result["elapsed_seconds"] = round(time.monotonic() - run_started_at, 2)
-        log.error("pipeline_error", error=str(e), traceback=traceback.format_exc())
+        log.error("pipeline_error", error_type=type(e).__name__, error=str(e), traceback=traceback.format_exc())
         return result
 
 
@@ -1000,6 +1205,8 @@ def main():
     parser.add_argument("--new-only", action="store_true", help="Only index pages not already indexed (default)")
     parser.add_argument("--dry-run", action="store_true", help="Validate config + chunk, no index changes/uploads")
     parser.add_argument("--file", type=str, default=None, help="Path to scraped JSON file")
+    parser.add_argument("--allow-shrink", action="store_true",
+                        help="With --full: allow rebuilding into far fewer documents than the live index holds")
     args = parser.parse_args()
 
     mode = "full" if args.full else "new-only"
@@ -1017,7 +1224,8 @@ def main():
     print(f"   OpenAI:    {AZURE_OPENAI_ENDPOINT}")
     print("=" * 60)
 
-    result = run_pipeline(mode=mode, scraped_file=scraped_file, dry_run=args.dry_run)
+    result = run_pipeline(mode=mode, scraped_file=scraped_file, dry_run=args.dry_run,
+                          allow_shrink=args.allow_shrink)
 
     if not result["success"]:
         print(f"\nFAILED after {result['elapsed_seconds']}s: {result['error']}")

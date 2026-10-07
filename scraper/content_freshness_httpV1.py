@@ -54,6 +54,7 @@ import asyncio
 import hashlib
 import json
 import os
+import random
 import re
 import sys
 import threading
@@ -74,10 +75,13 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from azure.core.exceptions import (
+    ClientAuthenticationError, HttpResponseError, ServiceRequestError, ServiceResponseError,
+)
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from azure.search.documents import SearchClient
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from openai import AzureOpenAI, RateLimitError
+from openai import APIConnectionError, APITimeoutError, AzureOpenAI, InternalServerError, RateLimitError
 
 load_dotenv(find_dotenv())
 log = structlog.get_logger()
@@ -103,8 +107,8 @@ SEMANTIC_CONFIG_NAME = "rlg-semantic-config"
 EMBEDDING_BATCH_SIZE = 50
 UPLOAD_BATCH_SIZE = 100
 
-CHUNK_SIZE = 1600
-CHUNK_OVERLAP = 200
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1600"))      # must match chunk_embed_index_v1.py
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 
 EXPECTED_DOMAIN = "royallondon.com"
 HTTP_CONCURRENCY = 5
@@ -132,6 +136,83 @@ REQUEST_HEADERS = {
         "Chrome/124.0 Safari/537.36 RLG-Aria-Scraper/1.0"
     ),
 }
+
+# ═══════════════════════════════════════════════════════════════
+# Resilience helpers — retry with exponential backoff + jitter, and a
+# transient-vs-permanent error classifier. Duplicated inline in every
+# pipeline script on purpose (zero cross-file imports); a fix here must
+# be mirrored by hand into scrape_approved_urls_httpV1.py and
+# chunk_embed_index_v1.py.
+#
+# Policy: transient failures (network, timeouts, throttling, 5xx, token
+# acquisition blips) are retried and every attempt is logged. Permanent
+# failures, or transient ones that exhaust their retries, are logged at
+# ERROR and RAISED — never swallowed — so a run fails loudly instead of
+# leaving the index half-updated with no trace.
+# ═══════════════════════════════════════════════════════════════
+RETRY_ATTEMPTS = int(os.environ.get("PIPELINE_RETRY_ATTEMPTS", "5"))
+RETRY_BASE_SECONDS = float(os.environ.get("PIPELINE_RETRY_BASE_SECONDS", "2"))
+RETRY_MAX_SECONDS = 60.0
+TRANSIENT_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+# Safety gate: refuse an apply run that would remove more than this share
+# of the indexed pages (min. 3 pages) unless --allow-mass-removal is given.
+# Protects against a truncated Excel / transient site outage mass-deleting
+# the knowledge base.
+MAX_REMOVAL_RATIO = float(os.environ.get("FRESHNESS_MAX_REMOVAL_RATIO", "0.10"))
+MIN_REMOVALS_FOR_BREAKER = 3
+
+# Health check: attempts per URL, and a second-opinion pause before any
+# 404/5xx result is allowed to trigger a deletion.
+HEALTH_ATTEMPTS = 3
+HEALTH_RECHECK_DELAY_SECONDS = 10
+
+
+class TransientHTTPError(Exception):
+    """Raised for a retryable HTTP status (429/5xx) from a plain HTTP fetch."""
+
+    def __init__(self, status_code: int):
+        super().__init__(f"transient HTTP status {status_code}")
+        self.status_code = status_code
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """True for errors worth retrying: network/timeout, throttling, 5xx, token-acquisition blips."""
+    if isinstance(exc, (
+        TransientHTTPError, ServiceRequestError, ServiceResponseError, ClientAuthenticationError,
+        RateLimitError, APIConnectionError, APITimeoutError, InternalServerError,
+        TimeoutError, ConnectionError,
+        requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+    )):
+        return True
+    if isinstance(exc, HttpResponseError):
+        return getattr(exc, "status_code", None) in TRANSIENT_HTTP_STATUS
+    return False
+
+
+def with_retry(fn, *, op: str, attempts: int | None = None, base_seconds: float | None = None, **ctx):
+    """
+    Call fn() with retry on transient errors (exponential backoff + jitter).
+    Every retry is logged at WARNING; a permanent error, or exhausted
+    retries, is logged at ERROR and re-raised. ctx is attached to every log line.
+    """
+    attempts = attempts or RETRY_ATTEMPTS
+    base = RETRY_BASE_SECONDS if base_seconds is None else base_seconds
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            transient = is_transient_error(e)
+            if not transient or attempt >= attempts:
+                log.error("operation_failed", op=op, attempt=attempt, attempts=attempts,
+                          transient=transient, error_type=type(e).__name__, error=str(e), **ctx)
+                raise
+            wait = min(RETRY_MAX_SECONDS, base * (2 ** (attempt - 1))) * random.uniform(0.75, 1.25)
+            log.warning("operation_retry", op=op, attempt=attempt, attempts=attempts,
+                        wait_seconds=round(wait, 1), error_type=type(e).__name__, error=str(e), **ctx)
+            time.sleep(wait)
+
+
 SECTION_MAP = {
     "existing-customers":       "Existing Customers",
     "insurance":                "Insurance",
@@ -953,7 +1034,10 @@ def _has_routing_dropdowns_in_html(html: str) -> bool:
             if len(valid_opts) > 1:
                 return True
         return False
-    except Exception:
+    except Exception as e:
+        # Logged, not silent: returning False means "treat as a normal
+        # page", which would hide dropdown content from the index.
+        log.warning("dropdown_detection_error", error_type=type(e).__name__, error=str(e))
         return False
 
 
@@ -1198,11 +1282,17 @@ def fetch_html(url: str, fixture_dir: str | None = None) -> tuple[str | None, in
         except Exception as e:
             return None, None, f"fixture_read_error:{e}"
 
+    def _get():
+        resp = requests.get(url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code in TRANSIENT_HTTP_STATUS:
+            raise TransientHTTPError(resp.status_code)
+        return resp
+
     try:
-        resp = requests.get(
-            url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT_SECONDS,
-        )
+        resp = with_retry(_get, op="http_get", attempts=3, url=url)
         return resp.text, resp.status_code, None
+    except TransientHTTPError as e:
+        return None, e.status_code, str(e)
     except requests.exceptions.RequestException as e:
         return None, None, str(e)
 
@@ -1708,7 +1798,7 @@ def embed_chunks(chunks: list) -> list:
     if not texts:
         return []
 
-    BATCH_SLEEP_SECONDS, MAX_RETRIES, RETRY_BASE_SECONDS = 2, 5, 10
+    BATCH_SLEEP_SECONDS = 2
     client = get_openai_client()
     all_embeddings = []
     total_batches = (len(texts) + EMBEDDING_BATCH_SIZE - 1) // EMBEDDING_BATCH_SIZE
@@ -1716,24 +1806,25 @@ def embed_chunks(chunks: list) -> list:
     for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
         batch = texts[i:i + EMBEDDING_BATCH_SIZE]
         batch_number = i // EMBEDDING_BATCH_SIZE + 1
-        retry = 0
-        while True:
-            try:
-                response = client.embeddings.create(
-                    input=batch, model=EMBEDDING_DEPLOYMENT, dimensions=EMBEDDING_DIMS,
+        # Rate limits need a longer backoff than other transient errors.
+        response = with_retry(
+            lambda b=batch: client.embeddings.create(
+                input=b, model=EMBEDDING_DEPLOYMENT, dimensions=EMBEDDING_DIMS,
+            ),
+            op="embeddings_create", base_seconds=10, batch=batch_number, total_batches=total_batches,
+        )
+        sorted_data = sorted(response.data, key=lambda e: e.index)
+        if len(sorted_data) != len(batch):
+            raise RuntimeError(
+                f"Embedding batch {batch_number}: expected {len(batch)} vectors, got {len(sorted_data)}"
+            )
+        for e in sorted_data:
+            if len(e.embedding) != EMBEDDING_DIMS:
+                raise RuntimeError(
+                    f"Embedding batch {batch_number}: expected {EMBEDDING_DIMS} dims, got {len(e.embedding)}"
                 )
-                sorted_data = sorted(response.data, key=lambda e: e.index)
-                all_embeddings.extend(e.embedding for e in sorted_data)
-                log.info("embeddings_batch_done", batch=batch_number, total_batches=total_batches)
-                break
-            except RateLimitError as e:
-                retry += 1
-                if retry > MAX_RETRIES:
-                    log.error("embeddings_rate_limit_max_retries", batch=batch_number, error=str(e))
-                    raise
-                wait = RETRY_BASE_SECONDS * (2 ** (retry - 1))
-                log.warning("embeddings_rate_limit_retry", batch=batch_number, retry=retry, wait_seconds=wait)
-                time.sleep(wait)
+        all_embeddings.extend(e.embedding for e in sorted_data)
+        log.info("embeddings_batch_done", batch=batch_number, total_batches=total_batches)
 
         if i + EMBEDDING_BATCH_SIZE < len(texts):
             time.sleep(BATCH_SLEEP_SECONDS)
@@ -1745,24 +1836,98 @@ def get_search_client() -> SearchClient:
     return SearchClient(endpoint=SEARCH_ENDPOINT, index_name=INDEX_NAME, credential=get_credential())
 
 
+def verify_azure_access(need_openai: bool) -> int:
+    """
+    Fail-fast preflight, run before any work: acquire an AAD token for Search
+    (and for OpenAI when embeddings will be needed) and read the index's
+    document count. Warms the credential chain, so a slow/broken `az` login
+    surfaces here — with retries and a clear error — instead of mid-run.
+    Returns the current document count.
+    """
+    cred = get_credential()
+    scopes = ["https://search.azure.com/.default"]
+    if need_openai:
+        scopes.append("https://cognitiveservices.azure.com/.default")
+    for scope in scopes:
+        with_retry(lambda s=scope: cred.get_token(s), op="credential_preflight", scope=scope)
+    client = get_search_client()
+    doc_count = with_retry(lambda: client.get_document_count(), op="index_preflight", index=INDEX_NAME)
+    log.info("azure_access_verified", index=INDEX_NAME, documents=doc_count, openai=need_openai)
+    return doc_count
+
+
 def upload_chunks(chunks: list, embeddings: list) -> int:
+    """
+    Upload chunk+embedding documents. Every document's result is checked:
+    failed documents are retried (bounded); if any still fail, raises —
+    a partial upload is never reported as success.
+    """
+    if len(chunks) != len(embeddings):
+        raise RuntimeError(f"upload_chunks: {len(chunks)} chunks but {len(embeddings)} embeddings")
     client = get_search_client()
     documents = [{**chunk, "embedding": emb} for chunk, emb in zip(chunks, embeddings)]
     total_uploaded = 0
     for i in range(0, len(documents), UPLOAD_BATCH_SIZE):
-        batch = documents[i:i + UPLOAD_BATCH_SIZE]
-        result = client.upload_documents(documents=batch)
-        total_uploaded += sum(1 for r in result if r.succeeded)
+        pending = documents[i:i + UPLOAD_BATCH_SIZE]
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
+            results = with_retry(
+                lambda p=pending: client.upload_documents(documents=p),
+                op="upload_documents", batch_start=i, batch_size=len(pending),
+            )
+            failed = {r.key: (r.error_message or r.status_code) for r in results if not r.succeeded}
+            total_uploaded += len(pending) - len(failed)
+            if not failed:
+                break
+            pending = [d for d in pending if d["chunk_id"] in failed]
+            if attempt == RETRY_ATTEMPTS:
+                log.error("upload_documents_failed", failed=len(pending), sample=list(failed.items())[:3])
+                raise RuntimeError(
+                    f"{len(pending)} document(s) failed to upload after {RETRY_ATTEMPTS} attempts "
+                    f"(batch starting at {i}); first errors: {list(failed.items())[:3]}"
+                )
+            wait = min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * (2 ** (attempt - 1))) * random.uniform(0.75, 1.25)
+            log.warning("upload_partial_failure_retry", attempt=attempt, failed=len(failed), wait_seconds=round(wait, 1))
+            time.sleep(wait)
     log.info("upload_complete", total=total_uploaded)
     return total_uploaded
 
 
 # ═══════════════════════════════════════════════════════════════
-# Index read/delete helpers — pagination-fixed versions (mirrors
-# content_freshnessV1.py's v1.7.8 fix: top=N with no skip loop
-# silently missed most documents once the index grew past a few
-# thousand chunks — every helper here pages through the full index).
+# Index read/delete helpers. Every full-index read is paginated, retried
+# per page, and VERIFIED COMPLETE against the service-reported total
+# count — a partial read raises instead of silently returning a subset
+# (a subset would mis-classify live pages as new/delisted and could
+# leave stale chunks behind or delete the wrong ones).
 # ═══════════════════════════════════════════════════════════════
+
+def _search_page(client, op: str, **kwargs):
+    """One search page with retry; returns (documents, total_count)."""
+    def _call():
+        r = client.search(include_total_count=True, **kwargs)
+        return list(r), r.get_count()
+    return with_retry(_call, op=op, skip=kwargs.get("skip"))
+
+
+def _scan_index(client, op: str, select: list, on_doc) -> int:
+    """Paginate the whole index, call on_doc(doc) for each; raise if the scan is incomplete."""
+    skip, page_sz, scanned, total = 0, 1000, 0, None
+    while True:
+        batch, count = _search_page(client, op, search_text="*", select=select, top=page_sz, skip=skip)
+        if total is None:
+            total = count
+        if not batch:
+            break
+        for r in batch:
+            on_doc(r)
+        scanned += len(batch)
+        if len(batch) < page_sz:
+            break
+        skip += page_sz
+    if total is not None and scanned != total:
+        log.error("index_scan_incomplete", op=op, scanned=scanned, expected=total)
+        raise RuntimeError(f"{op}: index scan incomplete — read {scanned} of {total} documents")
+    return scanned
+
 
 def fetch_current_state_from_index() -> dict:
     """
@@ -1772,164 +1937,138 @@ def fetch_current_state_from_index() -> dict:
     identity_url = dropdown_url when non-empty, else source_url. Since the
     schema change, source_url is ALWAYS the clean, navigable base page
     URL — including for dropdown-state chunks — so every dropdown state
-    under one base page now shares the same source_url. Keying this dict
-    by source_url alone would collapse them all into one entry again
-    (the exact bug this function was fixed for previously): a dropdown
-    state's own content_hash (hashed from just that panel's text) would
-    get silently overwritten by/lost to whichever chunk the paginated
-    scan saw first. dropdown_url is the real per-chunk identity and must be
-    the key whenever it's present.
+    under one base page shares the same source_url. Keying by source_url
+    alone would collapse them into one entry (the bug this function was
+    previously fixed for); dropdown_url is the real per-chunk identity and
+    must be the key whenever it's present.
     """
     client = get_search_client()
     state: dict = {}
-    skip, page_sz = 0, 1000
-    while True:
-        try:
-            results = client.search(
-                search_text="*",
-                select=["source_url", "dropdown_url", "content_hash", "video_url"],
-                top=page_sz, skip=skip,
-            )
-            batch = list(results)
-            if not batch:
-                break
-            for r in batch:
-                src = r.get("source_url", "")
-                st = r.get("dropdown_url", "")
-                identity = st or src
-                norm = normalise_url(identity)
-                if norm and norm not in state:
-                    state[norm] = {
-                        "content_hash": r.get("content_hash", ""),
-                        "video_url": r.get("video_url", ""),
-                        "is_dropdown": bool(st),
-                        "source_url": src,
-                    }
-            if len(batch) < page_sz:
-                break
-            skip += page_sz
-        except Exception as e:
-            log.error("fetch_current_state_error", error=str(e))
-            break
-    log.info("current_state_fetched", count=len(state))
+
+    def _on_doc(r):
+        src = r.get("source_url", "")
+        st = r.get("dropdown_url", "")
+        norm = normalise_url(st or src)
+        if norm and norm not in state:
+            state[norm] = {
+                "content_hash": r.get("content_hash", ""),
+                "video_url": r.get("video_url", ""),
+                "is_dropdown": bool(st),
+                "source_url": src,
+            }
+
+    scanned = _scan_index(
+        client, "fetch_current_state",
+        ["source_url", "dropdown_url", "content_hash", "video_url"], _on_doc,
+    )
+    log.info("current_state_fetched", count=len(state), documents=scanned)
     return state
 
 
-def get_chunk_ids_for_url(url: str) -> list:
+def fetch_index_snapshot() -> dict:
     """
-    Every chunk_id whose source_url matches this base page URL.
-
-    Since the schema change, source_url is ALWAYS the clean base page
-    URL — for a page's own prose/table chunks AND for every one of its
-    dropdown-state chunks (which used to carry the #state=... fragment
-    here; that now lives in dropdown_url instead). So a single source_url
-    match already captures the base page's own chunks and every
-    dropdown variant in one pass — no separate fragment-expansion step
-    needed (see the removed get_all_urls_to_delete()).
+    ONE verified-complete pass over the index, taken BEFORE any write in
+    apply mode. Returns:
+      by_base: {normalised base source_url: [full chunk docs]}  (ids + archive copies)
+      refresh: {normalised identity url: highest refresh_count}  (read before delete,
+               so changed pages' counters increment instead of resetting)
+    Replaces the old per-URL full-index scans (archive / chunk-ids /
+    refresh_count each re-read the entire index once per changed URL).
     """
     client = get_search_client()
-    norm = normalise_url(url)
-    ids, skip, page_sz = [], 0, 1000
-    try:
-        while True:
-            results = client.search(search_text="*", select=["chunk_id", "source_url"], top=page_sz, skip=skip)
-            batch = list(results)
-            if not batch:
-                break
-            for r in batch:
-                if normalise_url(r.get("source_url", "")) == norm:
-                    ids.append(r["chunk_id"])
-            if len(batch) < page_sz:
-                break
-            skip += page_sz
-    except Exception as e:
-        log.error("get_chunk_ids_error", url=url, error=str(e))
-    return ids
+    by_base: dict = {}
+    refresh: dict = {}
+
+    def _on_doc(r):
+        doc = dict(r)
+        by_base.setdefault(normalise_url(doc.get("source_url", "")), []).append(doc)
+        ident = normalise_url(doc.get("dropdown_url") or doc.get("source_url", ""))
+        refresh[ident] = max(refresh.get(ident, 0), int(doc.get("refresh_count") or 0))
+
+    scanned = _scan_index(client, "fetch_index_snapshot", ["*"], _on_doc)
+    log.info("index_snapshot_fetched", documents=scanned, pages=len(by_base))
+    return {"by_base": by_base, "refresh": refresh, "total_docs": scanned}
 
 
-def delete_chunks_for_urls(urls: list, dry_run: bool = False) -> dict:
+def get_chunk_ids_for_url(url: str, snapshot: dict) -> list:
+    """
+    Every chunk_id whose source_url matches this base page URL. source_url is
+    ALWAYS the clean base page URL — for a page's own prose/table chunks AND
+    every dropdown-state chunk — so one match captures them all.
+    """
+    return [d["chunk_id"] for d in snapshot["by_base"].get(normalise_url(url), [])]
+
+
+def _delete_ids_verified(client, url: str, ids: list):
+    """Delete chunk ids; check every result, retry the failed subset, raise if any remain."""
+    pending = list(ids)
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        results = with_retry(
+            lambda p=pending: client.delete_documents(documents=[{"chunk_id": c} for c in p]),
+            op="delete_documents", url=url, batch_size=len(pending),
+        )
+        pending = [r.key for r in results if not r.succeeded]
+        if not pending:
+            return
+        if attempt == RETRY_ATTEMPTS:
+            break
+        wait = min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * (2 ** (attempt - 1))) * random.uniform(0.75, 1.25)
+        log.warning("delete_partial_failure_retry", url=url, attempt=attempt, failed=len(pending), wait_seconds=round(wait, 1))
+        time.sleep(wait)
+    raise RuntimeError(f"{len(pending)} chunk(s) could not be deleted for {url} after {RETRY_ATTEMPTS} attempts")
+
+
+def delete_chunks_for_urls(urls: list, snapshot: dict, dry_run: bool = False) -> tuple:
+    """
+    Returns (summary, failed_urls). summary = {url: chunks deleted}. A URL
+    whose delete fails is logged at ERROR and returned in failed_urls (never
+    reported as deleted); the caller must not index replacement chunks for
+    it, and must fail the run.
+    """
     client = get_search_client()
-    summary = {}
+    summary: dict = {}
+    failed_urls: list = []
     for url in urls:
-        ids = get_chunk_ids_for_url(url)
+        ids = get_chunk_ids_for_url(url, snapshot)
         if not ids:
+            log.warning("delete_no_chunks_found", url=url)
             continue
-        summary[url] = len(ids)
         if dry_run:
+            summary[url] = len(ids)
             log.info("dry_run_would_delete", url=url, count=len(ids))
             continue
-        for i in range(0, len(ids), 100):
-            batch = [{"chunk_id": cid} for cid in ids[i:i + 100]]
-            try:
-                client.delete_documents(documents=batch)
-            except Exception as e:
-                log.error("delete_error", url=url, error=str(e))
+        try:
+            for i in range(0, len(ids), 100):
+                _delete_ids_verified(client, url, ids[i:i + 100])
+        except Exception as e:
+            failed_urls.append(url)
+            log.error("delete_failed", url=url, error_type=type(e).__name__, error=str(e))
+            continue
+        summary[url] = len(ids)
         log.info("chunks_deleted", url=url, count=len(ids))
-    return summary
+    return summary, failed_urls
 
 
-def get_refresh_count_for_url(identity_url: str) -> int:
+def archive_deleted_chunks_locally(url: str, ts_str: str, snapshot: dict) -> str | None:
     """
-    identity_url should be dropdown_url for a dropdown-state chunk, or
-    source_url for a regular chunk — matches how fetch_current_state_
-    from_index() keys entries, since source_url alone is no longer
-    unique for dropdown-state chunks (all share their base page's URL).
+    Local-file archive of the exact chunk documents about to be deleted
+    (from the pre-write snapshot), for manual rollback if a content change
+    causes a response-quality regression. Raises on a write failure — the
+    caller records it and surfaces it in the run summary; it does not
+    silently disappear.
+    NOTE: local disk is ephemeral in a Function App — switch this to Blob
+    storage when the job is moved there.
     """
-    client = get_search_client()
-    norm = normalise_url(identity_url)
-    skip, page_sz = 0, 1000
-    try:
-        while True:
-            results = client.search(search_text="*", select=["source_url", "dropdown_url", "refresh_count"], top=page_sz, skip=skip)
-            batch = list(results)
-            if not batch:
-                break
-            for r in batch:
-                if normalise_url(r.get("dropdown_url") or r.get("source_url", "")) == norm:
-                    return int(r.get("refresh_count") or 0)
-            if len(batch) < page_sz:
-                break
-            skip += page_sz
-    except Exception as e:
-        log.warning("get_refresh_count_error", url=identity_url, error=str(e))
-    return 0
-
-
-def archive_deleted_chunks_locally(url: str, ts_str: str) -> str | None:
-    """
-    Local-file archive (not Blob — this pipeline currently has no
-    Blob usage; Search + OpenAI only). Non-fatal — a failure here
-    never blocks the delete/reindex. Saves the exact chunk documents
-    about to be deleted, for manual rollback if a content change
-    causes a response-quality regression.
-    """
-    client = get_search_client()
-    norm = normalise_url(url)
-    try:
-        chunks, skip, page_sz = [], 0, 500
-        while True:
-            results = client.search(search_text="*", select=["*"], top=page_sz, skip=skip)
-            batch = list(results)
-            if not batch:
-                break
-            for r in batch:
-                if normalise_url(r.get("source_url", "")) == norm:
-                    chunks.append(dict(r))
-            if len(batch) < page_sz:
-                break
-            skip += page_sz
-        if not chunks:
-            return None
-        url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
-        archive_dir = Path(ARCHIVE_DIR)
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        archive_path = archive_dir / f"deleted_{url_hash}_{ts_str}.json"
-        with open(archive_path, "w", encoding="utf-8") as f:
-            json.dump(chunks, f, indent=2)
-        return str(archive_path)
-    except Exception as e:
-        log.warning("archive_failed", url=url, error=str(e))
+    chunks = snapshot["by_base"].get(normalise_url(url), [])
+    if not chunks:
         return None
+    url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    archive_dir = Path(ARCHIVE_DIR)
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = archive_dir / f"deleted_{url_hash}_{ts_str}.json"
+    with open(archive_path, "w", encoding="utf-8") as f:
+        json.dump(chunks, f, indent=2)
+    return str(archive_path)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1939,48 +2078,101 @@ def archive_deleted_chunks_locally(url: str, ts_str: str) -> str | None:
 # (which royallondon.com issues on every URL) isn't a false positive.
 # ═══════════════════════════════════════════════════════════════
 
+async def _probe_url(session: "aiohttp.ClientSession", url: str) -> tuple:
+    """One probe → (status_code, final_url). HEAD, falling back to GET when the server rejects HEAD."""
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
+    async with session.head(url, allow_redirects=True, max_redirects=5, timeout=timeout) as resp:
+        code, final_url = resp.status, str(resp.url)
+    if code in (403, 405, 501):
+        async with session.get(url, allow_redirects=True, max_redirects=5, timeout=timeout) as resp:
+            code, final_url = resp.status, str(resp.url)
+    return code, final_url
+
+
 async def check_single_url(session: "aiohttp.ClientSession", entry: dict) -> dict:
+    """
+    Classify one URL. Only a definitive 404/410 -> dead_404 and a persistent
+    5xx -> dead_5xx can lead to deletion. Ambiguous responses (401/403/429/
+    other 4xx), timeouts and network errors become "timeout"/"error", which
+    are NON-destructive (page left untouched, flagged in the report).
+    Transient failures are retried HEALTH_ATTEMPTS times with backoff.
+    """
     url = entry["url"]
     result = {"url": url, "status": "unknown", "status_code": None, "redirect_note": ""}
-    try:
-        async with session.head(
-            url, allow_redirects=True, max_redirects=5,
-            timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS),
-        ) as resp:
-            code = resp.status
-            final_url = str(resp.url)
+
+    for attempt in range(1, HEALTH_ATTEMPTS + 1):
+        try:
+            code, final_url = await _probe_url(session, url)
+        except asyncio.TimeoutError:
+            result["status"], result["redirect_note"] = "timeout", f"timed out after {HTTP_TIMEOUT_SECONDS}s"
+        except aiohttp.ClientError as e:
+            result["status"], result["redirect_note"] = "error", f"{type(e).__name__}: {e}"
+        except Exception as e:
+            result["status"], result["redirect_note"] = "error", f"{type(e).__name__}: {e}"
+            log.error("health_check_unexpected_error", url=url, error_type=type(e).__name__, error=str(e))
+            return result  # not a network error — retrying will not help
+        else:
             result["status_code"] = code
-            if code < 300:
-                if normalise_url_path(final_url) == normalise_url_path(url):
-                    result["status"] = "live"
-                elif EXPECTED_DOMAIN in final_url:
-                    result["status"] = "internal_redirect"
-                    result["redirect_note"] = f"Redirects to {final_url} — add new URL to Excel."
-                else:
-                    result["status"] = "external_redirect"
-                    result["redirect_note"] = f"Redirects to {final_url} — removing."
-            elif code < 500:
-                result["status"] = "dead_404"
+            if code in TRANSIENT_HTTP_STATUS and attempt < HEALTH_ATTEMPTS:
+                result["status"], result["redirect_note"] = "error", f"HTTP {code}"
             else:
-                result["status"] = "dead_5xx"
-    except asyncio.TimeoutError:
-        result["status"] = "timeout"
-    except Exception as e:
-        result["status"] = "error"
-        log.warning("health_check_error", url=url, error=str(e))
+                if code < 300:
+                    if normalise_url_path(final_url) == normalise_url_path(url):
+                        result["status"], result["redirect_note"] = "live", ""
+                    elif EXPECTED_DOMAIN in final_url:
+                        result["status"] = "internal_redirect"
+                        result["redirect_note"] = f"Redirects to {final_url} — add new URL to Excel."
+                    else:
+                        result["status"] = "external_redirect"
+                        result["redirect_note"] = f"Redirects to {final_url} — removing."
+                elif code in (404, 410):
+                    result["status"], result["redirect_note"] = "dead_404", ""
+                elif code >= 500:
+                    result["status"], result["redirect_note"] = "dead_5xx", ""
+                else:
+                    # 401/403/429/other 4xx: the server answered but not definitively "gone".
+                    result["status"], result["redirect_note"] = "error", f"HTTP {code} — ambiguous, not treated as removed"
+                return result
+
+        if attempt < HEALTH_ATTEMPTS:
+            wait = RETRY_BASE_SECONDS * (2 ** (attempt - 1)) * random.uniform(0.75, 1.25)
+            log.warning("health_check_retry", url=url, attempt=attempt, attempts=HEALTH_ATTEMPTS,
+                        status=result["status"], detail=result["redirect_note"], wait_seconds=round(wait, 1))
+            await asyncio.sleep(wait)
+
+    log.warning("health_check_gave_up", url=url, status=result["status"], detail=result["redirect_note"])
     return result
 
 
 async def check_all_urls_health(entries: list) -> list:
     sem = asyncio.Semaphore(HTTP_CONCURRENCY)
     connector = aiohttp.TCPConnector(ssl=False, limit=HTTP_CONCURRENCY)
+    entry_by_url = {e["url"]: e for e in entries}
     async with aiohttp.ClientSession(
         connector=connector, headers={"User-Agent": "RLG-Aria-ContentFreshness/1.0"},
     ) as session:
         async def _bounded(entry):
             async with sem:
                 return await check_single_url(session, entry)
-        return await asyncio.gather(*[_bounded(e) for e in entries])
+
+        results = list(await asyncio.gather(*[_bounded(e) for e in entries]))
+
+        # Second opinion: a 404/5xx result can trigger deleting a page from
+        # the knowledge base, so re-check every such URL after a pause and
+        # act on the LATER result (a blip that has cleared, or a now
+        # ambiguous answer, is never treated as "removed").
+        suspects = [i for i, r in enumerate(results) if r["status"] in ("dead_404", "dead_5xx")]
+        if suspects:
+            log.warning("health_recheck_destructive_candidates", count=len(suspects),
+                        delay_seconds=HEALTH_RECHECK_DELAY_SECONDS)
+            await asyncio.sleep(HEALTH_RECHECK_DELAY_SECONDS)
+            rechecked = await asyncio.gather(*[_bounded(entry_by_url[results[i]["url"]]) for i in suspects])
+            for i, second in zip(suspects, rechecked):
+                if second["status"] != results[i]["status"]:
+                    log.warning("health_recheck_changed_result", url=results[i]["url"],
+                                first=results[i]["status"], second=second["status"])
+                results[i] = second
+        return results
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2263,14 +2455,22 @@ def save_run_manifest(manifest: dict, ts_str: str) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 def run_freshness_job(mode: str = "report", excel_path: str | None = None,
-                       fixture_dir: str | None = None, dry_run: bool = False) -> dict:
+                       fixture_dir: str | None = None, dry_run: bool = False,
+                       allow_mass_removal: bool = False) -> dict:
     """
     report mode: full scan, produce Excel report, NO index writes.
     apply mode:  full scan + delete/re-index changed+new+removed URLs.
+
+    Apply-mode ordering is deliberate: chunk + embed FIRST (the slow,
+    failure-prone remote step) while the index is still untouched, THEN
+    archive + delete, THEN upload. Any failure before the delete leaves the
+    index exactly as it was. Failures after it are logged at ERROR/CRITICAL,
+    returned in result["errors"] and make the process exit non-zero.
     """
     run_started_at = time.monotonic()
     ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     freshness_run_id = str(uuid.uuid4())
+    errors: list = []
 
     if not SEARCH_ENDPOINT:
         raise ValueError("AZURE_SEARCH_ENDPOINT not set in .env")
@@ -2278,6 +2478,9 @@ def run_freshness_job(mode: str = "report", excel_path: str | None = None,
         raise ValueError("AZURE_OPENAI_ENDPOINT not set in .env (needed to embed changed/new pages)")
 
     excel_path = excel_path or APPROVED_EXCEL
+
+    print("🔐 Step 0: Verifying Azure access (credentials + index reachable)...")
+    verify_azure_access(need_openai=(mode == "apply" and not dry_run))
 
     print("📋 Step 1: Loading approved URLs from Excel...")
     entries = load_approved_pages(excel_path)
@@ -2315,7 +2518,8 @@ def run_freshness_job(mode: str = "report", excel_path: str | None = None,
         elif status == "external_redirect":
             row["action"], row["notes"] = "removed_ext_redir", health.get("redirect_note", "")
         elif status in ("timeout", "error"):
-            row["action"], row["notes"] = "scrape_failed", f"Health check {status}."
+            detail = health.get("redirect_note", "")
+            row["action"], row["notes"] = "scrape_failed", f"Health check {status}" + (f": {detail}" if detail else ".")
         else:
             base_norm = normalise_url(get_base_url(url))
             stored = current_state.get(base_norm)
@@ -2342,6 +2546,25 @@ def run_freshness_job(mode: str = "report", excel_path: str | None = None,
             "status_code": None, "action": "removed_delisted", "chunks_before": 0,
             "chunks_after": 0, "video_changed": False, "notes": "No longer in approved Excel.",
         })
+
+    # Mass-removal circuit breaker (before any scraping or write). A
+    # truncated Excel, a partial index read or a site outage would otherwise
+    # classify a large share of the knowledge base as removed.
+    removal_count = sum(1 for r in scan_results if r["action"].startswith("removed_"))
+    indexed_pages = sum(1 for s in current_state.values() if not s["is_dropdown"]) or len(entries)
+    removal_limit = max(MIN_REMOVALS_FOR_BREAKER, int(MAX_REMOVAL_RATIO * indexed_pages))
+    removal_breaker_tripped = removal_count > removal_limit
+    if removal_breaker_tripped:
+        msg = (f"{removal_count} of {indexed_pages} indexed pages are classified for removal "
+               f"(limit {removal_limit} = max({MIN_REMOVALS_FOR_BREAKER}, {MAX_REMOVAL_RATIO:.0%}))")
+        log.critical("removal_circuit_breaker_tripped", removals=removal_count,
+                     indexed_pages=indexed_pages, limit=removal_limit)
+        print(f"⚠️  WARNING: {msg}")
+        if mode == "apply" and not dry_run and not allow_mass_removal:
+            raise RuntimeError(
+                f"ABORTED before any index write: {msg}. Check the Excel file is complete and the "
+                f"site is reachable; re-run with --allow-mass-removal only if this is intended."
+            )
 
     print(f"🕷️  Step 5: Scraping {len(urls_to_scrape):,} URLs pending content check...")
     scraped_pages: list = []
@@ -2405,46 +2628,102 @@ def run_freshness_job(mode: str = "report", excel_path: str | None = None,
 
     chunks_added = 0
     chunks_deleted = 0
+    archive_failures: list = []
 
     if mode == "apply" and not dry_run:
         print("⚡ Step 7: Applying changes to the index...")
-        # No fragment-expansion step needed here: source_url is now the
-        # clean base URL for every chunk under a page, dropdown-state
-        # chunks included, so get_chunk_ids_for_url(base_url) — called
-        # inside delete_chunks_for_urls() — already matches the base
-        # page's own chunks AND every dropdown variant in one pass.
-        urls_needing_delete = [
-            r["url"] for r in scan_results
-            if r["action"] in ("changed", "removed_404", "removed_5xx", "removed_delisted",
-                                "removed_int_redir", "removed_ext_redir")
-        ]
-        if urls_needing_delete:
-            for url in urls_needing_delete:
-                archive_deleted_chunks_locally(url, ts_str)
-            deleted_summary = delete_chunks_for_urls(urls_needing_delete)
-            chunks_deleted = sum(deleted_summary.values())
+        # 7a. ONE verified-complete read of the index BEFORE any write: chunk
+        # ids to delete, archive copies, and each page's current refresh_count
+        # (read before the delete so it increments instead of resetting).
+        snapshot = fetch_index_snapshot()
+        snapshot_docs = snapshot["total_docs"]
+        for r in scan_results:
+            r["chunks_before"] = len(snapshot["by_base"].get(normalise_url(r["url"]), []))
 
-        pages_to_index = [p for p in scraped_pages]
-        for p in pages_to_index:
-            # refresh_count tracks THIS chunk's own prior count — for a
-            # dropdown-state page that's keyed by dropdown_url (its real
-            # identity), not source_url (now shared with the base page
-            # and every other dropdown state under it).
+        # 7b. Chunk + embed FIRST, while the index is still untouched: an
+        # OpenAI outage or a bad chunk aborts the run with nothing deleted.
+        # (source_url is the clean base URL for every chunk under a page,
+        # dropdown states included, so one base-URL match covers them all.)
+        for p in scraped_pages:
+            # refresh_count is keyed by dropdown_url for a dropdown-state page
+            # (its real identity), not source_url (shared with the base page).
             p_identity = p.get("dropdown_url") or p.get("source_url", "")
+            ident_norm = normalise_url(p_identity)
             base_norm = normalise_url(p.get("source_url", ""))
-            p["refresh_count"] = get_refresh_count_for_url(p_identity) + 1 if base_norm in current_state or normalise_url(p_identity) in current_state else 0
+            known = base_norm in current_state or ident_norm in current_state
+            p["refresh_count"] = snapshot["refresh"].get(ident_norm, 0) + 1 if known else 0
 
-        if pages_to_index:
-            new_chunks = chunk_pages(pages_to_index, refresh_run_id=freshness_run_id)
+        new_chunks: list = []
+        embeddings: list = []
+        if scraped_pages:
+            new_chunks = chunk_pages(scraped_pages, refresh_run_id=freshness_run_id)
             embeddings = embed_chunks(new_chunks)
-            chunks_added = upload_chunks(new_chunks, embeddings)
+            if len(embeddings) != len(new_chunks):
+                raise RuntimeError(f"ABORTED before any index write: {len(new_chunks)} chunks but {len(embeddings)} embeddings")
+        chunk_counts: dict = {}
+        for c in new_chunks:
+            key = normalise_url(c["source_url"])
+            chunk_counts[key] = chunk_counts.get(key, 0) + 1
 
-            chunks_by_url: dict = {}
-            for c in new_chunks:
-                chunks_by_url.setdefault(c["source_url"], 0)
-                chunks_by_url[c["source_url"]] += 1
-            for r in scan_results:
-                r["chunks_after"] = chunks_by_url.get(r["url"], 0)
+        # 7c. Never delete a changed page's chunks unless its replacement
+        # chunks are ready; otherwise leave the old content in place.
+        delete_actions = ("changed", "removed_404", "removed_5xx", "removed_delisted",
+                          "removed_int_redir", "removed_ext_redir")
+        urls_needing_delete: list = []
+        for r in scan_results:
+            if r["action"] not in delete_actions:
+                continue
+            if r["action"] == "changed" and chunk_counts.get(normalise_url(r["url"]), 0) == 0:
+                log.error("skip_delete_no_replacement", url=r["url"])
+                errors.append(f"changed page produced no replacement chunks — old chunks kept: {r['url']}")
+                continue
+            urls_needing_delete.append(r["url"])
+
+        # 7d. Archive rollback copies, then delete (every result verified).
+        for url in urls_needing_delete:
+            try:
+                archive_deleted_chunks_locally(url, ts_str, snapshot)
+            except Exception as e:
+                archive_failures.append(url)
+                log.error("archive_failed", url=url, error_type=type(e).__name__, error=str(e),
+                          note="no local rollback copy for this URL; deletion continues")
+        if archive_failures:
+            errors.append(f"archive failed for {len(archive_failures)} URL(s) (no rollback copy): {archive_failures}")
+        deleted_summary, delete_failed = delete_chunks_for_urls(urls_needing_delete, snapshot)
+        chunks_deleted = sum(deleted_summary.values())
+        if delete_failed:
+            errors.append(f"delete failed for {len(delete_failed)} URL(s) — old chunks still in the index: {delete_failed}")
+
+        # 7e. Upload replacements. URLs whose delete failed are skipped, so
+        # stale + new copies of one page never coexist.
+        failed_norm = {normalise_url(u) for u in delete_failed}
+        pairs = [(c, e) for c, e in zip(new_chunks, embeddings)
+                 if normalise_url(c["source_url"]) not in failed_norm]
+        uploaded_ok = True
+        if pairs:
+            try:
+                chunks_added = upload_chunks([c for c, _ in pairs], [e for _, e in pairs])
+            except Exception as e:
+                uploaded_ok = False
+                log.critical("upload_failed_after_delete", error_type=type(e).__name__, error=str(e),
+                             note="affected URLs have no chunks until the next successful run (they will be detected as new)")
+                errors.append(f"upload failed after delete — affected pages missing from the index until the next run: {e}")
+        for r in scan_results:
+            r["chunks_after"] = chunk_counts.get(normalise_url(r["url"]), 0) if uploaded_ok else 0
+
+        # 7f. Soft post-check (the service count is eventually consistent, so a
+        # mismatch is a warning to re-check shortly, not a failure).
+        try:
+            expected_docs = snapshot_docs - chunks_deleted + chunks_added
+            actual_docs = with_retry(lambda: get_search_client().get_document_count(),
+                                     op="postcheck_document_count", attempts=3)
+            if actual_docs == expected_docs:
+                log.info("document_count_verified", documents=actual_docs)
+            else:
+                log.warning("document_count_mismatch", expected=expected_docs, actual=actual_docs,
+                            note="index count is eventually consistent — re-check in a minute")
+        except Exception as e:
+            log.warning("postcheck_unavailable", error_type=type(e).__name__, error=str(e))
     else:
         print("   Step 7: Report mode (or dry-run) — no index writes.")
 
@@ -2465,6 +2744,9 @@ def run_freshness_job(mode: str = "report", excel_path: str | None = None,
         "scrape_failed": sum(1 for r in scan_results if r["action"] == "scrape_failed"),
         "chunks_added": chunks_added,
         "chunks_deleted": chunks_deleted,
+        "removal_breaker_tripped": removal_breaker_tripped,
+        "archive_failures": archive_failures,
+        "errors": errors,
     }
     report_path = build_report(
         scan_results, run_summary,
@@ -2476,7 +2758,7 @@ def run_freshness_job(mode: str = "report", excel_path: str | None = None,
 
     elapsed = round(time.monotonic() - run_started_at, 2)
     return {
-        "success": True, "elapsed_seconds": elapsed, "run_summary": run_summary,
+        "success": not errors, "errors": errors, "elapsed_seconds": elapsed, "run_summary": run_summary,
         "report_path": str(report_path), "manifest_path": manifest_path,
         "preflight": preflight,
     }
@@ -2488,6 +2770,8 @@ def main():
     parser.add_argument("--file", type=str, default=None, help="Path to approved-URLs Excel")
     parser.add_argument("--fixture-dir", type=str, default=None, help="Local HTML fixtures instead of live HTTP")
     parser.add_argument("--dry-run", action="store_true", help="Validate config/connectivity, no index writes")
+    parser.add_argument("--allow-mass-removal", action="store_true",
+                        help="Override the mass-removal circuit breaker (apply mode only)")
     args = parser.parse_args()
 
     print("\n" + "=" * 60)
@@ -2499,19 +2783,34 @@ def main():
     print(f"   Index:     {INDEX_NAME}")
     print("=" * 60 + "\n")
 
-    result = run_freshness_job(
-        mode=args.mode, excel_path=args.file,
-        fixture_dir=args.fixture_dir, dry_run=args.dry_run,
-    )
+    try:
+        result = run_freshness_job(
+            mode=args.mode, excel_path=args.file,
+            fixture_dir=args.fixture_dir, dry_run=args.dry_run,
+            allow_mass_removal=args.allow_mass_removal,
+        )
+    except Exception as e:
+        # Fail loudly with a non-zero exit code so a scheduler / DevOps
+        # pipeline marks the run failed instead of treating it as success.
+        log.critical("freshness_job_failed", error_type=type(e).__name__, error=str(e), exc_info=True)
+        print(f"\n❌ FAILED ({type(e).__name__}): {e}")
+        sys.exit(1)
 
     s = result["run_summary"]
     print(f"\nDone in {result['elapsed_seconds']}s")
     print(f"   Unchanged: {s['live_unchanged']}   Changed: {s['changed']}   New: {s['new']}")
     print(f"   Removed (404/5xx/redirect/delisted/failed): "
           f"{s['dead_404'] + s['dead_5xx'] + s['internal_redirect'] + s['external_redirect'] + s['delisted'] + s['scrape_failed']}")
+    if s["scrape_failed"]:
+        print(f"   ⚠️  {s['scrape_failed']} URL(s) could not be checked/scraped — left untouched (see report)")
     print(f"   Chunks added: {s['chunks_added']}   Chunks deleted: {s['chunks_deleted']}")
     print(f"   Report:   {result['report_path']}")
     print(f"   Manifest: {result['manifest_path']}")
+    if result["errors"]:
+        print(f"\n❌ COMPLETED WITH {len(result['errors'])} ERROR(S) — investigate before the next run:")
+        for err in result["errors"]:
+            print(f"   - {err}")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
