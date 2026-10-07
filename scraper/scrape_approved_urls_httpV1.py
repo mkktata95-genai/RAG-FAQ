@@ -1736,6 +1736,22 @@ def load_url_source(excel_path: str) -> list[dict]:
     return load_approved_pages(excel_path)
 
 
+def dedup_pages(pages: list[dict]) -> list[dict]:
+    """Drop repeated entries (key: dropdown_url, else source_url); never drop an entry with no key."""
+    seen, out = set(), []
+    for e in pages:
+        k = e.get("dropdown_url") or e.get("source_url")
+        if not k:
+            log.error("page_missing_identity_kept", entry_keys=sorted(e))
+            out.append(e)
+        elif k in seen:
+            log.warning("duplicate_page_dropped", key=k)
+        else:
+            seen.add(k)
+            out.append(e)
+    return out
+
+
 def save_scraped_pages(results: list[dict], output_file: Path) -> str:
     """
     Write the full list of scraped page dicts to a local JSON file
@@ -1864,15 +1880,7 @@ def run_scraper(
             if batch_start + BATCH_SIZE < total and not fixture_dir:
                 time.sleep(BATCH_DELAY_SECONDS)
 
-        _seen, _dedup = set(), []
-        for e in scraped:
-            k = e.get("dropdown_url") or e.get("url")
-            if k in _seen:
-                log.warning("duplicate_page_dropped", key=k)
-                continue
-            _seen.add(k)
-            _dedup.append(e)
-        scraped = _dedup
+        scraped = dedup_pages(scraped)
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         output_file = Path("scraper/data") / f"royal_london_faq_approved_httpV1_{timestamp}.json"
