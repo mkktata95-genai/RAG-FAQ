@@ -572,6 +572,7 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
             "publish_date": page.get("publish_date", ""),
             "collection_name": page.get("collection_name", ""),
             "read_time_mins": str(page.get("read_time_mins", "5")),
+            "page_purpose": page.get("page_purpose") or "",
         }
 
         is_dropdown_state = bool(page.get("dropdown_title", ""))
@@ -884,6 +885,11 @@ def create_or_update_index(fresh: bool = False):
         # display (e.g. "Related" cards) read this field explicitly instead.
         SearchableField(name="dropdown_title", type=SearchFieldDataType.String,
                          searchable=True, filterable=True, sortable=False, facetable=False, retrievable=True),
+        # page_purpose — B&M's Excel label (Information / Action / Directional /
+        # Reassurance / Engagement). Filterable so consumers can split answer
+        # sources from CTA pages; not searchable so label words never add BM25 noise.
+        SimpleField(name="page_purpose", type=SearchFieldDataType.String,
+                    searchable=False, filterable=True, sortable=False, facetable=True, retrievable=True),
         SimpleField(name="element_type", type=SearchFieldDataType.String,
                     searchable=False, filterable=True, sortable=False, facetable=True, retrievable=True),
         SearchField(name="embedding", type=SearchFieldDataType.Collection(SearchFieldDataType.Single),

@@ -721,6 +721,7 @@ def load_approved_pages(excel_path: str) -> list[dict]:
     TITLE_HEADERS    = {"title", "page title", "name"}
     STATUS_HEADERS   = {"status", "status code", "http status"}
     CATEGORY_HEADERS = {"category", "content category", "page category", "type"}
+    PURPOSE_HEADERS  = {"page purpose", "page_purpose", "purpose"}
 
     header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
     headers = [str(h).strip().lower() if h is not None else "" for h in header_row]
@@ -735,6 +736,10 @@ def load_approved_pages(excel_path: str) -> list[dict]:
     title_idx    = find_col(TITLE_HEADERS)
     status_idx   = find_col(STATUS_HEADERS)
     category_idx = find_col(CATEGORY_HEADERS)
+    purpose_idx  = find_col(PURPOSE_HEADERS)
+    if purpose_idx is None:
+        log.error("page_purpose_column_missing", file=str(excel_path), headers=headers,
+                  impact="page_purpose will be empty for every page")
 
     if url_idx is None:
         wb.close()
@@ -750,6 +755,7 @@ def load_approved_pages(excel_path: str) -> list[dict]:
         title_column=headers[title_idx] if title_idx is not None else None,
         status_column=headers[status_idx] if status_idx is not None else None,
         category_column=headers[category_idx] if category_idx is not None else None,
+        purpose_column=headers[purpose_idx] if purpose_idx is not None else None,
     )
 
     def _is_dead_status(value) -> bool:
@@ -791,6 +797,12 @@ def load_approved_pages(excel_path: str) -> list[dict]:
             else ""
         )
 
+        page_purpose = (
+            str(row[purpose_idx]).strip()
+            if purpose_idx is not None and len(row) > purpose_idx and row[purpose_idx]
+            else ""
+        )
+
         total_rows += 1
 
         if _is_dead_status(status_value):
@@ -809,7 +821,8 @@ def load_approved_pages(excel_path: str) -> list[dict]:
                 title = title[: -len(suffix)].strip()
                 break
 
-        pages.append({"url": normalized, "title": title, "excel_category": excel_category})
+        pages.append({"url": normalized, "title": title, "excel_category": excel_category,
+                      "page_purpose": page_purpose})
 
     wb.close()
 
@@ -1227,6 +1240,7 @@ def extract_dropdown_states_from_html(
                 "publish_date":     base_page_data["publish_date"],
                 "collection_name":  base_page_data["collection_name"],
                 "read_time_mins":   str(max(1, len(content.split()) // 200)),
+                "page_purpose":     base_page_data.get("page_purpose", ""),
                 "dropdown_title":   opt_text,
                 "dropdown_value":   opt_value or "",
             })
@@ -1714,6 +1728,7 @@ def chunk_pages(pages: list, refresh_run_id: str = "") -> list:
             "publish_date": page.get("publish_date", ""),
             "collection_name": page.get("collection_name", ""),
             "read_time_mins": str(page.get("read_time_mins", "5")),
+            "page_purpose": page.get("page_purpose") or "",
         }
 
         is_dropdown_state = bool(page.get("dropdown_title", ""))
@@ -2189,6 +2204,7 @@ def scrape_url_for_freshness(entry: dict, fixture_dir: str | None = None) -> "li
     url = entry["url"]
     title = entry.get("title", "")
     excel_category = entry.get("excel_category", "")
+    page_purpose = entry.get("page_purpose", "")
 
     html, status_code, fetch_error = fetch_html(url, fixture_dir=fixture_dir)
     if fetch_error is not None:
@@ -2242,6 +2258,7 @@ def scrape_url_for_freshness(entry: dict, fixture_dir: str | None = None) -> "li
             "publish_date": metadata["publish_date"],
             "collection_name": metadata["collection_name"],
             "read_time_mins": metadata["read_time_mins"],
+            "page_purpose": page_purpose,
             "dropdown_title": "",
             "dropdown_value": "",
         }
