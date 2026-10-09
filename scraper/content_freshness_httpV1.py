@@ -1366,9 +1366,10 @@ def clean_scraped_content(content: str) -> str:
     """
     content = _remove_duplicate_content(content)
 
+    # Breadcrumb: run of "N. [text](url) >" lines plus the final plain "N. Page name" item.
+    # Plain numbered lines elsewhere in the body are real steps and are kept.
+    content = re.sub(r'(?:^\s*\d+\.\s*\[.*?\]\(.*?\)\s*>\s*$\s*)+^\s*\d+\.\s+[A-Z][^\n]{3,60}$', '', content, flags=re.MULTILINE)
     content = re.sub(r'^\s*\d+\.\s*\[.*?\]\(.*?\)\s*>\s*$', '', content, flags=re.MULTILINE)
-    content = re.sub(r'^\s*\d+\.\s*\[.*?\]\(.*?\)\s*$', '', content, flags=re.MULTILINE)
-    content = re.sub(r'^\s*\d+\.\s+[A-Z][^\n]{3,60}$', '', content, flags=re.MULTILINE)
 
     content = re.sub(r'Share\s*\n(\s*\*\s*(\[?\s*\]?\([^\)]*\))?\s*\n)+', '', content)
     content = re.sub(r'^\s*\*\s*\[?\s*\]?\(\s*[^\)]{0,10}\)\s*$', '', content, flags=re.MULTILINE)
@@ -1386,12 +1387,6 @@ def clean_scraped_content(content: str) -> str:
     content = re.sub(r'^(Previous Item|Next Item)\s*$', '', content, flags=re.MULTILINE | re.IGNORECASE)
 
     content = re.sub(r'Your browser is not supported\..*?×\s*', '', content, flags=re.DOTALL)
-    content = re.sub(r'#{1,3}\s*Connect with us.*$', '', content, flags=re.DOTALL | re.MULTILINE)
-    content = re.sub(r'#{1,3}\s*Products and services.*$', '', content, flags=re.DOTALL | re.MULTILINE)
-    content = re.sub(r'#{1,3}\s*About Royal London.*$', '', content, flags=re.DOTALL | re.MULTILINE)
-    content = re.sub(r'#{1,3}\s*Useful links.*$', '', content, flags=re.DOTALL | re.MULTILINE)
-    content = re.sub(r'\*\*The Royal London Mutual Insurance.*$', '', content, flags=re.DOTALL | re.MULTILINE)
-    content = re.sub(r'©\s*Royal London \d{4}.*$', '', content, flags=re.DOTALL | re.MULTILINE)
     content = re.sub(r'\[Back to top\].*?\n', '', content)
 
     content = re.sub(r'\n{3,}', '\n\n', content)

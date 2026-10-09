@@ -962,14 +962,10 @@ def clean_content(content: str) -> str:
          URLs
       6. Empty markdown links `[ ]( )` and empty bullet-link stubs
       7. "Previous Item" / "Next Item" pagination labels
-      8. Footer boilerplate: the browser-support banner, and
-         everything from a "Connect with us" / "Products and
-         services" / "About Royal London" / "Useful links" heading
-         to end-of-content, the Royal London Mutual Insurance legal
-         paragraph, the "© Royal London <year>" copyright line, and
-         "[Back to top]" links — these all anchor at a known heading
-         and intentionally consume everything AFTER it (DOTALL),
-         since footer content is always last on the page
+      8. Browser-support banner and "[Back to top]" links. (Footer
+         heading/copyright CUT rules were removed: footer/nav/aside
+         tags are already excluded, and those rules deleted real
+         in-body content such as press-release "About Royal London".)
       9. Whitespace normalisation: collapses 3+ blank lines to one,
          strips trailing spaces before a newline, collapses a
          whitespace-only line between two blank lines
@@ -986,9 +982,10 @@ def clean_content(content: str) -> str:
     """
     content = remove_duplicate_content(content)
 
+    # Breadcrumb: run of "N. [text](url) >" lines plus the final plain "N. Page name" item.
+    # Plain numbered lines elsewhere in the body are real steps and are kept.
+    content = re.sub(r'(?:^\s*\d+\.\s*\[.*?\]\(.*?\)\s*>\s*$\s*)+^\s*\d+\.\s+[A-Z][^\n]{3,60}$', '', content, flags=re.MULTILINE)
     content = re.sub(r'^\s*\d+\.\s*\[.*?\]\(.*?\)\s*>\s*$', '', content, flags=re.MULTILINE)
-    content = re.sub(r'^\s*\d+\.\s*\[.*?\]\(.*?\)\s*$', '', content, flags=re.MULTILINE)
-    content = re.sub(r'^\s*\d+\.\s+[A-Z][^\n]{3,60}$', '', content, flags=re.MULTILINE)
 
     content = re.sub(r'Share\s*\n(\s*\*\s*(\[?\s*\]?\([^\)]*\))?\s*\n)+', '', content)
     content = re.sub(r'^\s*\*\s*\[?\s*\]?\(\s*[^\)]{0,10}\)\s*$', '', content, flags=re.MULTILINE)
@@ -1006,12 +1003,6 @@ def clean_content(content: str) -> str:
     content = re.sub(r'^(Previous Item|Next Item)\s*$', '', content, flags=re.MULTILINE | re.IGNORECASE)
 
     content = re.sub(r'Your browser is not supported\..*?×\s*', '', content, flags=re.DOTALL)
-    content = re.sub(r'#{1,3}\s*Connect with us.*$', '', content, flags=re.DOTALL | re.MULTILINE)
-    content = re.sub(r'#{1,3}\s*Products and services.*$', '', content, flags=re.DOTALL | re.MULTILINE)
-    content = re.sub(r'#{1,3}\s*About Royal London.*$', '', content, flags=re.DOTALL | re.MULTILINE)
-    content = re.sub(r'#{1,3}\s*Useful links.*$', '', content, flags=re.DOTALL | re.MULTILINE)
-    content = re.sub(r'\*\*The Royal London Mutual Insurance.*$', '', content, flags=re.DOTALL | re.MULTILINE)
-    content = re.sub(r'©\s*Royal London \d{4}.*$', '', content, flags=re.DOTALL | re.MULTILINE)
     content = re.sub(r'\[Back to top\].*?\n', '', content)
 
     content = re.sub(r'\n{3,}', '\n\n', content)
