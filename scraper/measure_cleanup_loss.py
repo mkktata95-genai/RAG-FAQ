@@ -9,9 +9,8 @@ import content_freshness_httpV1 as cf
 
 M, D, I = re.MULTILINE, re.DOTALL, re.IGNORECASE
 RULES = [  # (name, pattern, flags, replacement) - mirrors clean_scraped_content()
+    ("breadcrumb_block", r'(?:^\s*\d+\.\s*\[.*?\]\(.*?\)\s*>\s*$\s*)+^\s*\d+\.\s+[A-Z][^\n]{3,60}$', M),
     ("numbered_link_arrow", r'^\s*\d+\.\s*\[.*?\]\(.*?\)\s*>\s*$', M),
-    ("numbered_link", r'^\s*\d+\.\s*\[.*?\]\(.*?\)\s*$', M),
-    ("numbered_short_line", r'^\s*\d+\.\s+[A-Z][^\n]{3,60}$', M),
     ("share_block", r'Share\s*\n(\s*\*\s*(\[?\s*\]?\([^\)]*\))?\s*\n)+', 0),
     ("empty_bullet_link", r'^\s*\*\s*\[?\s*\]?\(\s*[^\)]{0,10}\)\s*$', M),
     ("share_line", r'^Share\s*$', M),
@@ -21,12 +20,7 @@ RULES = [  # (name, pattern, flags, replacement) - mirrors clean_scraped_content
     ("empty_bullet", r'^\s*\*\s*\[\s*\]\s*$', M),
     ("prev_next_item", r'^(Previous Item|Next Item)\s*$', M | I),
     ("browser_not_supported", r'Your browser is not supported\..*?×\s*', D),
-    ("CUT_connect_with_us", r'#{1,3}\s*Connect with us.*$', D | M),
-    ("CUT_products_and_services", r'#{1,3}\s*Products and services.*$', D | M),
-    ("CUT_about_royal_london", r'#{1,3}\s*About Royal London.*$', D | M),
-    ("CUT_useful_links", r'#{1,3}\s*Useful links.*$', D | M),
     ("CUT_RL_mutual_insurance", r'\*\*The Royal London Mutual Insurance.*$', D | M),
-    ("CUT_copyright", r'©\s*Royal London \d{4}.*$', D | M),
     ("back_to_top", r'\[Back to top\].*?\n', 0),
 ]
 
