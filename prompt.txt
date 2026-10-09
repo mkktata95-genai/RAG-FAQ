@@ -181,3 +181,6 @@ open(f'scraper/tests/fixtures/mini/{fname}','w',encoding='utf-8').write(r.text)
 print(r.status_code, fname)
 "
 python scraper\content_freshness_httpV1.py --mode apply --file scraper\data\mini_test.xlsx --fixture-dir scraper\tests\fixtures\mini
+
+----------------------
+python -c "import re,content_freshness_httpV1 as cf; from pathlib import Path; f=next(Path(r'tests\fixtures\fixtures_base').glob('*access_your_pension*.html')); md=cf.html_fragment_to_markdown(cf.extract_main_html(f.read_text(encoding='utf-8',errors='replace'))); [print(m.group(0).strip()) for p in (r'^\s*\d+\.\s*\[.*?\]\(.*?\)\s*>\s*$', r'^\s*\d+\.\s+[A-Z][^\n]{3,60}$') for m in re.finditer(p,md,re.M)]"
