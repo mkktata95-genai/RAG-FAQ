@@ -21,6 +21,7 @@ RULES = [  # (name, pattern, flags, replacement) - mirrors clean_scraped_content
     ("prev_next_item", r'^(Previous Item|Next Item)\s*$', M | I),
     ("browser_not_supported", r'Your browser is not supported\..*?×\s*', D),
     ("back_to_top", r'\[Back to top\].*?\n', 0),
+    ("CUT_latest_news", r'^#{1,3}[ \t]*Latest news[ \t]*$.*', D | M),
 ]
 
 def measure(md):

@@ -23,9 +23,11 @@ Real note to editors text.
 
 **The Royal London Mutual Insurance Society Limited** is real legal text.
 '''
+md += '\n### Latest news\n[### Other release](https://x/y "Read more")\n'
 a, b = cf.clean_scraped_content(md), sc.clean_content(md)
 assert a == b
 assert "[Home]" not in a and "4. Access your pension" not in a
 assert "1. Log in to your account" in a and "2. Check your details" in a
 assert "Real note to editors" in a and "Mutual Insurance Society" in a
+assert "Latest news" not in a and "Other release" not in a
 print(a); print("OK")

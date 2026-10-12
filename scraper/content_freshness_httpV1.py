@@ -1389,6 +1389,10 @@ def clean_scraped_content(content: str) -> str:
     content = re.sub(r'Your browser is not supported\..*?×\s*', '', content, flags=re.DOTALL)
     content = re.sub(r'\[Back to top\].*?\n', '', content)
 
+    # Related-news widget at the foot of press releases: a list of other releases' headlines + "Read more" links.
+    # Each of those releases is indexed as its own page, so this is pure duplication.
+    content = re.sub(r'^#{1,3}[ \t]*Latest news[ \t]*$.*', '', content, flags=re.DOTALL | re.MULTILINE)
+
     content = re.sub(r'\n{3,}', '\n\n', content)
     content = re.sub(r'[ \t]+\n', '\n', content)
     content = re.sub(r'\n[ \t]+\n', '\n\n', content)

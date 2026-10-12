@@ -222,6 +222,7 @@ TRANSIENT_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
 # marked FAILED (non-zero exit) so a downstream full re-index is not built
 # from an incomplete page set. Any failure at all still exits non-zero (2).
 MAX_SCRAPE_FAILURE_RATIO = float(os.environ.get("SCRAPER_MAX_FAILURE_RATIO", "0.05"))
+CLEANUP_LOSS_WARN_PCT = float(os.environ.get("SCRAPER_CLEANUP_LOSS_WARN_PCT", "20"))
 
 
 class TransientHTTPError(Exception):
@@ -1005,6 +1006,10 @@ def clean_content(content: str) -> str:
     content = re.sub(r'Your browser is not supported\..*?×\s*', '', content, flags=re.DOTALL)
     content = re.sub(r'\[Back to top\].*?\n', '', content)
 
+    # Related-news widget at the foot of press releases: a list of other releases' headlines + "Read more" links.
+    # Each of those releases is indexed as its own page, so this is pure duplication.
+    content = re.sub(r'^#{1,3}[ \t]*Latest news[ \t]*$.*', '', content, flags=re.DOTALL | re.MULTILINE)
+
     content = re.sub(r'\n{3,}', '\n\n', content)
     content = re.sub(r'[ \t]+\n', '\n', content)
     content = re.sub(r'\n[ \t]+\n', '\n\n', content)
@@ -1633,7 +1638,13 @@ def scrape_page(
                     f"may not use the expected main/article/.content selector, "
                     f"or is genuinely a near-empty page")
         else:
+            raw_len = len(page_content)
             page_content = clean_content(page_content)
+            loss_pct = round(100 * (raw_len - len(page_content)) / raw_len, 1)
+            if loss_pct > CLEANUP_LOSS_WARN_PCT:
+                # Review signal only: a rule may be deleting real content, or a new template has noise.
+                log.warning("cleanup_loss_high", url=url, raw_chars=raw_len,
+                            cleaned_chars=len(page_content), loss_pct=loss_pct)
             if len(page_content.strip()) < 50:
                 thin = ("content_too_short_after_cleaning", len(page_content.strip()),
                         f"content_too_short_after_cleaning: {len(page_content.strip())} "

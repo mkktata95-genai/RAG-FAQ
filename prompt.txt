@@ -236,3 +236,27 @@ python -c "import re,content_freshness_httpV1 as cf; from pathlib import Path; f
   "top": 50
 }
 
+-------------
+
+1. Page and chunk counts. Expect 300 pages and about 3,407 chunks.
+{ "search": "*", "filter": "chunk_index eq 0", "count": true, "top": 0 }
+{ "search": "*", "count": true, "top": 0, "facets": ["page_purpose,count:10"] }
+
+2. Latest-news widget gone. Expect 0, or only a page where "Latest news" is real body text.
+{
+  "search": "\"Latest news\"",
+  "searchFields": "content",
+  "count": true,
+  "select": "source_url,chunk_index",
+  "top": 20
+}
+
+3. Isabel Hudson page. Expect 5 chunks (0 to 4), with the "About Royal London" text in chunk 4.
+{
+  "search": "*",
+  "filter": "search.ismatch('isabel_hudson', 'source_url') or search.ismatch('isabel-hudson', 'source_url')",
+  "select": "chunk_index",
+  "orderby": "chunk_index asc",
+  "top": 50,
+  "count": true
+}
