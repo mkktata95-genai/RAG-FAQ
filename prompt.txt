@@ -184,3 +184,55 @@ python scraper\content_freshness_httpV1.py --mode apply --file scraper\data\mini
 
 ----------------------
 python -c "import re,content_freshness_httpV1 as cf; from pathlib import Path; f=next(Path(r'tests\fixtures\fixtures_base').glob('*access_your_pension*.html')); md=cf.html_fragment_to_markdown(cf.extract_main_html(f.read_text(encoding='utf-8',errors='replace'))); [print(m.group(0).strip()) for p in (r'^\s*\d+\.\s*\[.*?\]\(.*?\)\s*>\s*$', r'^\s*\d+\.\s+[A-Z][^\n]{3,60}$') for m in re.finditer(p,md,re.M)]"
+
+-------------------------------
+
+1. Footer leak check. Expect 0 results.
+{
+  "search": "\"Connect with us\" \"Products and services\" \"Useful links\"",
+  "searchMode": "any",
+  "searchFields": "content",
+  "count": true,
+  "select": "source_url,chunk_index",
+  "top": 20
+}
+
+2. Copyright and legal line. Expect hits only on legal/companies.
+{
+  "search": "\"The Royal London Mutual Insurance Society\"",
+  "searchFields": "content",
+  "count": true,
+  "select": "source_url,chunk_index",
+  "top": 20
+}
+
+3. Breadcrumb leftovers. Expect 0. This looks for the > after a link, such as [Home](/ "home").
+{
+  "search": "\"Existing customers\" \"Manage your products\"",
+  "searchMode": "all",
+  "searchFields": "content",
+  "count": true,
+  "select": "source_url,chunk_index",
+  "top": 20
+}
+
+4. Test-marker text gone. Use the exact marker string the mutate script appends. Expect 0.
+{
+  "search": "<marker text from load_test_fixtures.py>",
+  "searchFields": "content",
+  "count": true,
+  "top": 5
+}
+5. Totals. Expect 300 pages and the new chunk count, which should be slightly above 3399.
+{ "search": "*", "filter": "chunk_index eq 0", "count": true, "top": 0 }
+{ "search": "*", "count": true, "top": 0, "facets": ["page_purpose,count:10"] }
+
+6. Isabel Hudson page. Check that "About Royal London" is back and see what follows it.
+{
+  "search": "*",
+  "filter": "search.ismatch('isabel_hudson', 'source_url') or search.ismatch('isabel-hudson', 'source_url')",
+  "select": "chunk_index,content",
+  "orderby": "chunk_index asc",
+  "top": 50
+}
+
