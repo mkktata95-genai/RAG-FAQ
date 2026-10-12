@@ -104,3 +104,18 @@ We are still evaluating several of these aspects to determine what is feasible a
 
 Regards,
 Mukesh
+
+---------------
+Clarification on FS Super Agent Feasibility Discussion
+
+Hi Team,
+
+I am writing to clarify the recent escalation on my project.
+
+During a technical discussion, the use of code from FS Super Agent was suggested. I responded that I would check with our internal team first. This was a standard due-diligence step. It was not a refusal, and I have not raised any objection to using our product.
+
+I agree that my wording on the call could have been clearer. I should have stated the next steps and a timeline for the feasibility check. I take responsibility for that and apologise for any confusion it caused.
+
+I fully support promoting and using our internal products. On several calls, I have taken the initiative to bring our products to the client’s attention. I will follow all compliance requirements and guidelines for FS Super Agent, complete the necessary checks, and keep the relevant stakeholders updated on the outcome. I will continue to promote its adoption wherever it fits the project.
+
+Going forward, I will work on improving my communication. I will also align with our internal teams before making any commitment to the client, so that the client never gets the impression that our teams are not coordinated.
