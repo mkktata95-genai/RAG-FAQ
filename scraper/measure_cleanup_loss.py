@@ -20,7 +20,6 @@ RULES = [  # (name, pattern, flags, replacement) - mirrors clean_scraped_content
     ("empty_bullet", r'^\s*\*\s*\[\s*\]\s*$', M),
     ("prev_next_item", r'^(Previous Item|Next Item)\s*$', M | I),
     ("browser_not_supported", r'Your browser is not supported\..*?×\s*', D),
-    ("CUT_RL_mutual_insurance", r'\*\*The Royal London Mutual Insurance.*$', D | M),
     ("back_to_top", r'\[Back to top\].*?\n', 0),
 ]
 
