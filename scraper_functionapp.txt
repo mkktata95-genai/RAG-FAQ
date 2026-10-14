@@ -31,3 +31,26 @@ python -c "import openpyxl,sys; wb=openpyxl.load_workbook(sys.argv[1]); ws=wb.ac
 python src\scrape_approved_urls_httpV1.py --file sample5.xlsx --dry-run
 
 python -c "import json,sys; d=json.load(open(sys.argv[1],encoding='utf-8')); print(type(d).__name__); x=d if isinstance(d,list) else (list(d.values()) if isinstance(d,dict) else []); print(len(x)); y=x[0]; print(list(y) if isinstance(y,dict) else y)" "C:\path\to\latest_scrape.json"
+------------------------
+python src\scrape_approved_urls_httpV1.py --file sample5.xlsx
+Get-ChildItem -Recurse -Filter *.json -File | Where-Object FullName -notlike "*\.venv\*" | Sort-Object LastWriteTime -Descending | Select-Object -First 3 FullName, LastWriteTime
+
+@'
+import json, sys, difflib
+old, new = [{(r["source_url"], r.get("dropdown_url")): r for r in json.load(open(p, encoding="utf-8"))} for p in sys.argv[1:3]]
+same = diff = 0
+for k, n in new.items():
+    o = old.get(k)
+    if not o:
+        print("NOT IN OLD", k); continue
+    if o["content_hash"] == n["content_hash"]:
+        same += 1
+    else:
+        diff += 1
+        print("DIFF", k, o["content_length"], "->", n["content_length"])
+        for l in list(difflib.unified_diff(o["content"].splitlines(), n["content"].splitlines(), lineterm="", n=0))[:12]:
+            print("   ", l)
+print("same", same, "diff", diff)
+'@ | Set-Content _hashcmp.py
+
+python _hashcmp.py "C:\Users\MKund\Desktop\RAG\scraper\data\royal_london_faq_approved_httpV1_20261012_111801.json" "<NEW_JSON_PATH>"
