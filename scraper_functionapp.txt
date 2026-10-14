@@ -26,3 +26,8 @@ python --version
 pip install -r requirements.txt
 python .\src\scrape_approved_urls_httpV1.py --file "<path-to>\Approved_URLs.xlsx" --dry-run
 --------------
+
+python -c "import openpyxl,sys; wb=openpyxl.load_workbook(sys.argv[1]); ws=wb.active; ws.delete_rows(7, ws.max_row); wb.save('sample5.xlsx')" "C:\path\to\approved_urls.xlsx"
+python src\scrape_approved_urls_httpV1.py --file sample5.xlsx --dry-run
+
+python -c "import json,sys; d=json.load(open(sys.argv[1],encoding='utf-8')); print(type(d).__name__); x=d if isinstance(d,list) else (list(d.values()) if isinstance(d,dict) else []); print(len(x)); y=x[0]; print(list(y) if isinstance(y,dict) else y)" "C:\path\to\latest_scrape.json"
