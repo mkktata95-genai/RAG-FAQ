@@ -60,3 +60,28 @@ python src\scrape_approved_urls_httpV1.py --file "C:\Users\MKund\Desktop\RAG\scr
 Get-ChildItem scraper\data\*.json | Sort-Object LastWriteTime -Descending | Select-Object -First 1 Name
 
 python _hashcmp.py "C:\Users\MKund\Desktop\RAG\scraper\data\royal_london_faq_approved_httpV1_20261012_111801.json" "scraper\data\<NEWEST_FILE>.json" | Select-Object -Last 40
+--------------
+@'
+import json, sys, re
+def load(p): return {(r["source_url"], r.get("dropdown_url")): r for r in json.load(open(p, encoding="utf-8"))}
+old, new = load(sys.argv[1]), load(sys.argv[2])
+norm = lambda s: re.sub(r"[\s\u200b\xa0]+", " ", s).strip()
+same = diff = ws = missing = 0
+for k, n in new.items():
+    o = old.get(k)
+    if not o:
+        missing += 1; continue
+    if o["content_hash"] == n["content_hash"]:
+        same += 1; continue
+    diff += 1
+    a, b = o["content"], n["content"]
+    isws = norm(a) == norm(b)
+    ws += isws
+    i = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+    print("DIFF", k[0], len(a), "->", len(b), "ws-only" if isws else "REAL")
+    print("   old:", ascii(a[max(0, i-30):i+30]))
+    print("   new:", ascii(b[max(0, i-30):i+30]))
+print("same", same, "diff", diff, "ws_only", ws, "not_in_old", missing)
+'@ | Set-Content _hashcmp.py
+
+python _hashcmp.py "C:\Users\MKund\Desktop\RAG\scraper\data\royal_london_faq_approved_httpV1_20261012_111801.json" "scraper\data\royal_london_faq_approved_httpV1_20261014_201333.json" | Select-Object -Last 45
