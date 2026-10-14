@@ -54,3 +54,9 @@ print("same", same, "diff", diff)
 '@ | Set-Content _hashcmp.py
 
 python _hashcmp.py "C:\Users\MKund\Desktop\RAG\scraper\data\royal_london_faq_approved_httpV1_20261012_111801.json" "<NEW_JSON_PATH>"
+
+--------------
+python src\scrape_approved_urls_httpV1.py --file "C:\Users\MKund\Desktop\RAG\scraper\data\Sample_287URLS_HTTPV1.xlsx"
+Get-ChildItem scraper\data\*.json | Sort-Object LastWriteTime -Descending | Select-Object -First 1 Name
+
+python _hashcmp.py "C:\Users\MKund\Desktop\RAG\scraper\data\royal_london_faq_approved_httpV1_20261012_111801.json" "scraper\data\<NEWEST_FILE>.json" | Select-Object -Last 40
