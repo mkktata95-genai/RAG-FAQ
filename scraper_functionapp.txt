@@ -145,3 +145,19 @@ python -c "import ast,sys; std=sys.stdlib_module_names; [print(f, sorted({n.spli
 
 -------------------------------------------
 python -c "import ast,sys; [print(f, sorted({n for t in ast.walk(ast.parse(open(f,encoding='utf-8').read())) for n in ([a.name for a in t.names] if isinstance(t,ast.Import) else [t.module] if isinstance(t,ast.ImportFrom) and t.level==0 and t.module else []) if n.startswith('azure')})) for f in sys.argv[1:]]" "C:\Users\MKund\Desktop\RAG\scraper\chunk_embed_index_v1.py" "C:\Users\MKund\Desktop\RAG\scraper\content_freshness_httpV1.py"
+
+-----------------------------------------------------
+
+$feed = "https://artefacts.royallondongroup.com/pypi/rlg-pypi/simple"
+$common = "azure-functions==1.19.0","azure-storage-blob==12.30.0","azure-identity==1.25.3","azure-core==1.41.0","structlog==24.1.0","requests==2.34.2"
+$idx = "python-dotenv==1.2.2","openai==2.41.0","azure-search-documents==12.0.0","langchain-text-splitters==1.1.1"
+$web = "beautifulsoup4==4.14.3","markdownify==0.14.1","openpyxl==3.1.5"
+$common + $web | Set-Content req-scraper.txt
+$common + $idx | Set-Content req-indexer.txt
+$common + $idx + $web + "aiohttp==3.14.1" | Set-Content req-freshness.txt
+foreach ($a in "scraper","indexer","freshness") {
+  "=== $a ==="
+  pip download -r "req-$a.txt" -d "_wh_$a" --only-binary=:all: --platform manylinux2014_x86_64 --python-version 3.11 --index-url $feed 2>&1 | Select-Object -Last 6
+  Get-ChildItem "_wh_$a" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name | Set-Content "wheels-$a.txt"
+}
+
