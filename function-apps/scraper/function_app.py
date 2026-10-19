@@ -18,10 +18,14 @@ log = logging.getLogger("scraper_app")
 
 def _containers():
     """Fail fast if the data-storage setting is missing."""
-    uri = os.environ.get("DataStorage__blobServiceUri")
-    if not uri:
-        raise RuntimeError("DataStorage__blobServiceUri is not set")
-    svc = BlobServiceClient(uri, credential=DefaultAzureCredential(), retry_total=5)
+    conn = os.environ.get("DataStorage")  # local dev only (Azurite connection string)
+    uri = os.environ.get("DataStorage__blobServiceUri")  # Azure: managed identity
+    if conn:
+        svc = BlobServiceClient.from_connection_string(conn, retry_total=5)
+    elif uri:
+        svc = BlobServiceClient(uri, credential=DefaultAzureCredential(), retry_total=5)
+    else:
+        raise RuntimeError("Neither DataStorage__blobServiceUri nor DataStorage is set")
     return svc.get_container_client("input"), svc.get_container_client("output")
 
 

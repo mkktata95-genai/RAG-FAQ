@@ -169,3 +169,18 @@ python _hashcmp.py "scraper\data\royal_london_faq_approved_httpV1_20261014_20312
 ----------------------------
 python -c "import zipfile,glob; [print(f.split('\\')[-1]) for f in glob.glob('_wh_indexer/*.whl') if any('httpx2' in l.lower() for n in zipfile.ZipFile(f).namelist() if n.endswith('METADATA') for l in zipfile.ZipFile(f).read(n).decode('utf-8','ignore').splitlines() if l.startswith('Requires-Dist'))]"
 ------------------------
+# Function Apps (function-apps/*): local work files, never commit
+function-apps/*/_wh_*/
+function-apps/*/scraper/data/
+function-apps/*/_hashcmp.py
+function-apps/*/feedcheck.*
+function-apps/*/sample*.xlsx
+function-apps/*/all-validated.txt
+function-apps/*/req-*.txt
+function-apps/*/wheels-*.txt
+function-apps/*/local.settings.json
+__blobstorage__/
+__queuestorage__/
+
+--------------------------
+
