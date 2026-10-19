@@ -91,3 +91,55 @@ pip install markdownify==1.2.3
 python src\scrape_approved_urls_httpV1.py --file "C:\Users\MKund\Desktop\RAG\scraper\data\Sample_287URLS_HTTPV1.xlsx"
 Get-ChildItem scraper\data\*.json | Sort-Object LastWriteTime -Descending | Select-Object -First 1 Name
 python _hashcmp.py "C:\Users\MKund\Desktop\RAG\scraper\data\royal_london_faq_approved_httpV1_20261012_111801.json" "scraper\data\<NEWEST_FILE>.json" | Select-Object -Last 45
+--------------------------------------------
+
+@"
+azure-functions==1.24.0
+azure-storage-blob==12.30.0
+azure-identity==1.25.3
+azure-core==1.41.0
+structlog==26.1.0
+requests==2.34.2
+beautifulsoup4==4.15.0
+markdownify==1.2.3
+openpyxl==3.1.5
+python-dotenv==1.2.2
+openai==2.41.0
+azure-search-documents==12.0.0
+langchain-text-splitters==1.1.2
+aiohttp==3.14.1
+"@ | Set-Content all-validated.txt
+
+@'
+import subprocess, sys, re, tempfile, csv
+FEED = "https://artefacts.royallondongroup.com/pypi/rlg-pypi/simple"
+rows = []
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    name, ver = line.split("==")
+    with tempfile.TemporaryDirectory() as d:
+        p = subprocess.run([sys.executable, "-m", "pip", "download", line, "--no-deps", "-d", d,
+                            "--only-binary=:all:", "--platform", "manylinux2014_x86_64",
+                            "--python-version", "3.11", "--index-url", FEED],
+                           capture_output=True, text=True)
+    out = p.stdout + p.stderr
+    if p.returncode == 0:
+        rows.append((name, ver, "OK", ""))
+    else:
+        m = re.search(r"from versions: ([^)]*)\)", out)
+        rows.append((name, ver, "MISSING" if m else "ERROR",
+                     (m.group(1) if m else out.strip().splitlines()[-1])[:200]))
+for r in rows:
+    print(*r, sep=" | ")
+csv.writer(open("feedcheck.csv", "w", newline="")).writerows(
+    [("package", "ours", "status", "feed_versions_or_error"), *rows])
+'@ | Set-Content feedcheck.py
+
+python feedcheck.py all-validated.txt
+
+---------------------------------------------
+
+python -c "import ast,sys; std=sys.stdlib_module_names; [print(f, sorted({n.split('.')[0] for t in ast.walk(ast.parse(open(f,encoding='utf-8').read())) for n in ([a.name for a in t.names] if isinstance(t,ast.Import) else [t.module] if isinstance(t,ast.ImportFrom) and t.level==0 and t.module else [])} - set(std))) for f in sys.argv[1:]]" "src\scrape_approved_urls_httpV1.py" "<PATH>\chunk_embed_index_v1.py" "<PATH>\content_freshness_httpV1.py"
+
