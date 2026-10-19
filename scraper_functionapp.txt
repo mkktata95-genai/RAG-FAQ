@@ -161,3 +161,11 @@ foreach ($a in "scraper","indexer","freshness") {
   Get-ChildItem "_wh_$a" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name | Set-Content "wheels-$a.txt"
 }
 
+-----------------------------------------------------------
+pip install soupsieve==2.8.3
+python src\scrape_approved_urls_httpV1.py --file "C:\Users\MKund\Desktop\RAG\scraper\data\Sample_287URLS_HTTPV1.xlsx"
+Get-ChildItem scraper\data\*.json | Sort-Object LastWriteTime -Descending | Select-Object -First 1 Name
+python _hashcmp.py "scraper\data\royal_london_faq_approved_httpV1_20261014_203123.json" "scraper\data\<NEWEST_FILE>.json" | Select-Object -Last 20
+----------------------------
+python -c "import zipfile,glob; [print(f.split('\\')[-1]) for f in glob.glob('_wh_indexer/*.whl') if any('httpx2' in l.lower() for n in zipfile.ZipFile(f).namelist() if n.endswith('METADATA') for l in zipfile.ZipFile(f).read(n).decode('utf-8','ignore').splitlines() if l.startswith('Requires-Dist'))]"
+------------------------
