@@ -1,0 +1,14 @@
+variables:
+    # DEV environment-specific variables for DigiAssist Agent zip deployment
+
+    agentPoolName: 'rlg-dev-dig-uks-vmss-adoagentssv'
+    azureServiceConnectionName: 'RLG-DEV-DIG-ai-assistant-sp'
+    resourceGroupName: 'rlg-dev-dig-uks-rg-ai-assistant'
+    functionAppName: 'rlg-dev-dig-uks-func-digiassist-aia'
+    deploymentStorageAccountName: 'rlgdevdigukssaaia'
+    appInsightsName: 'rlg-dev-dig-uks-appin-aia'
+
+    # Pipeline Function Apps (names proposed - Andy/DevOps to confirm)
+    scraperFunctionAppName: 'rlg-dev-dig-uks-func-scraper-aia'
+    indexerFunctionAppName: 'rlg-dev-dig-uks-func-indexer-aia'
+    freshnessFunctionAppName: 'rlg-dev-dig-uks-func-freshness-aia'
