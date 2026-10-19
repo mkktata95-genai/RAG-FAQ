@@ -143,3 +143,5 @@ python feedcheck.py all-validated.txt
 
 python -c "import ast,sys; std=sys.stdlib_module_names; [print(f, sorted({n.split('.')[0] for t in ast.walk(ast.parse(open(f,encoding='utf-8').read())) for n in ([a.name for a in t.names] if isinstance(t,ast.Import) else [t.module] if isinstance(t,ast.ImportFrom) and t.level==0 and t.module else [])} - set(std))) for f in sys.argv[1:]]" "src\scrape_approved_urls_httpV1.py" "<PATH>\chunk_embed_index_v1.py" "<PATH>\content_freshness_httpV1.py"
 
+-------------------------------------------
+python -c "import ast,sys; [print(f, sorted({n for t in ast.walk(ast.parse(open(f,encoding='utf-8').read())) for n in ([a.name for a in t.names] if isinstance(t,ast.Import) else [t.module] if isinstance(t,ast.ImportFrom) and t.level==0 and t.module else []) if n.startswith('azure')})) for f in sys.argv[1:]]" "C:\Users\MKund\Desktop\RAG\scraper\chunk_embed_index_v1.py" "C:\Users\MKund\Desktop\RAG\scraper\content_freshness_httpV1.py"
