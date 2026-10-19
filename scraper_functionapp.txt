@@ -203,3 +203,8 @@ dir $d
    python -c "from azure.storage.blob import BlobServiceClient as B; [print(b.name) for b in B.from_connection_string('UseDevelopmentStorage=true').get_container_client('output').list_blobs()]"
 
 -----------------------
+
+mkdir out -Force
+python -c "from azure.storage.blob import BlobServiceClient as B; c=B.from_connection_string('UseDevelopmentStorage=true').get_container_client('output'); [open('out/'+b.name.split('/')[-1],'wb').write(c.download_blob(b.name).readall()) for b in c.list_blobs()]"
+
+------------
