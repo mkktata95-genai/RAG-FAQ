@@ -199,3 +199,7 @@ Unblock-File $z
 Expand-Archive $z -DestinationPath $d -Force
 dir $d
 ------------------
+
+   python -c "from azure.storage.blob import BlobServiceClient as B; [print(b.name) for b in B.from_connection_string('UseDevelopmentStorage=true').get_container_client('output').list_blobs()]"
+
+-----------------------
