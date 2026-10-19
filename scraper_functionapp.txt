@@ -208,3 +208,18 @@ mkdir out -Force
 python -c "from azure.storage.blob import BlobServiceClient as B; c=B.from_connection_string('UseDevelopmentStorage=true').get_container_client('output'); [open('out/'+b.name.split('/')[-1],'wb').write(c.download_blob(b.name).readall()) for b in c.list_blobs()]"
 
 ------------
+
+Build:
+   cd C:\Users\MKund\Desktop\DigiAssist\digiassist-agent\function-apps\scraper
+   .\funcbuild.ps1
+
+-----------------------
+3. Check the zip afterwards:
+
+   Add-Type -AssemblyName System.IO.Compression.FileSystem
+   $e = [IO.Compression.ZipFile]::OpenRead("$PWD\scraper.zip").Entries.FullName
+   $e | Where-Object { $_ -match '(^|/)(\.env|local\.settings\.json)$' }
+   $e | Where-Object { $_ -match '^(function_app\.py|host\.json|src/)' } | Select-Object -First 8
+   "{0:N1} MB" -f ((Get-Item scraper.zip).Length / 1MB)
+
+---------------
