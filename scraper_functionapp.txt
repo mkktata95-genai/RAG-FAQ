@@ -228,3 +228,6 @@ python -c "import zipfile,re; n=zipfile.ZipFile('scraper.zip').namelist(); print
 python -c "import zipfile; print('messageEncoding' in zipfile.ZipFile('scraper.zip').read('host.json').decode())"
 
 -------------------
+python -c "import zipfile; print([n for n in zipfile.ZipFile('scraper.zip').namelist() if n.startswith('libs/markdownify-')][:2])"
+------------------
+
