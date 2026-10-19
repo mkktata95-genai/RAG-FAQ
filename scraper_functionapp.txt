@@ -191,3 +191,11 @@ Create this folder and extract the zip’s contents into it, so extensions.json 
 Press Ctrl+C and run func start again.
 
 --------------------------
+
+$d = "$env:USERPROFILE\.azure-functions-core-tools\Functions\ExtensionBundles\Microsoft.Azure.Functions.ExtensionBundle\4.39.1"
+New-Item -ItemType Directory -Force $d
+$z = "$env:USERPROFILE\Downloads\Microsoft.Azure.Functions.ExtensionBundle.4.39.1_any-any.zip"
+Unblock-File $z
+Expand-Archive $z -DestinationPath $d -Force
+dir $d
+------------------
