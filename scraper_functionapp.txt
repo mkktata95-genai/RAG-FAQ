@@ -225,3 +225,6 @@ Build:
 ---------------
 python -c "import zipfile,re; n=zipfile.ZipFile('scraper.zip').namelist(); print('total',len(n)); print('SECRETS:',[x for x in n if re.search(r'(^|/)(\.env|local\.settings\.json)$',x)]); print([x for x in n if re.match(r'(function_app\.py|host\.json|src/)',x)][:8])"
 ------------------
+python -c "import zipfile; print('messageEncoding' in zipfile.ZipFile('scraper.zip').read('host.json').decode())"
+
+-------------------
