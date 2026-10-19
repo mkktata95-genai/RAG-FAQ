@@ -184,3 +184,10 @@ __queuestorage__/
 
 --------------------------
 
+Fix for local testing:
+
+In your normal browser, download this file: https://cdn.functions.azure.com/public/ExtensionBundles/Microsoft.Azure.Functions.ExtensionBundle/4.39.1/Microsoft.Azure.Functions.ExtensionBundle.4.39.1_any-any.zip
+Create this folder and extract the zip’s contents into it, so extensions.json and bin sit directly in the 4.39.1 folder: C:\Users\MKund\.azure-functions-core-tools\Functions\ExtensionBundles\Microsoft.Azure.Functions.ExtensionBundle\4.39.1\
+Press Ctrl+C and run func start again.
+
+--------------------------
