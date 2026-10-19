@@ -223,3 +223,5 @@ Build:
    "{0:N1} MB" -f ((Get-Item scraper.zip).Length / 1MB)
 
 ---------------
+python -c "import zipfile,re; n=zipfile.ZipFile('scraper.zip').namelist(); print('total',len(n)); print('SECRETS:',[x for x in n if re.search(r'(^|/)(\.env|local\.settings\.json)$',x)]); print([x for x in n if re.match(r'(function_app\.py|host\.json|src/)',x)][:8])"
+------------------
