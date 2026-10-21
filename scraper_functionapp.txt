@@ -231,3 +231,11 @@ python -c "import zipfile; print('messageEncoding' in zipfile.ZipFile('scraper.z
 python -c "import zipfile; print([n for n in zipfile.ZipFile('scraper.zip').namelist() if n.startswith('libs/markdownify-')][:2])"
 ------------------
 
+python -c "import zipfile; z=zipfile.ZipFile('indexer.zip'); n=z.namelist(); print(len(n),'files'); print([x for x in n if x in ('function_app.py','host.json','src/indexer_job.py','src/chunk_embed_index_v1.py')]); print('bad:',[x for x in n if x.endswith(('.env','local.settings.json')) or '__pycache__' in x]); print('enc:', 'messageEncoding' in z.read('host.json').decode()); print('libs:',[x for x in n if x.startswith(('libs/openai/__init__','libs/langchain_text_splitters/__init__','libs/azure/search/documents/__init__'))])"
+
+-------------------------
+
+cd C:\Users\MKund\Desktop\DigiAssist\digiassist-agent
+git add -n .gitignore Pipelines function-apps
+
+--------------
