@@ -239,3 +239,9 @@ cd C:\Users\MKund\Desktop\DigiAssist\digiassist-agent
 git add -n .gitignore Pipelines function-apps
 
 --------------
+
+git add .gitignore Pipelines function-apps
+git status --short
+git commit -m "Add indexer function app (blob/queue build + manual promote) and pipeline"
+git push origin dev
+----------------------
