@@ -277,3 +277,11 @@ git rm -r function-apps Pipelines/azure-pipelines-scraper-func.yml Pipelines/azu
 git add Pipelines/env/dev.yml
 git status --short
 -------------
+$a="C:\Users\MKund\Desktop\DigiAssist\digiassist-agent\function-apps"
+$n="C:\Users\MKund\Desktop\DigiAssist\digiassist-offlinescript\function-apps"
+robocopy $a $n /E /XC /XN /XO /XD .venv libs __pycache__
+cd C:\Users\MKund\Desktop\DigiAssist\digiassist-offlinescript
+git status --short
+----------------
+Move-Item $a C:\Users\MKund\Desktop\DigiAssist\function-apps-old
+-------------
