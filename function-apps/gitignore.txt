@@ -1,0 +1,27 @@
+# Python / local
+.venv/
+__pycache__/
+*.pyc
+.env
+log/
+
+# Function app local-only files (never commit)
+function-apps/*/local.settings.json
+function-apps/*/libs/
+function-apps/*/out/
+function-apps/*/_wh_*/
+function-apps/*/req-*.txt
+function-apps/*/wheels-*.txt
+function-apps/*/sample*.xlsx
+function-apps/*/all-validated.txt
+function-apps/*/_hashcmp.py
+function-apps/*/feedcheck.*
+function-apps/*/scraper/data/
+function-apps/*/devops-spec-*.md
+
+# Azurite local storage emulator
+__blobstorage__/
+__queuestorage__/
+__azurite_db_*.json
+__azurite_db_*__.json
+AzuriteConfig

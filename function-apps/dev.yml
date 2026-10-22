@@ -1,0 +1,12 @@
+variables:
+  # DEV environment variables for the offline-script Function Apps (scraper, indexer, freshness, templated)
+  # NEW SUBSCRIPTION: Andy/DevOps to confirm or replace every value below once the infra exists.
+
+  agentPoolName: 'rlg-dev-dig-uks-vmss-adoagentssv'
+  azureServiceConnectionName: 'RLG-DEV-DIG-ai-assistant-sp'
+  resourceGroupName: 'rlg-dev-dig-uks-rg-ai-assistant'
+
+  scraperFunctionAppName: 'rlg-dev-dig-uks-func-scraper-aia'
+  indexerFunctionAppName: 'rlg-dev-dig-uks-func-indexer-aia'
+  freshnessFunctionAppName: 'rlg-dev-dig-uks-func-freshness-aia'
+  templatedFunctionAppName: 'rlg-dev-dig-uks-func-templated-aia'
