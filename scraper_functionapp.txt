@@ -289,3 +289,36 @@ cd C:\Users\MKund\Desktop\DigiAssist\digiassist-agent
 Move-Item "C:\Users\MKund\Desktop\DigiAssist\digiassist-agent\function-apps" C:\Users\MKund\Desktop\DigiAssist\function-apps-old
 git status --short
 ------------
+Step 1: set up the folder
+
+In your repo, create the branch first: git switch dev, then git pull, then git switch -c feature/templated-questions. Check it with git branch --show-current.
+Create function-apps/templated/. Copy in src/templated_job.py, test_templated_job.py, make_sample_xlsx.py, sample_templated.xlsx, local_build.py and requirements.txt.
+Copy local.settings.json.example to local.settings.json. It is git-ignored, so it won’t be committed. The values point at the old-subscription dev Search and OpenAI services, which is fine for testing.
+
+---------------
+Step 2: offline check (no Azure)
+
+py -3.11 -m venv .venv
+.venv\Scripts\activate
+pip install openpyxl==3.1.5
+python test_templated_job.py
+python local_build.py sample_templated.xlsx --check
+
+----------
+
+Step 3: build a real test index (needs az login)
+
+pip install -r requirements.txt
+az login
+python local_build.py sample_templated.xlsx
+-----------------------
+Step 4: query it
+python local_build.py --query "What is a pension?" --index rlg-faq-templated-<timestamp>
+python local_build.py --query "Can you explain what a pension is?" --index rlg-faq-templated-<timestamp>
+python local_build.py --query "What is critical illness cover?" --index rlg-faq-templated-<timestamp>
+---------------------
+Step 5: promote (optional)
+python local_build.py --promote
+python local_build.py --query "What is a pension?"
+---------------------
+
