@@ -259,3 +259,21 @@ git branch --show-current
 git add .gitignore function-apps Pipelines
 git status --short
 -----------------
+$a="C:\Users\MKund\Desktop\DigiAssist\digiassist-agent\function-apps"
+$n="C:\Users\MKund\Desktop\DigiAssist\digiassist-offlinescript\function-apps"
+Copy-Item $a\scraper\local.settings.json $n\scraper\
+Copy-Item $a\indexer\local.settings.json $n\indexer\
+Copy-Item $a\scraper\out $n\scraper\out -Recurse
+Copy-Item $a\scraper\req-*.txt,$a\scraper\wheels-*.txt,$a\scraper\sample5.xlsx $n\scraper\
+Copy-Item $a\scraper\_wh_* $n\scraper\ -Recurse
+----------------------
+cd C:\Users\MKund\Desktop\DigiAssist\digiassist-agent
+git branch --show-current
+git pull
+git restore --staged .gitignore
+git restore .gitignore
+git rm -r function-apps Pipelines/azure-pipelines-scraper-func.yml Pipelines/azure-pipelines-indexer-func.yml
+-----------------------------
+git add Pipelines/env/dev.yml
+git status --short
+-------------
