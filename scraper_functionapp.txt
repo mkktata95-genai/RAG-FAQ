@@ -285,3 +285,7 @@ git status --short
 ----------------
 Move-Item $a C:\Users\MKund\Desktop\DigiAssist\function-apps-old
 -------------
+cd C:\Users\MKund\Desktop\DigiAssist\digiassist-agent
+Move-Item "C:\Users\MKund\Desktop\DigiAssist\digiassist-agent\function-apps" C:\Users\MKund\Desktop\DigiAssist\function-apps-old
+git status --short
+------------
