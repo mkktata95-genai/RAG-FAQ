@@ -245,3 +245,17 @@ git status --short
 git commit -m "Add indexer function app (blob/queue build + manual promote) and pipeline"
 git push origin dev
 ----------------------
+cd C:\Users\MKund\Desktop\DigiAssist\digiassist-offlinescript
+Select-String -Path Pipelines\*.yml -Pattern 'zipPath|storageContainerName|sasTokenExpiry'
+
+----------------------------
+foreach ($f in 'Pipelines\azure-pipelines-scraper-func.yml','Pipelines\azure-pipelines-indexer-func.yml') {
+  (Get-Content $f) | Where-Object { $_ -notmatch 'template: env/common.yml' } | Set-Content $f
+}
+Select-String -Path Pipelines\*.yml -Pattern 'template:'
+-----------------
+Copy-Item "$env:USERPROFILE\Downloads\gitignore.txt" .gitignore
+git branch --show-current
+git add .gitignore function-apps Pipelines
+git status --short
+-----------------
