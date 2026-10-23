@@ -1,0 +1,11 @@
+query,category,expected_question
+What is a pension?,exact,What is a pension?
+Can you explain what a pension is?,paraphrase,What is a pension?
+What's a pension?,paraphrase,What is a pension?
+Is my pension money invested?,paraphrase,Are pensions invested?
+How can I complain?,paraphrase,How do I make a complaint?
+What is a pension transfer?,near-miss,
+Are pensions taxed?,near-miss,
+How can I transfer my pension savings?,near-miss,
+What is critical illness cover?,unrelated,
+What is the weather in London today?,unrelated,
