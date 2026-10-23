@@ -321,4 +321,10 @@ Step 5: promote (optional)
 python local_build.py --promote
 python local_build.py --query "What is a pension?"
 ---------------------
+git add function-apps/templated/src/templated_job.py
+git add function-apps/templated/local_build.py function-apps/templated/test_templated_job.py
+git add function-apps/templated/make_sample_xlsx.py function-apps/templated/sample_templated.xlsx
+git add function-apps/templated/requirements.txt function-apps/templated/eval_sample.csv
+git status
+------------------
 
