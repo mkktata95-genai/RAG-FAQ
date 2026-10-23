@@ -1,0 +1,44 @@
+Suggested layout
+retrieval_eval/
+  generate_synthetic_dataset.py
+  datasets/          # synthetic_dataset_v1.json/.csv (later SME dataset)
+  runs/              # report JSON / per-query CSV (gitignored)
+  state.md  decisions.md  handover.md
+------------------------
+cd C:\Users\MKund\Desktop\DigiAssist
+git clone <CLONE_URL> digiassist-retrieval-eval
+cd digiassist-retrieval-eval
+
+git checkout main
+git pull
+if (git branch -r | Select-String "origin/dev") { git checkout dev; git pull } else { git checkout -b dev; git push -u origin dev }
+git checkout -b feature/retrieval-eval
+
+New-Item -ItemType Directory -Force retrieval_eval\datasets, retrieval_eval\runs | Out-Null
+New-Item -ItemType File -Force retrieval_eval\generate_synthetic_dataset.py, retrieval_eval\datasets\.gitkeep | Out-Null
+
+@"
+runs/
+synthetic_out/
+.venv/
+__pycache__/
+*.pyc
+.env
+"@ | Set-Content -Encoding utf8 .gitignore
+
+@"
+openai
+azure-identity
+azure-search-documents
+azure-monitor-opentelemetry
+azure-storage-blob
+"@ | Set-Content -Encoding utf8 requirements.txt
+
+git branch --show-current
+-----------------
+git branch --show-current
+git add .gitignore requirements.txt retrieval_eval/generate_synthetic_dataset.py retrieval_eval/datasets/.gitkeep
+git status --short
+git commit -m "Add retrieval eval scaffold and synthetic dataset generator"
+git push -u origin feature/retrieval-eval
+------------------
