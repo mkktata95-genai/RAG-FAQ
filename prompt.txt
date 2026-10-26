@@ -295,3 +295,7 @@ $uas = [ordered]@{
 }
 foreach ($k in $uas.Keys) { 1..5 | ForEach-Object { curl.exe -s -o NUL -A $uas[$k] -w "$k : %{http_code}`n" $u } }
 -----------
+$u = "https://www.royallondon.com/pensions/investment-options/investment-governance/"
+1..8 | ForEach-Object { curl.exe -I -s -o NUL -w "HEAD : %{http_code}`n" $u }
+1..8 | ForEach-Object { curl.exe -s -o NUL -w "GET  : %{http_code}`n" $u }
+-------------
