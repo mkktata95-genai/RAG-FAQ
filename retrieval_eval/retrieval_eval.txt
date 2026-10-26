@@ -65,3 +65,12 @@ git status --short
 git commit -m "Exclude hub pages; add synthetic dataset v1"
 git push origin dev
 -------
+Copy-Item synthetic_out\synthetic_dataset_v1.json retrieval_eval\datasets\synthetic_dataset_v1.json
+python -c "import json;p='retrieval_eval/datasets/synthetic_dataset_v1.json';d=json.load(open(p,encoding='utf-8'));d=[r for r in d if r['query_id']!='SYN-M001'];json.dump(d,open(p,'w',encoding='utf-8'),indent=2,ensure_ascii=False);print(len(d))"
+------------
+git branch --show-current
+git add retrieval_eval/generate_synthetic_dataset.py retrieval_eval/datasets/synthetic_dataset_v1.json
+git status --short
+git commit -m "Exclude hub pages; add synthetic dataset v1 (29 rows)"
+git push origin dev
+----------
