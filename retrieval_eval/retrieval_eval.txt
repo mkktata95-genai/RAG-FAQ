@@ -49,3 +49,10 @@ git status --short
 git commit -m "Exclude hub pages from synthetic dataset selection"
 git push origin dev
 ------------
+Import-Csv synthetic_out\synthetic_dataset_v1.csv | ForEach-Object { "$($_.query_id) [$($_.answer_type)/$($_.variant)] $($_.query)" }
+
+Import-Csv synthetic_out\synthetic_dataset_v1.csv | Where-Object { $_.answer_type -like 'multi*' } | ForEach-Object { "$($_.query_id) $($_.answer_type) $($_.relevant_ids)" }
+
+Copy-Item synthetic_out\synthetic_dataset_v1.json retrieval_eval\datasets\synthetic_dataset_v1.json
+
+------------
