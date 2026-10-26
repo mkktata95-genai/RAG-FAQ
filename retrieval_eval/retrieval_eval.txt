@@ -42,3 +42,10 @@ git status --short
 git commit -m "Add retrieval eval scaffold and synthetic dataset generator"
 git push -u origin feature/retrieval-eval
 ------------------
+python retrieval_eval\generate_synthetic_dataset.py --input C:\Users\MKund\Desktop\RAG\scraper\data\royal_london_faq_approved_httpV1_20261026_203016.json --out synthetic_out
+------------
+git add retrieval_eval/generate_synthetic_dataset.py
+git status --short
+git commit -m "Exclude hub pages from synthetic dataset selection"
+git push origin dev
+------------
