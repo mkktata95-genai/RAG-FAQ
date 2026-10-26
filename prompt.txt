@@ -283,3 +283,7 @@ WIDGET_SELECTORS = [".dynamicsliderblock"]  # extend once the guide-page widget 
 curl.exe -I -s -o NUL -w "HEAD: %{http_code}`n" https://www.royallondon.com/pensions/investment-options/investment-governance
 curl.exe -s -o NUL -w "GET: %{http_code}`n" https://www.royallondon.com/pensions/investment-options/investment-governance
 ---------
+curl.exe -I -s https://www.royallondon.com/pensions/investment-options/investment-governance | findstr /i "location"
+curl.exe -s -L -o NUL -w "no-UA  : %{http_code} %{url_effective} redirects=%{num_redirects}`n" https://www.royallondon.com/pensions/investment-options/investment-governance
+curl.exe -s -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36" -o NUL -w "browser : %{http_code} %{url_effective} redirects=%{num_redirects}`n" https://www.royallondon.com/pensions/investment-options/investment-governance
+-----------
