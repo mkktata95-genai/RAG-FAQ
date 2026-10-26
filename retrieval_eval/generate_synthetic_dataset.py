@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-generate_synthetic_dataset.py  v1.0.0
+generate_synthetic_dataset.py  v1.0.1
 Synthetic retrieval-eval dataset generator (Royal London products/services focus).
 
 Reads the scraper JSON (page text), NOT the index chunks and NOT augmented_questions
@@ -13,10 +13,13 @@ Usage (VDI, .venv Python 3.11):
   2) Generate:
        python generate_synthetic_dataset.py --input <scraper.json|dir> --out out_dir
 
-Env: AZURE_OPENAI_ENDPOINT, DEPLOYMENT_MAIN (or --deployment), AZURE_OPENAI_API_VERSION (optional)
+Env (read from a .env file at the repo root, or the shell; see .env.example):
+  AZURE_OPENAI_ENDPOINT, DEPLOYMENT_MAIN (or --deployment), AZURE_OPENAI_API_VERSION (optional)
 Auth: DefaultAzureCredential only. No API keys.
 
 Changelog (newest first)
+  v1.0.1  Load .env automatically (python-dotenv); warn if .env exists but python-dotenv missing.
+          Rollback: git revert the commit.
   v1.0.0  Initial version. Rollback: delete file.
 """
 from __future__ import annotations
@@ -464,7 +467,18 @@ def write_outputs(rows: list[dict], out: Path) -> None:
     LOG.info("Wrote %s and %s", jp, cp)
 
 
+def load_env() -> bool:
+    """Load .env (searched upward from this file). Returns False if python-dotenv is missing."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return False
+    load_dotenv()  # existing shell variables win over .env
+    return True
+
+
 def main() -> int:
+    dotenv_ok = load_env()  # must run before argparse: defaults read os.environ
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input", required=True, help="Scraper JSON file or directory")
     ap.add_argument("--out", default="synthetic_out")
@@ -485,6 +499,8 @@ def main() -> int:
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
         handlers=[logging.StreamHandler(), logging.FileHandler(Path(args.out) / "generate.log", encoding="utf-8")],
     )
+    if not dotenv_ok and any(p.exists() for p in (Path(".env"), Path(__file__).resolve().parent.parent / ".env")):
+        LOG.warning("A .env file exists but python-dotenv is not installed, so it was ignored. Run: pip install python-dotenv")
     try:
         pages = load_pages(args.input)
         sel = select_pages(pages, args.min_score)
