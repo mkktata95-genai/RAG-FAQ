@@ -280,3 +280,6 @@ python find_widget_container_retry.py https://www.royallondon.com/guides-tools/p
 -------------------
 WIDGET_SELECTORS = [".dynamicsliderblock"]  # extend once the guide-page widget is identified
 ------
+curl.exe -I -s -o NUL -w "HEAD: %{http_code}`n" https://www.royallondon.com/pensions/investment-options/investment-governance
+curl.exe -s -o NUL -w "GET: %{http_code}`n" https://www.royallondon.com/pensions/investment-options/investment-governance
+---------
