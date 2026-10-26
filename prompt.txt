@@ -268,3 +268,15 @@ python check_hash_3urls.py --file scraper\data\royal_london_faq_approved_httpV1_
 ---------------------
 python find_widget_container.py https://www.royallondon.com/guides-tools/life-events/when-someone-dies/what-to-do-when-someone-dies
 python find_widget_container.py https://www.royallondon.com
+-------------
+python find_widget_container_retry.py https://www.royallondon.com/guides-tools/life-events/when-someone-dies/what-to-do-when-someone-dies
+python find_widget_container_retry.py https://www.royallondon.com/guides-tools/pension-guides/pension-investments/what-are-stock-markets-and-how-do-they-work
+-------------
+    # Volatile widgets (rotate per request) — excluded from content and hash.
+    for sel in WIDGET_SELECTORS:
+        for el in soup.select(sel):
+            el.decompose()
+
+-------------------
+WIDGET_SELECTORS = [".dynamicsliderblock"]  # extend once the guide-page widget is identified
+------
