@@ -287,3 +287,11 @@ curl.exe -I -s https://www.royallondon.com/pensions/investment-options/investmen
 curl.exe -s -L -o NUL -w "no-UA  : %{http_code} %{url_effective} redirects=%{num_redirects}`n" https://www.royallondon.com/pensions/investment-options/investment-governance
 curl.exe -s -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36" -o NUL -w "browser : %{http_code} %{url_effective} redirects=%{num_redirects}`n" https://www.royallondon.com/pensions/investment-options/investment-governance
 -----------
+$u = "https://www.royallondon.com/pensions/investment-options/investment-governance/"
+$uas = [ordered]@{
+  scraper = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 RLG-Aria-Scraper/1.0"
+  health  = "RLG-Aria-ContentFreshness/1.0"
+  curl    = "curl/8.0"
+}
+foreach ($k in $uas.Keys) { 1..5 | ForEach-Object { curl.exe -s -o NUL -A $uas[$k] -w "$k : %{http_code}`n" $u } }
+-----------
