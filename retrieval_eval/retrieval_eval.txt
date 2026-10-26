@@ -56,3 +56,12 @@ Import-Csv synthetic_out\synthetic_dataset_v1.csv | Where-Object { $_.answer_typ
 Copy-Item synthetic_out\synthetic_dataset_v1.json retrieval_eval\datasets\synthetic_dataset_v1.json
 
 ------------
+Import-Csv synthetic_out\synthetic_dataset_v1.csv | Where-Object { $_.answer_type -like 'multi*' } | ForEach-Object { "$($_.query_id) $($_.query)`n   $($_.evidence)`n" }
+----------
+git branch --show-current
+Copy-Item synthetic_out\synthetic_dataset_v1.json retrieval_eval\datasets\synthetic_dataset_v1.json
+git add retrieval_eval/generate_synthetic_dataset.py retrieval_eval/datasets/synthetic_dataset_v1.json
+git status --short
+git commit -m "Exclude hub pages; add synthetic dataset v1"
+git push origin dev
+-------
