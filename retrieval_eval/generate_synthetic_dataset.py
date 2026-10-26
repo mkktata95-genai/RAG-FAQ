@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-generate_synthetic_dataset.py  v1.0.1
+generate_synthetic_dataset.py  v1.0.2
 Synthetic retrieval-eval dataset generator (Royal London products/services focus).
 
 Reads the scraper JSON (page text), NOT the index chunks and NOT augmented_questions
@@ -18,7 +18,9 @@ Env (read from a .env file at the repo root, or the shell; see .env.example):
 Auth: DefaultAzureCredential only. No API keys.
 
 Changelog (newest first)
-  v1.0.1  Load .env automatically (python-dotenv); warn if .env exists but python-dotenv missing.
+  v1.0.2  Exclude hub/landing pages (fewer than 2 path segments, e.g. homepage, /insurance).
+          Rollback: git revert the commit.
+  v1.0.1 Load .env automatically (python-dotenv); warn if .env exists but python-dotenv missing.
           Rollback: git revert the commit.
   v1.0.0  Initial version. Rollback: delete file.
 """
@@ -189,6 +191,8 @@ def product_score(pg: dict) -> int:
 
 def eligible(pg: dict, min_score: int) -> bool:
     if DENY_URL.search(pg["url"]) or DENY_TITLE.search(pg["title"]):
+        return False
+    if len([s for s in urlsplit(pg["url"]).path.split("/") if s]) < 2:  # hub/landing pages
         return False
     if len(pg["content"]) < MIN_CHARS:
         return False
