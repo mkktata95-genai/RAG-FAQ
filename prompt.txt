@@ -306,3 +306,5 @@ python scraper\widget_probe.py https://www.royallondon.com/pensions
 --------------
 python scraper\diff_page.py scraper\data\royal_london_faq_approved_httpV1_20261026_102346.json scraper\data\royal_london_faq_approved_httpV1_20261026_183642.json https://www.royallondon.com/pensions/workplace-pensions/how-tax-relief-works
 --------------
+python -c "import json,collections as c;p=json.load(open(r'scraper\data\<new file>.json',encoding='utf-8'));k=c.Counter(x.get('dropdown_url') or x['source_url'] for x in p);print([u for u,n in k.items() if n>1] or 'no duplicates')"
+-------------

@@ -94,7 +94,10 @@ PIPELINE_VERSION = "1.0.0"
 #          identical to scraper v1.2.0; (2) persistent 5xx is now a NON-destructive
 #          "error" (flagged, never removed) — site returns intermittent 500s on
 #          live pages (e.g. investment-governance). ROLLBACK: restore v1.0.0 file.
-FRESHNESS_JOB_VERSION = "1.1.0"
+# v1.1.1 — persistent 5xx URLs are re-probed once, alone, in a fresh HTTP session
+#          (shared-session 500s on pages that return 200 on a clean connection).
+#          ROLLBACK: restore v1.1.0 file.
+FRESHNESS_JOB_VERSION = "1.1.1"
 FRESHNESS_RUN_ID = str(uuid.uuid4())
 
 SCRAPER_VERSION = "1.2.0"       # matches scrape_approved_urls_httpV1.py
@@ -2197,6 +2200,30 @@ async def check_all_urls_health(entries: list) -> list:
                     log.warning("health_recheck_changed_result", url=results[i]["url"],
                                 first=results[i]["status"], second=second["status"])
                 results[i] = second
+
+        # Persistent 5xx (non-destructive "error"): the shared session (cookies /
+        # reused connections across 287 URLs) can get a 500 from pages that answer
+        # 200 on a clean connection. Re-probe each one alone in a FRESH session.
+        flaky = [i for i, r in enumerate(results)
+                 if r["status"] == "error" and (r.get("status_code") or 0) >= 500]
+        if flaky:
+            log.warning("health_reprobe_5xx_fresh_session", count=len(flaky),
+                        urls=[results[i]["url"] for i in flaky])
+            await asyncio.sleep(HEALTH_RECHECK_DELAY_SECONDS)
+            for i in flaky:
+                try:
+                    async with aiohttp.ClientSession(
+                        connector=aiohttp.TCPConnector(ssl=False),
+                        headers={"User-Agent": "RLG-Aria-ContentFreshness/1.0"},
+                    ) as fresh:
+                        second = await check_single_url(fresh, entry_by_url[results[i]["url"]])
+                    log.info("health_reprobe_result", url=results[i]["url"],
+                             first=results[i]["status"], second=second["status"],
+                             status_code=second.get("status_code"))
+                    results[i] = second
+                except Exception as e:  # never lose the original result
+                    log.error("health_reprobe_failed", url=results[i]["url"],
+                              error_type=type(e).__name__, error=str(e))
         return results
 
 
