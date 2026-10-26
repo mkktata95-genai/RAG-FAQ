@@ -119,3 +119,42 @@ I agree that my wording on the call could have been clearer. I should have state
 I fully support promoting and using our internal products. On several calls, I have taken the initiative to bring our products to the client’s attention. I will follow all compliance requirements and guidelines for FS Super Agent, complete the necessary checks, and keep the relevant stakeholders updated on the outcome. I will continue to promote its adoption wherever it fits the project.
 
 Going forward, I will work on improving my communication. I will also align with our internal teams before making any commitment to the client, so that the client never gets the impression that our teams are not coordinated.
+
+----------------------
+Subject: Content freshness job: false "changed" flags traced to rotating widgets, plus an intermittent site 500
+
+Hi all,
+
+Sharing the findings from today's investigation into the content freshness report flagging pages as changed straight after a full rescrape and reindex.
+
+SUMMARY
+After rescraping all URLs and building a new index (rlg-faq-index-261026, 300 pages, 3,413 chunks), the freshness job in report mode flagged a small set of pages as changed: 10, then 8, then 7 across three back-to-back runs. About 275 of 285 pages matched every time. The flagged set was not stable between runs, which pointed to content varying per request rather than genuine page edits.
+
+FINDING 1: ROTATING WIDGETS CAUSE FALSE "CHANGED" FLAGS
+- The freshness job and the indexer compute the content hash with the same formula. For all pages tested, the hash stored in the index matched the hash recomputed from the scraped file. The freshness job also reads the same index that was built.
+- Diffing consecutive fetches of the same page showed related-content and news widgets that change per request, and sometimes appear in one response and not the next. We identified three widget types by their HTML containers:
+  1. Homepage news carousel (dynamicsliderblock)
+  2. Slider block on guide pages (sliderblock)
+  3. Related-article cards on guides such as the stock-markets page (featuredcontentblock)
+- These are teasers for other pages, not the page's own content, but they are currently included in the text that is hashed and indexed.
+- Conclusion: the hash logic is not at fault. The widgets need to be excluded from content extraction.
+
+FINDING 2: INTERMITTENT HTTP 500 ON investment-governance
+- This page was flagged as a server error in all three freshness runs, although it opens in a browser.
+- Repeated curl tests show the site itself fails intermittently: 4 of 8 GET requests returned 500, and 4 of 15 requests across three different User-Agents returned 500. The failure rate did not depend on the User-Agent, so it is not caused by our scripts.
+- The freshness job currently treats a persistent 5xx as "page removed", which in apply mode would delete that page's chunks from the index. This is a risk and needs fixing before apply mode is used.
+
+OTHER ITEM
+- understanding-pension-tax-rules now redirects to a different URL, so the approved URL list needs updating.
+
+PROPOSED CHANGES
+1. Exclude the three widget containers in extract_main_html() in both the scraper and the freshness job, keeping the two identical.
+2. In the freshness health check, treat 5xx responses as a non-destructive error (page left untouched and flagged in the report) so only 404 or 410 can lead to removal.
+3. Rescrape, run a full reindex, then re-run freshness in report mode a few times. After the fix, only genuinely changed pages should be flagged.
+4. Update the approved URL list for the redirected page.
+5. Raise the intermittent 500 on investment-governance with the website team, with the test results above.
+
+Happy to walk through the details if useful.
+
+Regards,
+Mukesh
