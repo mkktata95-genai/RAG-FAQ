@@ -301,3 +301,6 @@ $u = "https://www.royallondon.com/pensions/investment-options/investment-governa
 -------------
 python compare_scrapes.py scraper\data\royal_london_faq_approved_httpV1_20261026_102346.json scraper\data\<new file>.json
 ------------
+python scraper\widget_probe.py https://www.royallondon.com/pensions/workplace-pensions/how-tax-relief-works
+python scraper\widget_probe.py https://www.royallondon.com/pensions
+--------------
