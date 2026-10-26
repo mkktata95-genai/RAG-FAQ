@@ -260,3 +260,8 @@ python -c "import re,content_freshness_httpV1 as cf; from pathlib import Path; f
   "top": 50,
   "count": true
 }
+
+
+----------------
+
+python check_hash_3urls.py --file scraper\data\royal_london_faq_approved_httpV1_20261026_102346.json --urls https://www.royallondon.com/guides-tools/life-events/when-someone-dies/what-to-do-when-someone-dies https://www.royallondon.com/guides-tools/money-guides/everyday-money/what-is-an-isa-and-how-do-they-work https://www.royallondon.com/guides-tools/pension-guides/pension-investments/what-are-stock-markets-and-how-do-they-work https://www.royallondon.com/guides-tools/pension-guides/workplace-pension-guides/death-in-service-benefit-is-it-enough https://www.royallondon.com
