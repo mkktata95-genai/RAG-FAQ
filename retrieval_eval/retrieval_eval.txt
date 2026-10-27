@@ -74,3 +74,18 @@ git status --short
 git commit -m "Exclude hub pages; add synthetic dataset v1 (29 rows)"
 git push origin dev
 ----------
+git checkout dev; git pull
+git checkout -b feature/runner-v1
+git add retrieval_eval\run_retrieval_eval.py retrieval_eval\test_run_retrieval_eval.py .env.example
+git status --short
+git commit -m "Add retrieval runner and metrics"
+git branch --show-current
+git push -u origin feature/runner-v1
+---------
+   AZURE_SEARCH_ENDPOINT=https://mng-dev-dit-uks-srch-aisplatform.search.windows.net
+   AZURE_SEARCH_INDEX=rlg-faq-index-271026
+   AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-large
+  ---------------
+
+
+
