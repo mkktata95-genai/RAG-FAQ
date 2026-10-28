@@ -331,3 +331,5 @@ python -c "import re,glob;f=sorted(glob.glob(r'scraper\data\royal_london_faq_app
 ---------------
 Get-ChildItem scraper\data | Sort-Object LastWriteTime | Select-Object -Last 3 Name, Length, LastWriteTime
 ---------------------
+python -c "import os,re;from azure.storage.blob import BlobServiceClient as B;c=B.from_connection_string('UseDevelopmentStorage=true').get_container_client('output');n=sorted(b.name for b in c.list_blobs(name_starts_with='scraped-data/') if not b.name.endswith('_failures.json'))[-1];t=c.download_blob(n).readall();os.makedirs('check',exist_ok=True);open('check/'+n.split('/')[-1],'wb').write(t);print(n,len(t));print(set(re.findall(r'\"scraper_version\": ?\"([^\"]+)\"',t.decode())))"
+------------
