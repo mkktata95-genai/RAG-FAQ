@@ -333,3 +333,5 @@ Get-ChildItem scraper\data | Sort-Object LastWriteTime | Select-Object -Last 3 N
 ---------------------
 python -c "import os,re;from azure.storage.blob import BlobServiceClient as B;c=B.from_connection_string('UseDevelopmentStorage=true').get_container_client('output');n=sorted(b.name for b in c.list_blobs(name_starts_with='scraped-data/') if not b.name.endswith('_failures.json'))[-1];t=c.download_blob(n).readall();os.makedirs('check',exist_ok=True);open('check/'+n.split('/')[-1],'wb').write(t);print(n,len(t));print(set(re.findall(r'\"scraper_version\": ?\"([^\"]+)\"',t.decode())))"
 ------------
+python -c "import zipfile;z=zipfile.ZipFile('scraper.zip');n=z.namelist();print(len(n),'entries');print(sorted({x.split('/')[0] for x in n}));print([x for x in n if x.startswith('src/')]);print('WIDGET_SELECTORS' in z.read('src/scrape_approved_urls_httpV1.py').decode());print([x for x in n if 'local.settings' in x or '.venv' in x or 'check' in x])"
+-------------
