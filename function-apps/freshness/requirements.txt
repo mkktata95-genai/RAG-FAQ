@@ -1,0 +1,14 @@
+azure-functions==1.19.0
+azure-storage-blob==12.30.0
+azure-identity==1.25.3
+azure-core==1.41.0
+structlog==24.1.0
+requests==2.34.2
+beautifulsoup4==4.14.3
+markdownify==1.2.3
+openpyxl==3.1.5
+python-dotenv==1.2.2
+openai==2.41.0
+azure-search-documents==12.0.0
+langchain-text-splitters==1.1.2
+aiohttp==REPLACE_WITH_VERSION_FROM_req-freshness.txt

@@ -1,0 +1,13 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "DataStorage": "UseDevelopmentStorage=true",
+    "AZURE_SEARCH_ENDPOINT": "https://rlg-dev-dit-uks-srch-aisplatform.search.windows.net",
+    "AZURE_SEARCH_INDEX_NAME": "<test index name - NOT the live index while testing>",
+    "AZURE_OPENAI_ENDPOINT": "https://rlg-dev-dit-sdc-aisvc-aisplatform.openai.azure.com",
+    "FRESHNESS_SCHEDULE": "0 0 3 * * *",
+    "FRESHNESS_TIMER_MODE": "report"
+  }
+}

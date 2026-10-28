@@ -1,0 +1,252 @@
+# Freshness Function App zip deploy (manual). Adapted from azure-pipelines-agent-func-digiassist.yml:
+# same deploy mechanics (run-from-package, SCM wait, async zip deploy, restart), agent-specific
+# steps (/chat invocation test, agent.log fetch, full network diagnostics) replaced/trimmed.
+# freshness.zip is built locally with funcbuild.ps1 and COMMITTED; this pipeline only deploys it.
+trigger: none
+pr: none
+
+variables:
+  - template: env/dev.yml
+  - name: appName
+    value: $(freshnessFunctionAppName)
+  - name: appZipPath
+    value: $(Build.SourcesDirectory)/function-apps/freshness/freshness.zip
+  - name: expectedFunctions
+    value: 'freshness_daily freshness_on_request'
+
+pool:
+  name: '$(agentPoolName)'
+
+steps:
+- script: |
+    set -e
+    echo "Checking deployment package"
+    echo "Expected: $(appZipPath)"
+
+    if [ ! -f "$(appZipPath)" ]; then
+      echo "ERROR: freshness.zip not found at $(appZipPath)"
+      echo "Ensure freshness.zip is committed at function-apps/freshness/."
+      exit 1
+    fi
+
+    ls -lh "$(appZipPath)"
+  displayName: Validate freshness.zip exists
+
+- task: AzureCLI@2
+  displayName: Ensure WEBSITE_RUN_FROM_PACKAGE=1 (freshness.zip is pre-built, no internet egress for Oryx/pip)
+  inputs:
+    azureSubscription: ${{ variables.azureServiceConnectionName }}
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set -e
+      echo "Setting WEBSITE_RUN_FROM_PACKAGE=1 on $(appName): zip is mounted read-only, no build step."
+      az functionapp config appsettings set \
+        --resource-group "$(resourceGroupName)" \
+        --name "$(appName)" \
+        --settings WEBSITE_RUN_FROM_PACKAGE=1 SCM_DO_BUILD_DURING_DEPLOYMENT=false ENABLE_ORYX_BUILD=false
+
+      echo ""
+      echo "Restarting $(appName) so the SCM/Kudu sidecar reloads the new app settings before deploy."
+      az functionapp restart \
+        --resource-group "$(resourceGroupName)" \
+        --name "$(appName)"
+
+      scm_host="$(appName).scm.azurewebsites.net"
+      echo ""
+      echo "Waiting for SCM/Kudu endpoint (${scm_host}) to come back up..."
+      ready=0
+      for i in $(seq 1 24); do
+        code=$(curl -k -sS -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 15 "https://${scm_host}/api/settings" 2>/dev/null)
+        echo "  attempt ${i}: HTTP ${code}"
+        if echo "${code}" | grep -qE '^(200|401|403)$'; then
+          ready=1
+          break
+        fi
+        sleep 5
+      done
+      if [ "${ready}" = "1" ]; then
+        echo "SCM endpoint responded - waiting an extra 20s buffer for settings to settle."
+        sleep 20
+      else
+        echo "WARNING: SCM endpoint did not respond as expected within timeout; proceeding anyway."
+      fi
+
+- task: AzureCLI@2
+  displayName: Deploy freshness.zip via az functionapp deploy
+  continueOnError: true
+  inputs:
+    azureSubscription: ${{ variables.azureServiceConnectionName }}
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set -e
+
+      scm_host="$(appName).scm.azurewebsites.net"
+      echo "PRE-DEPLOY DNS CHECK:"
+      echo "Resolving ${scm_host} ..."
+      resolved_ip=$(getent hosts "${scm_host}" 2>/dev/null | awk '{print $1}' || true)
+      if [ -z "$resolved_ip" ]; then
+        resolved_ip=$(nslookup "${scm_host}" 2>/dev/null | awk '/^Address: /{print $2}' | tail -1 || true)
+      fi
+      echo "  Resolved IP: ${resolved_ip:-'UNRESOLVED'}"
+      if echo "${resolved_ip}" | grep -qE '^10\.'; then
+        echo "  GOOD: SCM resolves to a private IP - private DNS zone is working."
+      elif [ -n "${resolved_ip}" ]; then
+        echo "  WARNING: SCM resolves to a PUBLIC IP (${resolved_ip})."
+        echo "  Cause: privatelink.azurewebsites.net DNS zone is missing the '$(appName).scm' A record."
+        echo "  Fix: add an A record for '$(appName).scm' -> SCM PE IP in the private DNS zone."
+        echo "  With public_network_access_enabled=false, Azure sends TCP RST on the public endpoint."
+      fi
+      echo ""
+
+      echo "Deploying $(appZipPath) to $(appName)"
+
+      # freshness.zip already vendors all dependencies into libs/ (funcbuild.ps1; function_app.py
+      # inserts libs/ into sys.path). No internet egress, so Oryx/remote build is disabled via the
+      # app settings in the previous step. --async true avoids blocking on site startup.
+      az functionapp deploy \
+        --resource-group "$(resourceGroupName)" \
+        --name "$(appName)" \
+        --src-path "$(appZipPath)" \
+        --type zip \
+        --async true
+
+      echo ""
+      echo "Deployment initiated (async). Check Kudu deployment logs for build status."
+
+      # With WEBSITE_RUN_FROM_PACKAGE=1 the running worker does not reload the new package by itself.
+      echo ""
+      echo "Restarting $(appName) so it reloads the newly deployed package..."
+      az functionapp restart \
+        --resource-group "$(resourceGroupName)" \
+        --name "$(appName)"
+
+- task: AzureCLI@2
+  displayName: Fetch deployment failure log
+  condition: always()
+  inputs:
+    azureSubscription: ${{ variables.azureServiceConnectionName }}
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set +e
+      echo "az webapp log deployment show"
+      az webapp log deployment show \
+        --resource-group "$(resourceGroupName)" \
+        --name "$(appName)"
+      echo ""
+
+      last_id=$(az webapp log deployment list \
+        --resource-group "$(resourceGroupName)" \
+        --name "$(appName)" \
+        --query "[0].id" -o tsv 2>/dev/null)
+      if [ -n "$last_id" ]; then
+        echo "Deployment ID: ${last_id}"
+        az webapp log deployment show \
+          --resource-group "$(resourceGroupName)" \
+          --name "$(appName)" \
+          --deployment-id "${last_id}"
+      else
+        echo "Could not resolve last deployment ID via 'az webapp log deployment list'."
+      fi
+    continueOnError: true
+
+- task: AzureCLI@2
+  displayName: Network diagnostics - SCM/Kudu endpoint check
+  condition: always()
+  inputs:
+    azureSubscription: ${{ variables.azureServiceConnectionName }}
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set +e
+      scm_host="$(appName).scm.azurewebsites.net"
+      echo "Agent -> ${scm_host}:443 (Kudu/SCM endpoint for zip deploy)"
+      getent hosts "${scm_host}" || nslookup "${scm_host}" || echo "DNS: Could not resolve"
+      scm_code=$(curl -k -sS -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 "https://${scm_host}/" 2>&1 | tail -n 1)
+      echo "SCM endpoint HTTP response: ${scm_code}"
+      echo ""
+      echo "If 000: TCP/443 from the ADO agent subnet (10.196.201.8/29) to this app's SCM private endpoint"
+      echo "is blocked. Hub firewall (10.196.0.4) must allow it; also check the private DNS A record."
+    continueOnError: true
+
+- task: AzureCLI@2
+  displayName: Fetch container startup logs
+  condition: always()
+  inputs:
+    azureSubscription: ${{ variables.azureServiceConnectionName }}
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set +e
+      echo "Fetching container logs for $(appName)..."
+
+      az webapp log download \
+        --resource-group "$(resourceGroupName)" \
+        --name "$(appName)" \
+        --log-file /tmp/webapp-logs.zip 2>&1
+
+      if [ -f /tmp/webapp-logs.zip ]; then
+        unzip -o /tmp/webapp-logs.zip -d /tmp/webapp-logs/ 2>/dev/null
+
+        # container stdout/stderr - the actual Python error/traceback
+        stream_log=$(find /tmp/webapp-logs/LogFiles/StartupLogs/.sources -name "*containerStream.log" 2>/dev/null | sort | tail -1)
+        if [ -n "$stream_log" ]; then
+          echo "=== CONTAINER STREAM (stdout/stderr): $stream_log ==="
+          cat "$stream_log"
+          echo ""
+        fi
+
+        failure_log=$(find /tmp/webapp-logs/LogFiles/StartupLogs -maxdepth 1 -name "*failure.log" 2>/dev/null | sort | tail -1)
+        if [ -n "$failure_log" ]; then
+          echo "=== STARTUP FAILURE LOG (last 100 lines): $failure_log ==="
+          tail -100 "$failure_log"
+          echo ""
+        fi
+
+        if [ -z "$stream_log" ] && [ -z "$failure_log" ]; then
+          echo "No StartupLogs found. Available log files:"
+          find /tmp/webapp-logs -name "*.log" | head -20
+        fi
+      else
+        echo "Log download failed."
+        az webapp log show \
+          --resource-group "$(resourceGroupName)" \
+          --name "$(appName)" 2>&1 | tail -100
+      fi
+    continueOnError: true
+
+- task: AzureCLI@2
+  displayName: Verify functions registered (replaces agent /chat test)
+  inputs:
+    azureSubscription: ${{ variables.azureServiceConnectionName }}
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set +e
+      echo "Waiting for functions to register on $(appName): $(expectedFunctions)"
+      echo "(blob/queue triggers cannot be invoked over HTTP; registration = package loaded + host started)"
+      ok=0
+      for attempt in $(seq 1 12); do
+        names=$(az functionapp function list \
+          --resource-group "$(resourceGroupName)" \
+          --name "$(appName)" \
+          --query "[].name" -o tsv 2>/dev/null)
+        echo "--- Attempt ${attempt}/12: registered = $(echo "${names}" | tr '\n' ' ')"
+        missing=0
+        for fn in $(expectedFunctions); do
+          echo "${names}" | grep -q "${fn}" || missing=1
+        done
+        if [ "${missing}" = "0" ] && [ -n "${names}" ]; then
+          ok=1
+          break
+        fi
+        sleep 30
+      done
+      if [ "${ok}" = "1" ]; then
+        echo "All expected functions are registered."
+      else
+        echo "ERROR: expected functions not registered after 6 minutes - check container startup logs above."
+        exit 1
+      fi
