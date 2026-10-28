@@ -11,3 +11,10 @@ Save, then check the file still parses:
 python -c "import ast;ast.parse(open(r'function-apps\freshness\src\content_freshness_httpV1.py',encoding='utf-8').read());print('syntax ok')"
 Select-String -Path function-apps\freshness\src\content_freshness_httpV1.py -Pattern 'FRESHNESS_WORK_DIR','FRESHNESS_JOB_VERSION ='
 ----------
+python check_idx.py "https://www.royallondon.com/existing-customers/online-service"
+------------
+python local_upload.py --run apply
+------------------
+python check_idx.py "https://www.royallondon.com/existing-customers/online-service"
+python local_upload.py --outputs
+-----------------------
