@@ -18,3 +18,9 @@ python local_upload.py --run apply
 python check_idx.py "https://www.royallondon.com/existing-customers/online-service"
 python local_upload.py --outputs
 -----------------------
+Add-Content ..\..\.git\info\exclude "function-apps/freshness/check_report.py"
+Add-Content ..\..\.git\info\exclude "function-apps/freshness/diag_url.py"
+Add-Content ..\..\.git\info\exclude "function-apps/freshness/check_idx.py"
+git branch --show-current
+git status --short
+-----------
