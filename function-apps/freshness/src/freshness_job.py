@@ -12,6 +12,7 @@ chunks to blob, even when the run fails -> raise if the script reported errors.
 import json
 import logging
 import os
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -85,7 +86,18 @@ def timer_mode() -> str:
 
 
 # ── script call (faked in tests) ──────────────────────────────
+def force_utf8_stdio() -> None:
+    """The script prints emoji. A Windows host (local func start) gives the worker a cp1252
+    stdout, where print() raises UnicodeEncodeError and kills the run. Azure Linux is already UTF-8."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass  # not a reconfigurable text stream: nothing to fix
+
+
 def default_run(*, mode: str, excel_path: str, dry_run: bool, allow_mass_removal: bool) -> dict:
+    force_utf8_stdio()
     # Index name is required explicitly: the script's own default is a legacy index.
     need = ["AZURE_SEARCH_ENDPOINT", "AZURE_SEARCH_INDEX_NAME"]
     if mode == "apply" and not dry_run:

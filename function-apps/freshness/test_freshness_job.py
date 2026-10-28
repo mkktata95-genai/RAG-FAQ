@@ -122,4 +122,24 @@ try:
     j.default_run(mode="apply", excel_path="x", dry_run=False, allow_mass_removal=False); raise SystemExit("should raise")
 except RuntimeError as e:
     assert "AZURE_OPENAI_ENDPOINT" in str(e)
+# force_utf8_stdio: cp1252 stdout would crash on emoji; after the call it must not
+import io, sys  # noqa: E402
+raw = io.BytesIO()
+fake = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+saved = sys.stdout, sys.stderr
+sys.stdout = sys.stderr = fake
+try:
+    j.force_utf8_stdio()
+    print("\U0001f510 Step 0")  # raised UnicodeEncodeError before the fix
+    fake.flush()
+finally:
+    sys.stdout, sys.stderr = saved
+assert "\U0001f510".encode("utf-8") in raw.getvalue()
+class NoReconf:  # a stream without reconfigure() is left alone, no crash
+    pass
+sys.stdout = NoReconf()
+try:
+    j.force_utf8_stdio()
+finally:
+    sys.stdout = saved[0]
 print("OK")
