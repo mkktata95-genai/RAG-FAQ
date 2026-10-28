@@ -1,0 +1,13 @@
+ # v1.1.2: FRESHNESS_WORK_DIR lets a read-only host (Azure zip deploy) point the
+# archive/manifest/report folders at a writable temp dir. Unset = unchanged.
+BASE_DIR = Path(os.environ.get("FRESHNESS_WORK_DIR") or Path(__file__).resolve().parent)
+
+---------
+For the version, change FRESHNESS_JOB_VERSION = "1.1.1" to "1.1.2". Add this line at the end of the changelog comment, just above it:
+# v1.1.2 — FRESHNESS_WORK_DIR env override for read-only hosting. ROLLBACK: restore v1.1.1 file.
+
+----
+Save, then check the file still parses:
+python -c "import ast;ast.parse(open(r'function-apps\freshness\src\content_freshness_httpV1.py',encoding='utf-8').read());print('syntax ok')"
+Select-String -Path function-apps\freshness\src\content_freshness_httpV1.py -Pattern 'FRESHNESS_WORK_DIR','FRESHNESS_JOB_VERSION ='
+----------
