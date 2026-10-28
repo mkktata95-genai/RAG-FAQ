@@ -327,4 +327,7 @@ git add function-apps/templated/make_sample_xlsx.py function-apps/templated/samp
 git add function-apps/templated/requirements.txt function-apps/templated/eval_sample.csv
 git status
 ------------------
-
+python -c "import re,glob;f=sorted(glob.glob(r'scraper\data\royal_london_faq_approved_httpV1_*.json'))[-1];t=open(f,encoding='utf-8').read();print(f,len(t));print(set(re.findall(r'\"scraper_version\": ?\"([^\"]+)\"',t)))"
+---------------
+Get-ChildItem scraper\data | Sort-Object LastWriteTime | Select-Object -Last 3 Name, Length, LastWriteTime
+---------------------
