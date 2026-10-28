@@ -31,3 +31,7 @@ tar -tf freshness.zip | Select-String "^libs/(openai|aiohttp|markdownify|langcha
 git add src/content_freshness_httpV1.py src/freshness_job.py function_app.py host.json funcbuild.ps1 local_upload.py requirements.txt test_freshness_job.py freshness.zip
 git status --short -uall
 ------------------------
+git add Pipelines/azure-pipelines-freshness-func.yml
+git commit -m "Add Freshness Function App (timer + queue triggers, blob outputs) and v1.1.2 FRESHNESS_WORK_DIR override" -m "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>" -m "Claude-Session: https://claude.ai/code/session_015iGQpSs7EUjcortwXLeNgF"
+git push -u origin feature/freshness-app
+------------------
