@@ -24,3 +24,7 @@ Add-Content ..\..\.git\info\exclude "function-apps/freshness/check_idx.py"
 git branch --show-current
 git status --short
 -----------
+tar -tf freshness.zip | Select-String "^(function_app\.py|host\.json|src/)"
+tar -tf freshness.zip | Select-String "local.settings|\.env|check_|diag_|local_upload|test_"
+tar -tf freshness.zip | Select-String "^libs/(openai|aiohttp|markdownify|langchain_text_splitters)/__init__"
+-----------------
