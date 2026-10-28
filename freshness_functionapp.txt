@@ -28,3 +28,6 @@ tar -tf freshness.zip | Select-String "^(function_app\.py|host\.json|src/)"
 tar -tf freshness.zip | Select-String "local.settings|\.env|check_|diag_|local_upload|test_"
 tar -tf freshness.zip | Select-String "^libs/(openai|aiohttp|markdownify|langchain_text_splitters)/__init__"
 -----------------
+git add src/content_freshness_httpV1.py src/freshness_job.py function_app.py host.json funcbuild.ps1 local_upload.py requirements.txt test_freshness_job.py freshness.zip
+git status --short -uall
+------------------------
