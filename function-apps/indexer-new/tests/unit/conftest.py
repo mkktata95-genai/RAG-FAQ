@@ -36,3 +36,9 @@ def script():
         AZURE_OPENAI_ENDPOINT="https://openai.test.invalid", EMBEDDING_DIMS=1536,
     ):
         yield m
+
+
+@pytest.fixture(autouse=True)
+def no_sleep(mocker):
+    """Retry/backoff waits must never slow the tests down."""
+    mocker.patch("time.sleep")

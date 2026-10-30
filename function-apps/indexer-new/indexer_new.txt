@@ -68,3 +68,10 @@ git commit -m "Indexer: requirements.txt holds the full pinned set; add indexer.
 git push -u origin dev
 git log --oneline -3
 ---------------
+python -m pytest --cov=src --cov-report=term-missing
+-----
+git status
+git add .gitignore pytest.ini requirements-test.txt tests
+git rm test_indexer_job.py
+git status
+------------
