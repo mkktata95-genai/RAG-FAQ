@@ -56,3 +56,15 @@ echo inject_stale.py >> .git\info\exclude
 Get-Item indexer.zip | Select-Object Name, Length
 tar -tf indexer.zip | Select-String "function_app.py|host.json|src/|requirements|inject_stale|local.settings|\.venv"
 ----------
+Copy-Item requirements.lock.txt requirements.txt -Force
+git rm -f requirements.lock.txt
+-----------
+In requirements.txt, add this as line 1: # Fully pinned: direct + transitive, Linux py3.11, all verified in rlg-pypi (feedcheck.py). Lines starting with # are ignored by pip and by feedcheck.py.
+In funcbuild.ps1, around line 63, change "requirements.lock.txt" to "requirements.txt", and fix the comment above it to say “pinned requirements”.
+--------
+git add requirements.txt funcbuild.ps1 indexer.zip
+git status
+git commit -m "Indexer: requirements.txt holds the full pinned set; add indexer.zip"
+git push -u origin dev
+git log --oneline -3
+---------------
