@@ -36,3 +36,13 @@ git status
 git commit -m "Indexer function app: sync into platform-owned index, pinned lock file"
 git log --oneline -3
 ------
+$env:AZURE_SEARCH_ENDPOINT = "https://rlg-dev-dit-uks-srch-aisplatform.search.windows.net"
+$env:AZURE_SEARCH_INDEX_NAME = "rlg-faq-index-271026"
+$env:AZURE_OPENAI_ENDPOINT = "https://rlg-dev-dit-sdc-aisvc-aisplatform.openai.azure.com"
+$env:AZURE_OPENAI_EMBEDDING_DEPLOYMENT = "text-embedding-3-large"
+$env:AZURE_OPENAI_EMBEDDING_DIMENSIONS = "1536"
+
+$f = "<full path to the scraped JSON>"
+python src\chunk_embed_index_funcV1.py --dry-run --file $f
+
+------
