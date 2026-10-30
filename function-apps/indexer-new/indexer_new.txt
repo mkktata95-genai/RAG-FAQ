@@ -46,3 +46,6 @@ $f = "<full path to the scraped JSON>"
 python src\chunk_embed_index_funcV1.py --dry-run --file $f
 
 ------
+python inject_stale.py
+python src\chunk_embed_index_funcV1.py --file $f
+---------
