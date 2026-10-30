@@ -75,3 +75,7 @@ git add .gitignore pytest.ini requirements-test.txt tests
 git rm test_indexer_job.py
 git status
 ------------
+git commit -m "Indexer: add unit tests (pytest, 97% coverage) and requirements-test.txt"
+git push
+git log --oneline -4
+-----------
