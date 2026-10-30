@@ -49,3 +49,10 @@ python src\chunk_embed_index_funcV1.py --dry-run --file $f
 python inject_stale.py
 python src\chunk_embed_index_funcV1.py --file $f
 ---------
+python local_upload.py "C:\Users\MKund\Desktop\RAG\scraper\data\royal_london_faq_approved_httpV1_20261028_194354.json"
+-----
+echo inject_stale.py >> .git\info\exclude
+.\funcbuild.ps1
+Get-Item indexer.zip | Select-Object Name, Length
+tar -tf indexer.zip | Select-String "function_app.py|host.json|src/|requirements|inject_stale|local.settings|\.venv"
+----------
