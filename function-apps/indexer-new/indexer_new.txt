@@ -1,0 +1,7 @@
+git branch --show-current
+
+$old = "..\digiassist-offlinescript\function-apps\indexer"
+New-Item -ItemType Directory -Force src, Pipelines | Out-Null
+Copy-Item "$old\host.json", "$old\requirements.txt", "$old\funcbuild.ps1" .
+Get-ChildItem -Force
+-------------------
