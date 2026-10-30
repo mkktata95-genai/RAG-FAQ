@@ -5,3 +5,27 @@ New-Item -ItemType Directory -Force src, Pipelines | Out-Null
 Copy-Item "$old\host.json", "$old\requirements.txt", "$old\funcbuild.ps1" .
 Get-ChildItem -Force
 -------------------
+git checkout -b dev
+git branch --show-current
+
+$old = "..\digiassist-offlinescript\function-apps\indexer"
+New-Item -ItemType Directory -Force src, Pipelines | Out-Null
+Copy-Item "$old\host.json", "$old\requirements.txt" .
+
+@"
+libs/
+.venv/
+__pycache__/
+*.pyc
+local.settings.json
+.env
+"@ | Set-Content .gitignore -Encoding utf8
+
+Get-ChildItem -Force
+----------------------
+python test_indexer_job.py
+
+git status
+git add .gitignore host.json requirements.txt requirements.lock.txt funcbuild.ps1 function_app.py local_upload.py test_indexer_job.py local.settings.json.example src/indexer_job.py src/chunk_embed_index_funcV1.py Pipelines/azure-pipelines-indexer-func.yml
+git status
+--------------
