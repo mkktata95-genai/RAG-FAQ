@@ -1,7 +1,11 @@
 {
   "IsEncrypted": false,
   "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "DataStorage": "UseDevelopmentStorage=true",
     "AZURE_SEARCH_ENDPOINT": "https://rlg-dev-dit-uks-srch-aisplatform.search.windows.net",
+    "AZURE_SEARCH_TEMPLATED_INDEX_NAME": "<templated index name created by platform>",
     "AZURE_OPENAI_ENDPOINT": "https://rlg-dev-dit-sdc-aisvc-aisplatform.openai.azure.com",
     "AZURE_OPENAI_EMBEDDING_DEPLOYMENT": "text-embedding-3-large",
     "AZURE_OPENAI_EMBEDDING_DIMENSIONS": "1536"

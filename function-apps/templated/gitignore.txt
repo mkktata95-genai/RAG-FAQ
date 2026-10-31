@@ -1,0 +1,22 @@
+# Python / local
+.venv/
+__pycache__/
+*.pyc
+.env
+log/
+.coverage
+.pytest_cache/
+
+# Function app local-only files (never commit)
+local.settings.json
+libs/
+out/
+feedcheck.*
+sample_templated.xlsx
+
+# Azurite local storage emulator
+__blobstorage__/
+__queuestorage__/
+__azurite_db_*.json
+__azurite_db_*__.json
+AzuriteConfig

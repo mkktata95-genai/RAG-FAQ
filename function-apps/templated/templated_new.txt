@@ -1,0 +1,39 @@
+digiassist-templated-functionapp\
+│
+├── .gitignore                      <- save gitignore.txt as this name
+├── README.md
+├── function_app.py
+├── host.json
+├── requirements.txt
+├── requirements-test.txt
+├── pytest.ini
+├── funcbuild.ps1
+├── local_build.py
+├── local_upload.py
+├── local.settings.json.example
+├── make_sample_xlsx.py
+├── eval_sample.csv
+├── templated.zip                   <- created by funcbuild.ps1, then committed
+│
+├── src\
+│   └── templated_job.py
+│
+├── Pipelines\
+│   ├── azure-pipelines-templated-func.yml
+│   └── env\
+│       └── dev.yml
+│
+└── tests\
+    ├── conftest.py
+    └── unit\
+        ├── validation\
+        │   └── test_validation.py
+        ├── sync\
+        │   ├── test_sync.py
+        │   └── test_search_ops.py
+        ├── embedding\
+        │   └── test_embedding.py
+        ├── wrapper\
+        │   └── test_wrapper_core.py
+        └── cli\
+            └── test_local_build.py

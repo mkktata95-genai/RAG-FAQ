@@ -1,0 +1,9 @@
+variables:
+  # DEV variables for the templated-questions Function App.
+  # NEW SUBSCRIPTION: Andy/DevOps to confirm or replace every value below once the infra exists.
+
+  agentPoolName: 'rlg-dev-dig-uks-vmss-adoagentssv'
+  azureServiceConnectionName: 'RLG-DEV-DIG-ai-assistant-sp'
+  resourceGroupName: 'rlg-dev-dig-uks-rg-ai-assistant'
+
+  templatedFunctionAppName: 'rlg-dev-dig-uks-func-templated-aia'
