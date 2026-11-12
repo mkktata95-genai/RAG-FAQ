@@ -97,14 +97,18 @@ PIPELINE_VERSION = "1.0.0"
 # v1.1.1 — persistent 5xx URLs are re-probed once, alone, in a fresh HTTP session
 #          (shared-session 500s on pages that return 200 on a clean connection).
 #          ROLLBACK: restore v1.1.0 file.
-# v1.1.2 - FRESHNESS_WORK_DIR override: archive/manifest/report folders live on a writable disk.
-# v1.1.3 - (1) scraped_at falls back to the index time (the platform index field is DateTimeOffset,
-#          an empty string is invalid); (2) embedding deployment/dimensions read from app settings,
-#          defaults unchanged. ROLLBACK: restore v1.1.2 file.
+# v1.1.2 — extract_main_html() keeps <header class="hero"> (in-page hero banner:
+#          H1 + strapline), identical to scraper v1.2.1; all other <header> tags
+#          are still stripped. Hero-banner pages will show as changed once.
+#          ROLLBACK: restore v1.1.1 file.
+# v1.1.3 - (1) FRESHNESS_WORK_DIR override: archive/manifest/report folders live on a writable disk;
+#          (2) scraped_at falls back to the index time (the index field is DateTimeOffset, "" is invalid);
+#          (3) embedding deployment/dimensions read from app settings, defaults unchanged.
+#          ROLLBACK: restore v1.1.2 file.
 FRESHNESS_JOB_VERSION = "1.1.3"
 FRESHNESS_RUN_ID = str(uuid.uuid4())
 
-SCRAPER_VERSION = "1.2.0"       # matches scrape_approved_urls_httpV1.py
+SCRAPER_VERSION = "1.2.1"       # matches scrape_approved_urls_httpV1.py
 METADATA_VERSION = "1.0.0"
 SCRAPE_RUN_ID = FRESHNESS_RUN_ID
 
@@ -1332,6 +1336,8 @@ def extract_main_html(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     for tag_name in EXCLUDED_TAGS:
         for tag in soup.find_all(tag_name):
+            if tag_name == "header" and "hero" in (tag.get("class") or []):
+                continue  # keep the in-page hero banner (h1 + strapline)
             tag.decompose()
     # Dropdown option panels (data-content) are rendered hidden-but-present
     # in the DOM for every option simultaneously. Strip them from the base

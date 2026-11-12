@@ -36,3 +36,11 @@ def test_long_table_is_split_with_header_repeated():
 def test_element_parsing_finds_headings_paragraphs_and_tables():
     els = m._ea_parse_elements("# Heading\n\nA paragraph.\n\n| a | b |\n| - | - |\n| 1 | 2 |")
     assert {e["type"] for e in els} >= {"table"} and len(els) >= 2
+
+
+# ── hero banner (script v1.1.2 behaviour, parity with scraper v1.2.1) ──
+def test_hero_header_is_kept_other_headers_dropped():
+    html = ('<html><body><main><header class="hero"><h1>Hero title</h1><p>Strapline text</p></header>'
+            '<header class="site"><p>Site header</p></header><p>Body text</p></main></body></html>')
+    out = m.extract_main_html(html)
+    assert "Hero title" in out and "Strapline text" in out and "Site header" not in out

@@ -21,4 +21,3 @@ __queuestorage__/
 __azurite_db_*.json
 __azurite_db_*__.json
 AzuriteConfig
-tools/
