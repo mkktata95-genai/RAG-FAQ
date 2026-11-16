@@ -1,0 +1,22 @@
+trigger: none
+pr: none
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: AI CoE/ai-platform-pipelines
+      ref: refs/tags/v0.1.1
+
+extends:
+  template: pipelines/function-app.yml@templates
+  parameters:
+    poolName: rlg-dev-aia-uks-vmss-adoagentssv
+    pythonVersion: "3.11"
+    pypiIndexUrl: https://artefacts.royallondongroup.com/pypi/rlg-pypi/simple
+    projectPath: .
+    testsPath: ""
+    environments:
+      - name: dev
+        serviceConnection: RLG-DEV-DigitalAssistant-sp
+        appName: rlg-dev-da-uks-func-indexing   # TBC: real Function App name from DevOps
