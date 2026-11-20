@@ -1,0 +1,16 @@
+git clone <repo url> digiassist-inputdata
+cd digiassist-inputdata
+git checkout dev
+# copy the two renamed Excel files into approved-urls\ and templated-questions\, create .gitignore and azure-pipelines.yml
+git branch --show-current
+git add approved-urls/approved_urls.xlsx templated-questions/templated_questions.xlsx azure-pipelines.yml .gitignore
+git commit -m "Add input data and upload pipeline"
+git push origin dev
+
+
+-------------Folder Structure--------------
+digiassist-inputdata/
+├─ approved-urls/approved_urls.xlsx
+├─ templated-questions/templated_questions.xlsx
+├─ azure-pipelines.yml
+└─ .gitignore

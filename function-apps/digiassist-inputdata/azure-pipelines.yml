@@ -1,0 +1,43 @@
+trigger:
+  branches:
+    include: [dev]
+  paths:
+    include:
+      - approved-urls/*
+      - templated-questions/*
+
+parameters:
+  - name: forceUpload
+    displayName: Upload both files even if unchanged
+    type: boolean
+    default: false
+
+pool:
+  name: <self-hosted-pool-inside-vnet>        # DevOps to fill in
+
+variables:
+  azureServiceConnection: '<service-connection>'   # DevOps to fill in
+  dataStorageAccount: '<data-storage-account>'     # DevOps to fill in
+
+steps:
+  - checkout: self
+    fetchDepth: 2
+  - task: AzureCLI@2
+    displayName: Upload changed input files to blob
+    inputs:
+      azureSubscription: $(azureServiceConnection)
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        changed=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git ls-files)
+        for f in approved-urls/approved_urls.xlsx templated-questions/templated_questions.xlsx; do
+          if [ "${{ parameters.forceUpload }}" = "True" ] || echo "$changed" | grep -qx "$f"; then
+            az storage blob upload --auth-mode login \
+              --account-name "$(dataStorageAccount)" \
+              --container-name input --name "$f" --file "$f" --overwrite
+            echo "uploaded $f"
+          else
+            echo "unchanged $f, skipped"
+          fi
+        done
